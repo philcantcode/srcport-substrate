@@ -21,6 +21,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ...then let prost generate the Rust types from the descriptors. No protoc.
     let mut config = prost_build::Config::new();
+    // Generate every `map<>` field as a BTreeMap, not a HashMap, so protobuf
+    // encoding is deterministic (entries in sorted-key order). Ledger `detail`
+    // is folded into the entry hash, so its encoding MUST be canonical across
+    // SDKs — see SPEC.md "Ledger detail". `.` matches all paths, now and future.
+    config.btree_map(["."]);
     config.compile_fds(fds)?;
 
     Ok(())

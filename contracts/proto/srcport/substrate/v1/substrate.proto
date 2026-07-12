@@ -50,6 +50,12 @@ message Artifact {
   bytes  body                = 3;  // opaque encoded value
   map<string, string> meta   = 4;
   string produced_by         = 5;  // module name
+  // Provenance: ids of the artifacts this one was derived from, turning the
+  // immutable-artifact chain into a traversable lineage graph. Like `meta` and
+  // `produced_by`, it is NOT part of the address — same (type, body) is the
+  // same artifact however it was derived. The kernel stores and echoes it and
+  // never interprets it (a ref need not resolve to a stored artifact).
+  repeated string derived_from = 6;
 }
 
 message ArtifactRef { string id = 1; }

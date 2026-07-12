@@ -61,6 +61,16 @@ _LIFECYCLE_VERB = {
 }
 
 
+def _canonical(msg) -> bytes:
+    """Serialize ``msg`` with deterministic field and map ordering.
+
+    Ledger detail is folded into the entry hash, so its encoding MUST be
+    canonical — the same logical value has to yield byte-identical detail across
+    SDKs and runs, or chains stop cross-verifying (see SPEC.md "Ledger detail").
+    """
+    return msg.SerializeToString(deterministic=True)
+
+
 class Kernel:
     """The in-process microkernel. Thread-safe; share one instance across
     module threads. Every meaningful action lands one append-only ledger entry.
@@ -111,7 +121,12 @@ class Kernel:
             self._modules.append(
                 [copy.deepcopy(manifest), Lifecycle.LIFECYCLE_REGISTERED]
             )
-            self._append_locked("module.registered", manifest.name)
+            # The full manifest lands in the tamper-evident chain, so the registry
+            # is reconstructable from the ledger alone. detail is the canonical
+            # ModuleManifest; see SPEC.md "Ledger detail".
+            self._append_locked(
+                "module.registered", manifest.name, _canonical(manifest)
+            )
             return RegisterAck(state=Lifecycle.LIFECYCLE_REGISTERED)
 
     def transition(self, module: str, to: Lifecycle) -> Lifecycle:
@@ -139,7 +154,14 @@ class Kernel:
                 stored = copy.deepcopy(artifact)
                 stored.id = aid
                 self._artifacts[aid] = stored
-                self._append_locked("artifact.put", aid)
+                # The ledger commits to everything but the body: subject (the id)
+                # already addresses (type, body), so re-inlining the body would
+                # duplicate the store into a log it can never prune. detail is the
+                # canonical Artifact with body cleared; meta, produced_by, and
+                # derived_from ride along.
+                for_log = copy.deepcopy(stored)
+                for_log.ClearField("body")
+                self._append_locked("artifact.put", aid, _canonical(for_log))
             return ArtifactRef(id=aid)
 
     def get_artifact(self, ref: ArtifactRef) -> Artifact:
@@ -211,7 +233,13 @@ class Kernel:
             self._gates[rid] = GateDecision(
                 request_id=rid, decision=Decision.DECISION_PENDING
             )
-            self._append_locked("gate.requested", rid, req.context)
+            # The full request lands in the tamper-evident chain — action,
+            # requested_by, and context are the evidence a human (or an auditor
+            # after a restart) reconstructs. detail is the canonical GateRequest,
+            # with its assigned id.
+            logged = copy.deepcopy(req)
+            logged.id = rid
+            self._append_locked("gate.requested", rid, _canonical(logged))
             return GateTicket(request_id=rid)
 
     def decide_gate(self, decision: GateDecision) -> GateDecision:
@@ -222,7 +250,11 @@ class Kernel:
             if decision.request_id not in self._gates:
                 raise NotFound(decision.request_id)
             self._gates[decision.request_id] = copy.deepcopy(decision)
-            self._append_locked("gate.decided", decision.request_id)
+            # The decision itself — who decided, what, and why — is hash-committed,
+            # so the approval record can't be rewritten without breaking the chain.
+            self._append_locked(
+                "gate.decided", decision.request_id, _canonical(decision)
+            )
             self._gate_cv.notify_all()
             return copy.deepcopy(decision)
 

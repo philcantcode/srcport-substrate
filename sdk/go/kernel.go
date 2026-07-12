@@ -65,6 +65,20 @@ func NewKernel() *Kernel {
 
 func clone[M proto.Message](m M) M { return proto.Clone(m).(M) }
 
+// marshalCanonical encodes m with deterministic field and map ordering. Ledger
+// detail is folded into the entry hash, so its encoding MUST be canonical — the
+// same logical value has to yield byte-identical detail across SDKs and runs, or
+// chains stop cross-verifying (see SPEC.md "Ledger detail"). A marshal error
+// here means one of our own well-formed messages failed to encode: a bug, not a
+// runtime condition, so we panic rather than widen every ABI method's signature.
+func marshalCanonical(m proto.Message) []byte {
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(m)
+	if err != nil {
+		panic(fmt.Sprintf("substrate: canonical marshal of %T failed: %v", m, err))
+	}
+	return b
+}
+
 // appendLocked is the ONLY path that creates ledger entries. Caller holds mu.
 func (k *Kernel) appendLocked(kind, subject string, detail []byte) *LedgerEntry {
 	seq := uint64(len(k.ledger))
@@ -100,7 +114,9 @@ func (k *Kernel) Register(m *ModuleManifest) *RegisterAck {
 		}
 	}
 	k.modules = append(k.modules, moduleSlot{manifest: m, lifecycle: LifecycleRegistered})
-	k.appendLocked("module.registered", m.Name, nil)
+	// The full manifest lands in the tamper-evident chain, so the registry is
+	// reconstructable from the ledger alone. detail is the canonical manifest.
+	k.appendLocked("module.registered", m.Name, marshalCanonical(m))
 	return &RegisterAck{State: LifecycleRegistered}
 }
 
@@ -135,7 +151,13 @@ func (k *Kernel) PutArtifact(a *Artifact) *ArtifactRef {
 		stored := clone(a)
 		stored.Id = id
 		k.artifacts[id] = stored
-		k.appendLocked("artifact.put", id, nil)
+		// The ledger commits to everything but the body: subject (the id) already
+		// addresses (type, body), so re-inlining the body would duplicate the
+		// store into a log it can never prune. detail is the canonical Artifact
+		// with body cleared; meta, produced_by, and derived_from ride along.
+		forLog := clone(stored)
+		forLog.Body = nil
+		k.appendLocked("artifact.put", id, marshalCanonical(forLog))
 	}
 	return &ArtifactRef{Id: id}
 }
@@ -235,7 +257,12 @@ func (k *Kernel) RequestGate(r *GateRequest) *GateTicket {
 		id = fmt.Sprintf("gate-%d", k.gateCounter)
 	}
 	k.gates[id] = &GateDecision{RequestId: id, Decision: DecisionPending}
-	k.appendLocked("gate.requested", id, r.Context)
+	// The full request lands in the tamper-evident chain — action, requested_by,
+	// and context are the evidence a human (or an auditor after a restart)
+	// reconstructs. detail is the canonical GateRequest, with its assigned id.
+	req := clone(r)
+	req.Id = id
+	k.appendLocked("gate.requested", id, marshalCanonical(req))
 	return &GateTicket{RequestId: id}
 }
 
@@ -252,7 +279,9 @@ func (k *Kernel) DecideGate(d *GateDecision) (*GateDecision, error) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, d.RequestId)
 	}
 	k.gates[d.RequestId] = d
-	k.appendLocked("gate.decided", d.RequestId, nil)
+	// The decision itself — who decided, what, and why — is hash-committed, so
+	// the approval record can't be rewritten without breaking the chain.
+	k.appendLocked("gate.decided", d.RequestId, marshalCanonical(d))
 	k.gateCond.Broadcast()
 	return clone(d), nil
 }

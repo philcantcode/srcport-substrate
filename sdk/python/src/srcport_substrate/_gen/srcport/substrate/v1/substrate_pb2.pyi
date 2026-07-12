@@ -51,7 +51,7 @@ class ModuleManifest(_message.Message):
     def __init__(self, name: _Optional[str] = ..., version: _Optional[str] = ..., provides: _Optional[_Iterable[_Union[Capability, _Mapping]]] = ..., requires: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class Artifact(_message.Message):
-    __slots__ = ("id", "type", "body", "meta", "produced_by")
+    __slots__ = ("id", "type", "body", "meta", "produced_by", "derived_from")
     class MetaEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -64,12 +64,14 @@ class Artifact(_message.Message):
     BODY_FIELD_NUMBER: _ClassVar[int]
     META_FIELD_NUMBER: _ClassVar[int]
     PRODUCED_BY_FIELD_NUMBER: _ClassVar[int]
+    DERIVED_FROM_FIELD_NUMBER: _ClassVar[int]
     id: str
     type: str
     body: bytes
     meta: _containers.ScalarMap[str, str]
     produced_by: str
-    def __init__(self, id: _Optional[str] = ..., type: _Optional[str] = ..., body: _Optional[bytes] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ...) -> None: ...
+    derived_from: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, id: _Optional[str] = ..., type: _Optional[str] = ..., body: _Optional[bytes] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ..., derived_from: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ArtifactRef(_message.Message):
     __slots__ = ("id",)

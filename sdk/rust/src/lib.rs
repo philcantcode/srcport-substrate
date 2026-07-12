@@ -215,11 +215,15 @@ impl Kernel {
                 });
         }
         let name = manifest.name.clone();
+        // The full manifest lands in the tamper-evident chain, so the registry
+        // is reconstructable from the ledger alone. `detail` is the canonical
+        // ModuleManifest; see SPEC.md "Ledger detail".
+        let detail = manifest.encode_to_vec();
         state.modules.push(ModuleSlot {
             manifest,
             lifecycle: Lifecycle::Registered,
         });
-        Self::append_locked(&mut state, "module.registered", &name, Vec::new());
+        Self::append_locked(&mut state, "module.registered", &name, detail);
         RegisterAck {
             state: Lifecycle::Registered as i32,
         }
@@ -260,8 +264,15 @@ impl Kernel {
         let mut state = self.state.lock().unwrap();
         // Immutability: only the first writer of an id sets the stored bytes.
         if !state.artifacts.contains_key(&id) {
+            // The ledger commits to everything but the body: `subject` (the id)
+            // already addresses (type, body), so re-inlining the body would
+            // duplicate the store into a log it can never prune. `detail` is the
+            // canonical Artifact with `body` cleared; see SPEC.md "Ledger detail".
+            let body = std::mem::take(&mut artifact.body);
+            let detail = artifact.encode_to_vec();
+            artifact.body = body;
             state.artifacts.insert(id.clone(), artifact);
-            Self::append_locked(&mut state, "artifact.put", &id, Vec::new());
+            Self::append_locked(&mut state, "artifact.put", &id, detail);
         }
         ArtifactRef { id }
     }

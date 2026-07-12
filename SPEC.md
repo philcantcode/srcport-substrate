@@ -34,7 +34,7 @@ shapes just carry them.
 | # | Primitive | Message(s) | Invariant the kernel guarantees |
 |---|-----------|------------|---------------------------------|
 | 1 | **Module** | `ModuleManifest`, `Capability`, `Lifecycle` | A module is a self-contained vertical slice. It declares what it `provides`/`requires` and moves through `REGISTERED → LOADED → ACTIVE → DEACTIVATED`. It never imports another module. |
-| 2 | **Artifact** | `Artifact`, `ArtifactRef` | Typed, content-addressed, **immutable**. `id = "sha256:" + hex(sha256(type + 0x00 + body))`. Same content ⇒ same id; any change ⇒ a new id. Stored artifacts are never mutated in place. |
+| 2 | **Artifact** | `Artifact`, `ArtifactRef` | Typed, content-addressed, **immutable**. `id = "sha256:" + hex(sha256(type + 0x00 + body))`. Same content ⇒ same id; any change ⇒ a new id. Stored artifacts are never mutated in place. `derived_from` records the parent ids it was built from — provenance that makes the immutable chain a lineage graph, and is deliberately **not** part of the address. |
 | 3 | **Contract** | `Contract`, `Capability.contract`, `Artifact.type`, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to a contract *ref* (a string name), never to each other's code. |
 | 4 | **Event** | `Event`, `Subscription` | Modules publish to topics and subscribe to topics; they never call each other directly. Every event gets a monotonic `seq` — a **total order** within the kernel. |
 | 5 | **Ledger** | `LedgerEntry` | Append-only and **hash-chained**. Each entry commits to the previous entry's hash, so the whole history is tamper-evident and fully agent-observable. Every meaningful kernel action writes one entry. |
@@ -103,10 +103,13 @@ This is a rule SDKs uphold, **not** a wire change — `detail` was always `bytes
 Pin it now, while one SDK exists; discovered after several exist, it is a breaking
 change to chain verification.
 
-> **Status (v0.1).** The Rust SDK enforces this for `gate.requested` /
-> `gate.decided` first — the approval record is the entry where tamper-evidence
-> matters most. The remaining kinds adopt fat detail as it is implemented; the
-> encoding rule above is fixed regardless.
+> **Status (v0.1).** All three SDKs — Rust, Go, and Python — enforce this for
+> `module.registered`, `artifact.put`, `gate.requested`, and `gate.decided`, so
+> the registry, the artifact store, and the approval record all reconstruct from
+> the chain alone. A shared known-answer fixture pins the exact final chain hash
+> and every suite asserts the same constant, so the three chains are proven to
+> cross-verify byte-for-byte. `event.published` waits on how a payload is
+> addressed (as an artifact ref); the encoding rule above is fixed regardless.
 
 ---
 
@@ -153,9 +156,16 @@ The minimal conformance suite (each SDK ships it) is:
    contract.
 7. **Ledger reconstruction & canonical detail** — a state-bearing entry's `detail`
    decodes to the message named for its `kind` and reproduces the original value,
-   and re-encoding it canonically is byte-identical, so chains cross-verify. The
-   v0.1 Rust SDK enforces this for gates: a gate's full request and its decision
-   (who / what / why) round-trip from the tamper-evident chain alone.
+   and re-encoding it canonically is byte-identical, so chains cross-verify. All
+   three SDKs enforce this for `module.registered`, `artifact.put`, and both gate
+   kinds — the registry, the artifact store, and the approval record all round-trip
+   from the tamper-evident chain alone. A shared known-answer fixture pins the exact
+   chain hash identically across Rust, Go, and Python, so cross-verification is
+   proven, not assumed.
+8. **Address invariance** — `meta`, `produced_by`, and `derived_from` are not part
+   of the address; an identity-preserving change to them must *not* move the `id`.
+   (Metamorphic: the mirror of #1 — a change that preserves `(type, body)` must
+   preserve the address.)
 
 An SDK is "done" when these pass and the human-owned contract above is unchanged.
 Everything else in the SDK is a leaf you never have to read.

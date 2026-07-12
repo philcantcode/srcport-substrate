@@ -2,7 +2,7 @@
 //! conformant iff all of them pass. Each test names the primitive and invariant
 //! it pins down. If you widen the contract, add tests here — never weaken these.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::thread;
 
 use srcport_substrate::*;
@@ -53,7 +53,7 @@ fn addressing_is_content_derived_and_metamorphic() {
 fn artifacts_are_immutable() {
     let k = Kernel::new();
 
-    let mut meta = HashMap::new();
+    let mut meta = BTreeMap::new();
     meta.insert("first".into(), "true".into());
     let r = k.put_artifact(Artifact {
         r#type: "t".into(),
@@ -68,7 +68,7 @@ fn artifacts_are_immutable() {
 
     // A later put of the same content (same id) with different meta must NOT
     // change what is stored. First write wins.
-    let mut meta2 = HashMap::new();
+    let mut meta2 = BTreeMap::new();
     meta2.insert("first".into(), "false".into());
     meta2.insert("sneaky".into(), "yes".into());
     let r2 = k.put_artifact(Artifact {
@@ -312,6 +312,172 @@ fn gate_request_and_decision_are_in_the_chain() {
     assert!(
         !verify_chain(&forged),
         "rewriting the recorded decision must break the chain"
+    );
+}
+
+// 7b. Fat detail for artifact.put and module.registered — both reconstruct from
+//     the chain (including the artifact's `derived_from` lineage), and the body
+//     is cleared (already addressed by the id in `subject`, so the log never
+//     duplicates blob content).
+#[test]
+fn artifact_and_module_reconstruct_from_the_chain() {
+    let k = Kernel::new();
+
+    let mut meta = BTreeMap::new();
+    meta.insert("region".into(), "eu".into());
+    meta.insert("scan".into(), "full".into());
+    let r = k.put_artifact(Artifact {
+        r#type: "acme.recon.v1.Host".into(),
+        body: b"10.0.0.1".to_vec(),
+        meta: meta.clone(),
+        produced_by: "recon".into(),
+        derived_from: vec!["sha256:parent-a".into(), "sha256:parent-b".into()],
+        ..Default::default()
+    });
+
+    k.register(ModuleManifest {
+        name: "recon".into(),
+        version: "0.1.0".into(),
+        provides: vec![Capability {
+            name: "recon.scan".into(),
+            contract: "acme.recon.v1.ScanRequest".into(),
+        }],
+        requires: vec!["report.render".into()],
+    });
+
+    let chain = k.ledger();
+
+    // artifact.put reconstructs everything but the body.
+    let a_entry = chain.iter().find(|e| e.kind == "artifact.put").unwrap();
+    let a = Artifact::decode(&a_entry.detail[..]).unwrap();
+    assert_eq!(a.id, r.id);
+    assert_eq!(a_entry.subject, r.id, "subject is the content address");
+    assert_eq!(a.r#type, "acme.recon.v1.Host");
+    assert_eq!(a.meta, meta);
+    assert_eq!(a.produced_by, "recon");
+    assert_eq!(
+        a.derived_from,
+        vec!["sha256:parent-a".to_string(), "sha256:parent-b".to_string()],
+        "derived_from lineage round-trips through the ledger"
+    );
+    assert!(a.body.is_empty(), "body is cleared — the id already addresses it");
+
+    // module.registered reconstructs the whole manifest.
+    let m_entry = chain.iter().find(|e| e.kind == "module.registered").unwrap();
+    let m = ModuleManifest::decode(&m_entry.detail[..]).unwrap();
+    assert_eq!(m.name, "recon");
+    assert_eq!(m.version, "0.1.0");
+    assert_eq!(m.provides.len(), 1);
+    assert_eq!(m.provides[0].name, "recon.scan");
+    assert_eq!(m.requires, vec!["report.render".to_string()]);
+
+    assert!(k.verify_ledger(), "the chain with fat detail verifies");
+}
+
+// 7c. CANONICAL DETAIL — `map<>` fields encode in sorted-key order, so the same
+//     logical value hashes to identical bytes across SDKs and runs. `Artifact.meta`
+//     is a BTreeMap for exactly this reason; two builds must encode byte-identically.
+#[test]
+fn map_detail_encodes_canonically() {
+    let pairs = [("z", "1"), ("a", "2"), ("m", "3"), ("b", "4")];
+    let build = || {
+        let mut meta = BTreeMap::new();
+        for (key, val) in pairs {
+            meta.insert(key.to_string(), val.to_string());
+        }
+        Artifact {
+            r#type: "t".into(),
+            meta,
+            ..Default::default()
+        }
+    };
+    assert_eq!(
+        build().encode_to_vec(),
+        build().encode_to_vec(),
+        "identical meta must encode to identical bytes (sorted keys)"
+    );
+}
+
+// 8. ADDRESS INVARIANCE — `meta`, `produced_by`, and `derived_from` are NOT part
+//    of the address; transforming them must not move the `id`. The mirror of #1:
+//    an identity-preserving change must NOT change the address (metamorphic).
+#[test]
+fn address_ignores_non_identity_fields() {
+    let k = Kernel::new();
+    let base = k.put_artifact(Artifact {
+        r#type: "acme.recon.v1.Host".into(),
+        body: b"10.0.0.1".to_vec(),
+        ..Default::default()
+    });
+
+    let mut meta = BTreeMap::new();
+    meta.insert("x".into(), "y".into());
+    let enriched = k.put_artifact(Artifact {
+        r#type: "acme.recon.v1.Host".into(),
+        body: b"10.0.0.1".to_vec(),
+        meta,
+        produced_by: "whoever".into(),
+        derived_from: vec!["sha256:some-parent".into()],
+        ..Default::default()
+    });
+
+    assert_eq!(
+        enriched.id, base.id,
+        "meta, produced_by, and derived_from must not participate in the address"
+    );
+    assert_eq!(enriched.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"));
+}
+
+// CROSS-SDK KNOWN ANSWER — a fixed scenario must produce this exact final ledger
+// hash in every SDK. Go, Rust, and Python all assert the SAME constant, so any
+// drift in canonical detail encoding or the hash rule fails here and the three
+// chains are pinned to cross-verify. If this constant ever changes, it changes in
+// all three suites in lockstep — never one SDK alone.
+#[test]
+fn ledger_hash_known_answer_cross_sdk() {
+    const WANT: &str = "985f4980bda5266d03b3e7092ef2bd9eb49b12107b43f17bbe00415deca4ab6a";
+
+    let k = Kernel::new();
+    k.register(ModuleManifest {
+        name: "recon".into(),
+        version: "0.1.0".into(),
+        provides: vec![Capability {
+            name: "recon.scan".into(),
+            contract: "acme.recon.v1.ScanRequest".into(),
+        }],
+        requires: vec!["report.render".into()],
+    });
+    let mut meta = BTreeMap::new();
+    meta.insert("region".into(), "eu".into());
+    meta.insert("scan".into(), "full".into());
+    k.put_artifact(Artifact {
+        r#type: "acme.recon.v1.Host".into(),
+        body: b"10.0.0.1".to_vec(),
+        meta,
+        produced_by: "recon".into(),
+        derived_from: vec!["sha256:parent-a".into(), "sha256:parent-b".into()],
+        ..Default::default()
+    });
+    let t = k.request_gate(GateRequest {
+        action: "delete production".into(),
+        context: b"rows=42".to_vec(),
+        requested_by: "danger".into(),
+        ..Default::default()
+    });
+    k.decide_gate(GateDecision {
+        request_id: t.request_id,
+        decision: Decision::Approved as i32,
+        decided_by: "phil".into(),
+        reason: "reviewed".into(),
+    })
+    .unwrap();
+
+    let chain = k.ledger();
+    assert!(k.verify_ledger(), "the chain must verify");
+    assert_eq!(
+        chain.last().unwrap().hash,
+        WANT,
+        "cross-SDK ledger hash drift"
     );
 }
 

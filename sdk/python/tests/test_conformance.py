@@ -183,6 +183,175 @@ class Conformance(unittest.TestCase):
         refs = {c.ref for c in snap.contracts}
         self.assertTrue({"acme.recon.v1.ScanRequest", "acme.report.v1.Report"} <= refs)
 
+    # 7. LEDGER RECONSTRUCTION & CANONICAL DETAIL — a state-bearing entry's detail
+    #    decodes to the message named for its kind and reproduces the original
+    #    value, so the registry, the artifact store, and the approval record all
+    #    round-trip from the tamper-evident chain alone. detail is folded into the
+    #    entry hash, so forging it breaks verification.
+    def test_ledger_reconstructs_state_from_detail(self):
+        k = Kernel()
+        r = k.put_artifact(
+            Artifact(
+                type="acme.recon.v1.Host",
+                body=b"10.0.0.1",
+                meta={"region": "eu", "scan": "full"},
+                produced_by="recon",
+                derived_from=["sha256:parent-a", "sha256:parent-b"],
+            )
+        )
+        k.register(
+            ModuleManifest(
+                name="recon",
+                version="0.1.0",
+                provides=[Capability(name="recon.scan", contract="acme.recon.v1.ScanRequest")],
+                requires=["report.render"],
+            )
+        )
+        t = k.request_gate(
+            GateRequest(action="delete production", context=b"rows=42", requested_by="danger")
+        )
+        k.decide_gate(
+            GateDecision(
+                request_id=t.request_id,
+                decision=Decision.DECISION_APPROVED,
+                decided_by="phil",
+                reason="reviewed",
+            )
+        )
+
+        chain = k.ledger()
+
+        def detail_of(kind):
+            return next(e for e in chain if e.kind == kind).detail
+
+        # artifact.put reconstructs everything but the body; lineage rides along.
+        a_entry = next(e for e in chain if e.kind == "artifact.put")
+        a = Artifact()
+        a.ParseFromString(a_entry.detail)
+        self.assertEqual(a.id, r.id)
+        self.assertEqual(a_entry.subject, r.id, "subject is the content address")
+        self.assertEqual(a.type, "acme.recon.v1.Host")
+        self.assertEqual(a.produced_by, "recon")
+        self.assertEqual(dict(a.meta), {"region": "eu", "scan": "full"})
+        self.assertEqual(
+            list(a.derived_from),
+            ["sha256:parent-a", "sha256:parent-b"],
+            "derived_from lineage must round-trip through the ledger",
+        )
+        self.assertEqual(a.body, b"", "body is cleared — the id already addresses it")
+
+        # module.registered reconstructs the whole manifest.
+        m = ModuleManifest()
+        m.ParseFromString(detail_of("module.registered"))
+        self.assertEqual((m.name, m.version), ("recon", "0.1.0"))
+        self.assertEqual(len(m.provides), 1)
+        self.assertEqual(m.provides[0].name, "recon.scan")
+        self.assertEqual(list(m.requires), ["report.render"])
+
+        # gate.requested / gate.decided reconstruct who / what / why.
+        req = GateRequest()
+        req.ParseFromString(detail_of("gate.requested"))
+        self.assertEqual(
+            (req.action, req.requested_by, req.context),
+            ("delete production", "danger", b"rows=42"),
+        )
+        dec = GateDecision()
+        dec.ParseFromString(detail_of("gate.decided"))
+        self.assertEqual(
+            (dec.decision, dec.decided_by, dec.reason),
+            (Decision.DECISION_APPROVED, "phil", "reviewed"),
+        )
+
+        self.assertTrue(k.verify_ledger(), "the chain with fat detail verifies")
+
+        # The approval record is hash-committed: forging who approved it (by
+        # re-encoding a different decider into detail) breaks verification.
+        forged = k.ledger()
+        i = next(i for i, e in enumerate(forged) if e.kind == "gate.decided")
+        forged[i].detail = GateDecision(
+            request_id=t.request_id,
+            decision=Decision.DECISION_APPROVED,
+            decided_by="attacker",
+            reason="reviewed",
+        ).SerializeToString(deterministic=True)
+        self.assertFalse(verify_chain(forged), "rewriting the recorded decision breaks the chain")
+
+    # 7c. CANONICAL DETAIL — the same logical value encodes to identical bytes, so
+    #     ledger detail hashes reproducibly across runs and SDKs (sorted map keys).
+    def test_ledger_detail_encodes_canonically(self):
+        def build():
+            return Artifact(
+                type="t", meta={"z": "1", "a": "2", "m": "3", "b": "4"}
+            ).SerializeToString(deterministic=True)
+
+        for _ in range(64):
+            self.assertEqual(
+                build(), build(), "identical meta must encode to identical bytes (sorted keys)"
+            )
+
+    # METAMORPHIC — the address depends ONLY on (type, body). Transforming fields
+    # that aren't identity (meta, produced_by, derived_from) is a known no-op: the
+    # id must not move, or the address would be keyed on provenance, not content.
+    def test_address_ignores_non_identity_fields(self):
+        k = Kernel()
+        base = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"10.0.0.1"))
+        enriched = k.put_artifact(
+            Artifact(
+                type="acme.recon.v1.Host",
+                body=b"10.0.0.1",
+                meta={"x": "y"},
+                produced_by="whoever",
+                derived_from=["sha256:some-parent"],
+            )
+        )
+        self.assertEqual(
+            enriched.id, base.id,
+            "meta, produced_by, derived_from must not participate in the address",
+        )
+        self.assertEqual(enriched.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"))
+
+    # CROSS-SDK KNOWN ANSWER — a fixed scenario must produce this exact final
+    # ledger hash in every SDK. Go, Rust, and Python all assert the SAME constant,
+    # so any drift in canonical detail encoding or the hash rule fails here and the
+    # three chains are pinned to cross-verify. If it ever changes, it changes in
+    # all three suites in lockstep — never one SDK alone.
+    def test_ledger_hash_known_answer_cross_sdk(self):
+        want = "985f4980bda5266d03b3e7092ef2bd9eb49b12107b43f17bbe00415deca4ab6a"
+
+        k = Kernel()
+        k.register(
+            ModuleManifest(
+                name="recon",
+                version="0.1.0",
+                provides=[Capability(name="recon.scan", contract="acme.recon.v1.ScanRequest")],
+                requires=["report.render"],
+            )
+        )
+        k.put_artifact(
+            Artifact(
+                type="acme.recon.v1.Host",
+                body=b"10.0.0.1",
+                meta={"region": "eu", "scan": "full"},
+                produced_by="recon",
+                derived_from=["sha256:parent-a", "sha256:parent-b"],
+            )
+        )
+        t = k.request_gate(
+            GateRequest(action="delete production", context=b"rows=42", requested_by="danger")
+        )
+        k.decide_gate(
+            GateDecision(
+                request_id=t.request_id,
+                decision=Decision.DECISION_APPROVED,
+                decided_by="phil",
+                reason="reviewed",
+            )
+        )
+
+        chain = k.ledger()
+        self.assertTrue(k.verify_ledger(), "the chain must verify")
+        self.assertEqual(chain[-1].hash, want, "cross-SDK ledger hash drift")
+
 
 if __name__ == "__main__":
     unittest.main()

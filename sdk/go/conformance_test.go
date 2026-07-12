@@ -7,6 +7,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 )
 
 func recv(t *testing.T, ch <-chan *Event, d time.Duration) (*Event, bool) {
@@ -240,4 +242,186 @@ func hasContract(cs []*Contract, ref string) bool {
 		}
 	}
 	return false
+}
+
+func findKind(chain []*LedgerEntry, kind string) *LedgerEntry {
+	for _, e := range chain {
+		if e.Kind == kind {
+			return e
+		}
+	}
+	return nil
+}
+
+func indexKind(chain []*LedgerEntry, kind string) int {
+	for i, e := range chain {
+		if e.Kind == kind {
+			return i
+		}
+	}
+	return -1
+}
+
+// 7. LEDGER RECONSTRUCTION & CANONICAL DETAIL — a state-bearing entry's Detail
+//    decodes to the message named for its Kind and reproduces the original
+//    value, so the registry, the artifact store, and the approval record all
+//    round-trip from the tamper-evident chain alone. Detail is folded into the
+//    entry hash, so forging it breaks verification.
+func TestLedgerReconstructsStateFromDetail(t *testing.T) {
+	k := NewKernel()
+
+	r := k.PutArtifact(&Artifact{
+		Type:        "acme.recon.v1.Host",
+		Body:        []byte("10.0.0.1"),
+		Meta:        map[string]string{"region": "eu", "scan": "full"},
+		ProducedBy:  "recon",
+		DerivedFrom: []string{"sha256:parent-a", "sha256:parent-b"},
+	})
+	k.Register(&ModuleManifest{
+		Name: "recon", Version: "0.1.0",
+		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
+		Requires: []string{"report.render"},
+	})
+	tkt := k.RequestGate(&GateRequest{Action: "delete production", Context: []byte("rows=42"), RequestedBy: "danger"})
+	if _, err := k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "phil", Reason: "reviewed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	chain := k.Ledger()
+
+	// artifact.put reconstructs everything but the body; lineage rides along.
+	var a Artifact
+	aEntry := findKind(chain, "artifact.put")
+	if err := proto.Unmarshal(aEntry.Detail, &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.Id != r.Id || aEntry.Subject != r.Id {
+		t.Fatal("subject and detail id must both be the content address")
+	}
+	if a.Type != "acme.recon.v1.Host" || a.ProducedBy != "recon" {
+		t.Fatal("type and producer must round-trip")
+	}
+	if a.Meta["region"] != "eu" || a.Meta["scan"] != "full" {
+		t.Fatal("meta must round-trip")
+	}
+	if len(a.DerivedFrom) != 2 || a.DerivedFrom[0] != "sha256:parent-a" || a.DerivedFrom[1] != "sha256:parent-b" {
+		t.Fatal("derived_from lineage must round-trip through the ledger")
+	}
+	if len(a.Body) != 0 {
+		t.Fatal("body must be cleared — the id in subject already addresses it")
+	}
+
+	// module.registered reconstructs the whole manifest.
+	var m ModuleManifest
+	if err := proto.Unmarshal(findKind(chain, "module.registered").Detail, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.Name != "recon" || m.Version != "0.1.0" || len(m.Provides) != 1 || m.Provides[0].Name != "recon.scan" {
+		t.Fatal("manifest name/version/provides must round-trip")
+	}
+	if len(m.Requires) != 1 || m.Requires[0] != "report.render" {
+		t.Fatal("requires must round-trip")
+	}
+
+	// gate.requested / gate.decided reconstruct who / what / why.
+	var req GateRequest
+	if err := proto.Unmarshal(findKind(chain, "gate.requested").Detail, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Action != "delete production" || req.RequestedBy != "danger" || !bytes.Equal(req.Context, []byte("rows=42")) {
+		t.Fatal("gate request must round-trip from the chain")
+	}
+	var dec GateDecision
+	if err := proto.Unmarshal(findKind(chain, "gate.decided").Detail, &dec); err != nil {
+		t.Fatal(err)
+	}
+	if dec.Decision != DecisionApproved || dec.DecidedBy != "phil" || dec.Reason != "reviewed" {
+		t.Fatal("gate decision must round-trip from the chain")
+	}
+
+	if !k.VerifyLedger() {
+		t.Fatal("the chain with fat detail must verify")
+	}
+
+	// The approval record is hash-committed: forging who approved it (re-encoding
+	// a different decider into Detail) must break verification.
+	forged := k.Ledger()
+	i := indexKind(forged, "gate.decided")
+	forged[i].Detail = marshalCanonical(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "attacker", Reason: "reviewed"})
+	if VerifyChain(forged) {
+		t.Fatal("rewriting the recorded decision must break the chain")
+	}
+}
+
+// 7c. CANONICAL DETAIL — the same logical value encodes to identical bytes every
+//     time, so ledger detail hashes reproducibly across runs and SDKs. Go map
+//     iteration is randomized; this pins that the kernel's canonical marshal
+//     (Deterministic: sorted keys) defeats it.
+func TestLedgerDetailEncodesCanonically(t *testing.T) {
+	build := func() []byte {
+		return marshalCanonical(&Artifact{
+			Type: "t",
+			Meta: map[string]string{"z": "1", "a": "2", "m": "3", "b": "4"},
+		})
+	}
+	for i := 0; i < 64; i++ {
+		if !bytes.Equal(build(), build()) {
+			t.Fatal("identical meta must encode to identical bytes (deterministic, sorted keys)")
+		}
+	}
+}
+
+// METAMORPHIC — the address depends ONLY on (type, body). Transforming fields
+// that aren't identity (meta, produced_by, derived_from) is a known no-op: the
+// id must not move. If it did, the address would be keyed on provenance, not
+// content — exactly the overfit a metamorphic test exists to catch.
+func TestAddressIgnoresNonIdentityFields(t *testing.T) {
+	k := NewKernel()
+	base := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1")})
+
+	enriched := k.PutArtifact(&Artifact{
+		Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"),
+		Meta:        map[string]string{"x": "y"},
+		ProducedBy:  "whoever",
+		DerivedFrom: []string{"sha256:some-parent"},
+	})
+	if enriched.Id != base.Id {
+		t.Fatal("meta, produced_by, and derived_from must not participate in the address")
+	}
+	if enriched.Id != ArtifactID("acme.recon.v1.Host", []byte("10.0.0.1")) {
+		t.Fatal("address must equal the pure (type, body) function regardless of provenance")
+	}
+}
+
+// CROSS-SDK KNOWN ANSWER — a fixed scenario must produce this exact final ledger
+// hash in every SDK. Go, Rust, and Python all assert the SAME constant, so any
+// drift in canonical detail encoding or the hash rule fails here and the three
+// chains are pinned to cross-verify. If this constant ever changes, it changes
+// in all three suites in lockstep — never one SDK alone.
+func TestLedgerHashKnownAnswerCrossSDK(t *testing.T) {
+	const want = "985f4980bda5266d03b3e7092ef2bd9eb49b12107b43f17bbe00415deca4ab6a"
+
+	k := NewKernel()
+	k.Register(&ModuleManifest{
+		Name: "recon", Version: "0.1.0",
+		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
+		Requires: []string{"report.render"},
+	})
+	k.PutArtifact(&Artifact{
+		Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"),
+		Meta: map[string]string{"region": "eu", "scan": "full"}, ProducedBy: "recon",
+		DerivedFrom: []string{"sha256:parent-a", "sha256:parent-b"},
+	})
+	tkt := k.RequestGate(&GateRequest{Action: "delete production", Context: []byte("rows=42"), RequestedBy: "danger"})
+	if _, err := k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "phil", Reason: "reviewed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	chain := k.Ledger()
+	if !k.VerifyLedger() {
+		t.Fatal("the chain must verify")
+	}
+	if got := chain[len(chain)-1].Hash; got != want {
+		t.Fatalf("cross-SDK ledger hash drift:\n got  %s\n want %s", got, want)
+	}
 }
