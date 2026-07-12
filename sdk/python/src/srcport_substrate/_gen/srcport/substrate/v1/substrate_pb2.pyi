@@ -14,13 +14,6 @@ class Lifecycle(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LIFECYCLE_ACTIVE: _ClassVar[Lifecycle]
     LIFECYCLE_DEACTIVATED: _ClassVar[Lifecycle]
 
-class Decision(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
-    __slots__ = ()
-    DECISION_UNSPECIFIED: _ClassVar[Decision]
-    DECISION_PENDING: _ClassVar[Decision]
-    DECISION_APPROVED: _ClassVar[Decision]
-    DECISION_REJECTED: _ClassVar[Decision]
-
 class RunState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     RUN_STATE_UNSPECIFIED: _ClassVar[RunState]
@@ -29,21 +22,34 @@ class RunState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     RUN_STATE_STALLED: _ClassVar[RunState]
     RUN_STATE_FAILED: _ClassVar[RunState]
     RUN_STATE_CANCELLED: _ClassVar[RunState]
+
+class ErrorCode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    ERROR_CODE_UNSPECIFIED: _ClassVar[ErrorCode]
+    ERROR_CODE_NOT_FOUND: _ClassVar[ErrorCode]
+    ERROR_CODE_INVALID: _ClassVar[ErrorCode]
+    ERROR_CODE_CONFLICT: _ClassVar[ErrorCode]
+    ERROR_CODE_FAILED_PRECONDITION: _ClassVar[ErrorCode]
+    ERROR_CODE_RESOURCE_EXHAUSTED: _ClassVar[ErrorCode]
+    ERROR_CODE_BLOB_INTEGRITY: _ClassVar[ErrorCode]
 LIFECYCLE_UNSPECIFIED: Lifecycle
 LIFECYCLE_REGISTERED: Lifecycle
 LIFECYCLE_LOADED: Lifecycle
 LIFECYCLE_ACTIVE: Lifecycle
 LIFECYCLE_DEACTIVATED: Lifecycle
-DECISION_UNSPECIFIED: Decision
-DECISION_PENDING: Decision
-DECISION_APPROVED: Decision
-DECISION_REJECTED: Decision
 RUN_STATE_UNSPECIFIED: RunState
 RUN_STATE_RUNNING: RunState
 RUN_STATE_COMPLETED: RunState
 RUN_STATE_STALLED: RunState
 RUN_STATE_FAILED: RunState
 RUN_STATE_CANCELLED: RunState
+ERROR_CODE_UNSPECIFIED: ErrorCode
+ERROR_CODE_NOT_FOUND: ErrorCode
+ERROR_CODE_INVALID: ErrorCode
+ERROR_CODE_CONFLICT: ErrorCode
+ERROR_CODE_FAILED_PRECONDITION: ErrorCode
+ERROR_CODE_RESOURCE_EXHAUSTED: ErrorCode
+ERROR_CODE_BLOB_INTEGRITY: ErrorCode
 
 class Capability(_message.Message):
     __slots__ = ("name", "contract", "inputs", "outputs")
@@ -81,8 +87,28 @@ class ModuleManifest(_message.Message):
     requires: _containers.RepeatedScalarFieldContainer[str]
     def __init__(self, name: _Optional[str] = ..., version: _Optional[str] = ..., provides: _Optional[_Iterable[_Union[Capability, _Mapping]]] = ..., requires: _Optional[_Iterable[str]] = ...) -> None: ...
 
+class BlobRef(_message.Message):
+    __slots__ = ("digest", "byte_count", "namespace")
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    BYTE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    digest: str
+    byte_count: int
+    namespace: str
+    def __init__(self, digest: _Optional[str] = ..., byte_count: _Optional[int] = ..., namespace: _Optional[str] = ...) -> None: ...
+
+class ObjectRef(_message.Message):
+    __slots__ = ("digest", "byte_count", "namespace")
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    BYTE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    digest: str
+    byte_count: int
+    namespace: str
+    def __init__(self, digest: _Optional[str] = ..., byte_count: _Optional[int] = ..., namespace: _Optional[str] = ...) -> None: ...
+
 class Artifact(_message.Message):
-    __slots__ = ("id", "type", "body", "meta", "produced_by", "derived_from")
+    __slots__ = ("id", "type", "body", "meta", "produced_by", "derived_from", "object")
     class MetaEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -96,13 +122,15 @@ class Artifact(_message.Message):
     META_FIELD_NUMBER: _ClassVar[int]
     PRODUCED_BY_FIELD_NUMBER: _ClassVar[int]
     DERIVED_FROM_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_FIELD_NUMBER: _ClassVar[int]
     id: str
     type: str
     body: bytes
     meta: _containers.ScalarMap[str, str]
     produced_by: str
     derived_from: _containers.RepeatedScalarFieldContainer[str]
-    def __init__(self, id: _Optional[str] = ..., type: _Optional[str] = ..., body: _Optional[bytes] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ..., derived_from: _Optional[_Iterable[str]] = ...) -> None: ...
+    object: ObjectRef
+    def __init__(self, id: _Optional[str] = ..., type: _Optional[str] = ..., body: _Optional[bytes] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ..., derived_from: _Optional[_Iterable[str]] = ..., object: _Optional[_Union[ObjectRef, _Mapping]] = ...) -> None: ...
 
 class ArtifactRef(_message.Message):
     __slots__ = ("id",)
@@ -110,13 +138,65 @@ class ArtifactRef(_message.Message):
     id: str
     def __init__(self, id: _Optional[str] = ...) -> None: ...
 
+class PutBlobRequest(_message.Message):
+    __slots__ = ("namespace", "data")
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    namespace: str
+    data: bytes
+    def __init__(self, namespace: _Optional[str] = ..., data: _Optional[bytes] = ...) -> None: ...
+
+class GetBlobRequest(_message.Message):
+    __slots__ = ("digest", "namespace")
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    digest: str
+    namespace: str
+    def __init__(self, digest: _Optional[str] = ..., namespace: _Optional[str] = ...) -> None: ...
+
+class BlobData(_message.Message):
+    __slots__ = ("digest", "byte_count", "namespace", "data")
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    BYTE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    digest: str
+    byte_count: int
+    namespace: str
+    data: bytes
+    def __init__(self, digest: _Optional[str] = ..., byte_count: _Optional[int] = ..., namespace: _Optional[str] = ..., data: _Optional[bytes] = ...) -> None: ...
+
+class HasBlobRequest(_message.Message):
+    __slots__ = ("digest", "namespace")
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    NAMESPACE_FIELD_NUMBER: _ClassVar[int]
+    digest: str
+    namespace: str
+    def __init__(self, digest: _Optional[str] = ..., namespace: _Optional[str] = ...) -> None: ...
+
+class HasBlobResponse(_message.Message):
+    __slots__ = ("exists", "byte_count")
+    EXISTS_FIELD_NUMBER: _ClassVar[int]
+    BYTE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    exists: bool
+    byte_count: int
+    def __init__(self, exists: bool = ..., byte_count: _Optional[int] = ...) -> None: ...
+
 class Contract(_message.Message):
-    __slots__ = ("ref", "schema")
+    __slots__ = ("ref", "schema", "media_type", "version", "digest", "compatible_with")
     REF_FIELD_NUMBER: _ClassVar[int]
     SCHEMA_FIELD_NUMBER: _ClassVar[int]
+    MEDIA_TYPE_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    DIGEST_FIELD_NUMBER: _ClassVar[int]
+    COMPATIBLE_WITH_FIELD_NUMBER: _ClassVar[int]
     ref: str
     schema: str
-    def __init__(self, ref: _Optional[str] = ..., schema: _Optional[str] = ...) -> None: ...
+    media_type: str
+    version: str
+    digest: str
+    compatible_with: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, ref: _Optional[str] = ..., schema: _Optional[str] = ..., media_type: _Optional[str] = ..., version: _Optional[str] = ..., digest: _Optional[str] = ..., compatible_with: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class Event(_message.Message):
     __slots__ = ("id", "topic", "type", "payload", "source", "seq", "run_id", "artifacts")
@@ -153,30 +233,6 @@ class LedgerEntry(_message.Message):
     prev_hash: str
     hash: str
     def __init__(self, seq: _Optional[int] = ..., kind: _Optional[str] = ..., subject: _Optional[str] = ..., detail: _Optional[bytes] = ..., prev_hash: _Optional[str] = ..., hash: _Optional[str] = ...) -> None: ...
-
-class GateRequest(_message.Message):
-    __slots__ = ("id", "action", "context", "requested_by")
-    ID_FIELD_NUMBER: _ClassVar[int]
-    ACTION_FIELD_NUMBER: _ClassVar[int]
-    CONTEXT_FIELD_NUMBER: _ClassVar[int]
-    REQUESTED_BY_FIELD_NUMBER: _ClassVar[int]
-    id: str
-    action: str
-    context: bytes
-    requested_by: str
-    def __init__(self, id: _Optional[str] = ..., action: _Optional[str] = ..., context: _Optional[bytes] = ..., requested_by: _Optional[str] = ...) -> None: ...
-
-class GateDecision(_message.Message):
-    __slots__ = ("request_id", "decision", "decided_by", "reason")
-    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    DECISION_FIELD_NUMBER: _ClassVar[int]
-    DECIDED_BY_FIELD_NUMBER: _ClassVar[int]
-    REASON_FIELD_NUMBER: _ClassVar[int]
-    request_id: str
-    decision: Decision
-    decided_by: str
-    reason: str
-    def __init__(self, request_id: _Optional[str] = ..., decision: _Optional[_Union[Decision, str]] = ..., decided_by: _Optional[str] = ..., reason: _Optional[str] = ...) -> None: ...
 
 class RegistrySnapshot(_message.Message):
     __slots__ = ("modules", "capabilities", "contracts")
@@ -340,6 +396,32 @@ class DerivationList(_message.Message):
     derivations: _containers.RepeatedCompositeFieldContainer[Derivation]
     def __init__(self, derivations: _Optional[_Iterable[_Union[Derivation, _Mapping]]] = ...) -> None: ...
 
+class RequestContext(_message.Message):
+    __slots__ = ("caller", "request_key", "deadline_unix_ms", "correlation_id")
+    CALLER_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_KEY_FIELD_NUMBER: _ClassVar[int]
+    DEADLINE_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
+    CORRELATION_ID_FIELD_NUMBER: _ClassVar[int]
+    caller: str
+    request_key: str
+    deadline_unix_ms: int
+    correlation_id: str
+    def __init__(self, caller: _Optional[str] = ..., request_key: _Optional[str] = ..., deadline_unix_ms: _Optional[int] = ..., correlation_id: _Optional[str] = ...) -> None: ...
+
+class Error(_message.Message):
+    __slots__ = ("code", "message", "retryable", "conflict_subject", "failed_precondition")
+    CODE_FIELD_NUMBER: _ClassVar[int]
+    MESSAGE_FIELD_NUMBER: _ClassVar[int]
+    RETRYABLE_FIELD_NUMBER: _ClassVar[int]
+    CONFLICT_SUBJECT_FIELD_NUMBER: _ClassVar[int]
+    FAILED_PRECONDITION_FIELD_NUMBER: _ClassVar[int]
+    code: ErrorCode
+    message: str
+    retryable: bool
+    conflict_subject: str
+    failed_precondition: str
+    def __init__(self, code: _Optional[_Union[ErrorCode, str]] = ..., message: _Optional[str] = ..., retryable: bool = ..., conflict_subject: _Optional[str] = ..., failed_precondition: _Optional[str] = ...) -> None: ...
+
 class RegisterAck(_message.Message):
     __slots__ = ("state",)
     STATE_FIELD_NUMBER: _ClassVar[int]
@@ -363,12 +445,6 @@ class Subscription(_message.Message):
 class SnapshotRequest(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
-
-class GateTicket(_message.Message):
-    __slots__ = ("request_id",)
-    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
-    request_id: str
-    def __init__(self, request_id: _Optional[str] = ...) -> None: ...
 
 class AppendRequest(_message.Message):
     __slots__ = ("kind", "subject", "detail")

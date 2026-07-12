@@ -3,7 +3,7 @@ name = "flow-example"
 version = "0.1.0"
 edition = "2021"
 publish = false
-license = "LicenseRef-srcport-all-rights-reserved"
+license = "MIT OR Apache-2.0"
 description = "A runnable example: drive a real convergent Run on the Rust SDK, then reconstruct and visualise the dataflow from the tamper-evident ledger alone."
 
 # Depends on the SDK exactly as a downstream project would: by path, through

@@ -1,16 +1,18 @@
-# srcport-substrate — Python SDK (v0.1)
+# srcport-substrate — Python SDK (v1.0.0)
 
 The in-process Python realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
-It conforms to [`SPEC.md`](../../SPEC.md) — the eight primitives and the one ABI.
-One runtime dependency: the `protobuf` runtime.
+It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI.
+`MemoryKernel` implements `KernelApi`. **Durability lives in Modules, not the
+core** — the in-memory kernel is one backend, not the authority. One runtime
+dependency: the `protobuf` runtime.
 
 > The message types are **generated** from `substrate.proto` (via
 > `buf generate`, committed under `src/srcport_substrate/_gen/`) and
 > re-exported from `srcport_substrate`, so the SDK can never drift from the
 > contract. They are canonical protobuf messages: construct with keyword args
 > (`Artifact(type=…, body=…)`) and use fully-qualified enum values
-> (`Decision.DECISION_APPROVED`). To add capability, widen the proto and run
+> (`Lifecycle.LIFECYCLE_REGISTERED`). To add capability, widen the proto and run
 > `scripts/gen.sh`; do not fork this.
 
 ## Install
@@ -23,10 +25,10 @@ pip install "git+https://github.com/philcantcode/srcport-substrate.git#subdirect
 
 ```python
 from srcport_substrate import (
-    Kernel, ModuleManifest, Capability, Port, Artifact, Event, GateRequest,
+    MemoryKernel, ModuleManifest, Capability, Port, Artifact, Event, Contract,
 )
 
-kernel = Kernel()
+kernel = MemoryKernel()
 
 # 1. A module registers, declaring the contracts it speaks.
 kernel.register(ModuleManifest(
@@ -47,23 +49,23 @@ kernel.publish(Event(
     artifacts=[host], source="recon",
 ))
 
-# 4. Before anything irreversible, open a human-held gate and wait.
-ticket = kernel.request_gate(GateRequest(
-    action="exploit host 10.0.0.1", requested_by="recon",
+# 4. Contracts are immutable identities — put_contract pins ref → digest.
+#    Re-registering the same ref with different content is a conflict.
+kernel.put_contract(Contract(
+    ref="acme.recon.v1.Host",
+    media_type="application/schema+json",
+    schema='{"type":"object"}',
+    version="1.0.0",
 ))
-kernel.ensure_approved(ticket)  # raises GateBlocked until a human APPROVES
-# a human decides:
-#   from srcport_substrate import GateDecision, Decision
-#   kernel.decide_gate(GateDecision(
-#       request_id=ticket.request_id, decision=Decision.DECISION_APPROVED))
 
 # 5. The registry always answers "what exists right now."
 snapshot = kernel.snapshot()
 ```
 
-The `Kernel` methods mirror the `service Kernel` RPCs one-for-one.
-`subscribe()` returns a `queue.Queue[Event]` as the in-process "stream"; events
-arrive in kernel `seq` order. The `Kernel` is thread-safe.
+`MemoryKernel` implements `KernelApi` — the 16 unary RPCs one-for-one.
+`subscribe()` returns a bounded `queue.Queue[Event]` (`SUBSCRIBER_BUFFER`); a
+slow consumer is shed rather than allowed to OOM the kernel. Events arrive in
+kernel `seq` order. `MemoryKernel` is thread-safe.
 
 ## Convergent runs
 

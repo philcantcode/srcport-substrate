@@ -1,8 +1,10 @@
-# srcport-substrate — Go SDK (v0.1)
+# srcport-substrate — Go SDK (v1.0.0)
 
 The in-process Go realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
-It conforms to [`SPEC.md`](../../SPEC.md) — the eight primitives and the one ABI.
+It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI.
+`MemoryKernel` implements `KernelApi`. **Durability lives in Modules, not the
+core** — the in-memory kernel is one backend, not the authority.
 
 > The message types are **generated** from `substrate.proto` (via
 > `buf generate`, committed under [`internal/genpb/`](internal/genpb/)) and
@@ -29,7 +31,7 @@ import (
 )
 
 func main() {
-	k := substrate.NewKernel()
+	k := substrate.NewMemoryKernel()
 
 	// 1. A module registers, declaring the contracts it speaks.
 	k.Register(&substrate.ModuleManifest{
@@ -40,12 +42,19 @@ func main() {
 		},
 	})
 
-	// 2. It produces an immutable, content-addressed artifact...
-	host := k.PutArtifact(&substrate.Artifact{
+	// 2. Small values inline; large values PutBlob then place a verified ObjectRef.
+	host, err := k.PutArtifact(&substrate.Artifact{
 		Type:       "acme.recon.v1.Host",
 		Body:       []byte("10.0.0.1"),
 		ProducedBy: "recon",
 	})
+	if err != nil {
+		panic(err)
+	}
+	// Large evidence without copying into the artifact store:
+	// blob := k.PutBlob(&substrate.PutBlobRequest{Namespace: "evidence", Data: pcap})
+	// capture, _ := k.PutArtifact(&substrate.Artifact{Type: "observer.v1.Capture",
+	//   Object: &substrate.ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: blob.Namespace}})
 
 	// 3. ...and publishes an event. Artifact refs are the data plane; coupling
 	//    is only through contract refs.
@@ -56,13 +65,13 @@ func main() {
 		Source:    "recon",
 	})
 
-	// 4. Before anything irreversible, open a human-held gate and wait.
-	ticket := k.RequestGate(&substrate.GateRequest{
-		Action:      "exploit host 10.0.0.1",
-		RequestedBy: "recon",
-	})
-	if err := k.EnsureApproved(ticket); err != nil {
-		fmt.Println("blocked until a human APPROVES:", err)
+	// 4. Contracts are immutable identities — PutContract pins ref → digest.
+	//    Re-registering the same ref with different content is a conflict.
+	if _, err := k.PutContract(&substrate.Contract{
+		Ref: "acme.recon.v1.Host", MediaType: "application/schema+json",
+		Schema: `{"type":"object"}`, Version: "1.0.0",
+	}); err != nil {
+		fmt.Println("contract registration failed:", err)
 	}
 
 	// 5. The registry always answers "what exists right now."
@@ -70,11 +79,12 @@ func main() {
 }
 ```
 
-The `Kernel` methods mirror the `service Kernel` RPCs one-for-one. `Subscribe`
-returns an unbounded `<-chan *Event` (a background pump means the publisher
-never blocks). Values handed in and out are cloned, so a caller can never mutate
-stored state through a shared pointer. The `Kernel` is safe for concurrent use
-across goroutines.
+The `MemoryKernel` methods mirror the `service Kernel` RPCs one-for-one (and
+implement `KernelApi`). `Subscribe` returns a bounded `<-chan *Event`
+(`SubscriberBuffer`); a slow consumer is shed rather than allowed to OOM the
+kernel. Values handed in and out are cloned, so a caller can never mutate stored
+state through a shared pointer. `MemoryKernel` is safe for concurrent use across
+goroutines.
 
 ## Convergent runs
 

@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srcport-substrate"
-version = "0.1.1"
-description = "In-process Python SDK for the srcport-substrate microkernel: eight primitives and one Kernel ABI, conformant to SPEC.md (v0.1)."
+version = "1.0.0"
+description = "In-process Python SDK for the srcport-substrate microkernel: seven primitives and one KernelApi, conformant to SPEC.md (v1.0)."
 readme = "README.md"
 requires-python = ">=3.9"
-license = "LicenseRef-srcport-all-rights-reserved"
+license = "MIT OR Apache-2.0"
 authors = [{ name = "srcport.com" }]
 
 # The one runtime dependency: the protobuf runtime for the generated messages.

@@ -21,12 +21,21 @@ func recv(t *testing.T, ch <-chan *Event, d time.Duration) (*Event, bool) {
 	}
 }
 
+func mustPut(t *testing.T, k *MemoryKernel, a *Artifact) *ArtifactRef {
+	t.Helper()
+	r, err := k.PutArtifact(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 // 1. ADDRESSING — same (type, body) ⇒ same id; a one-byte change ⇒ a new id.
 func TestAddressingIsContentDerivedAndMetamorphic(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 
-	a := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "recon"})
-	b := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "someone-else"})
+	a := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "recon"})
+	b := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "someone-else"})
 	if a.Id != b.Id {
 		t.Fatalf("same (type, body) must yield the same id: %s != %s", a.Id, b.Id)
 	}
@@ -34,11 +43,11 @@ func TestAddressingIsContentDerivedAndMetamorphic(t *testing.T) {
 		t.Fatalf("id must be sha256-prefixed, got %s", a.Id)
 	}
 
-	c := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.2")})
+	c := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.2")})
 	if a.Id == c.Id {
 		t.Fatal("a one-byte change must change the address")
 	}
-	d := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Port", Body: []byte("10.0.0.1")})
+	d := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Port", Body: []byte("10.0.0.1")})
 	if a.Id == d.Id {
 		t.Fatal("type must participate in the address")
 	}
@@ -49,9 +58,9 @@ func TestAddressingIsContentDerivedAndMetamorphic(t *testing.T) {
 
 // 2. IMMUTABILITY — reads back byte-identical; a later put never mutates it.
 func TestArtifactsAreImmutable(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 
-	r := k.PutArtifact(&Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "true"}})
+	r := mustPut(t, k, &Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "true"}})
 	got, err := k.GetArtifact(r)
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +74,7 @@ func TestArtifactsAreImmutable(t *testing.T) {
 
 	// A later put of the same content with different meta must NOT change what
 	// is stored. First write wins.
-	r2 := k.PutArtifact(&Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "false", "sneaky": "yes"}})
+	r2 := mustPut(t, k, &Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "false", "sneaky": "yes"}})
 	if r2.Id != r.Id {
 		t.Fatal("same content ⇒ same id")
 	}
@@ -81,7 +90,7 @@ func TestArtifactsAreImmutable(t *testing.T) {
 //  3. ORDERING & ISOLATION — events reach exactly their subscribers, in Seq
 //     order, and never reach non-subscribers.
 func TestEventsAreOrderedAndIsolated(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 	hosts := k.Subscribe(&Subscription{Module: "a", Topics: []string{"recon.host.found"}})
 	ports := k.Subscribe(&Subscription{Module: "b", Topics: []string{"recon.port.found"}})
 
@@ -116,9 +125,9 @@ func TestEventsAreOrderedAndIsolated(t *testing.T) {
 
 // 4. LEDGER INTEGRITY — the chain verifies; tampering breaks verification.
 func TestLedgerIsTamperEvident(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{Name: "m", Version: "0.1.0"})
-	k.PutArtifact(&Artifact{Type: "t", Body: []byte("x")})
+	mustPut(t, k, &Artifact{Type: "t", Body: []byte("x")})
 	k.Append(&AppendRequest{Kind: "domain.fact", Subject: "s", Detail: []byte("d")})
 
 	chain := k.Ledger()
@@ -142,61 +151,9 @@ func TestLedgerIsTamperEvident(t *testing.T) {
 	}
 }
 
-// 5. GATE NON-BYPASS — blocked while PENDING/REJECTED; permitted only APPROVED.
-func TestGatesAreNonBypassable(t *testing.T) {
-	k := NewKernel()
-
-	tkt := k.RequestGate(&GateRequest{Action: "delete production", RequestedBy: "danger"})
-	var blocked *GateBlockedError
-	if err := k.EnsureApproved(tkt); !errors.As(err, &blocked) || blocked.Decision != DecisionPending {
-		t.Fatalf("must be blocked while PENDING, got %v", err)
-	}
-
-	if _, err := k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionRejected, DecidedBy: "phil", Reason: "no"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := k.EnsureApproved(tkt); !errors.As(err, &blocked) || blocked.Decision != DecisionRejected {
-		t.Fatalf("REJECTED must block, got %v", err)
-	}
-
-	t2 := k.RequestGate(&GateRequest{Action: "delete production"})
-	if err := k.EnsureApproved(t2); err == nil {
-		t.Fatal("fresh gate must block")
-	}
-	if _, err := k.DecideGate(&GateDecision{RequestId: t2.RequestId, Decision: DecisionApproved, DecidedBy: "phil"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := k.EnsureApproved(t2); err != nil {
-		t.Fatalf("APPROVED must permit the act, got %v", err)
-	}
-
-	// A non-decision is rejected at the ABI.
-	if _, err := k.DecideGate(&GateDecision{RequestId: t2.RequestId, Decision: DecisionPending}); !errors.Is(err, ErrNotADecision) {
-		t.Fatalf("PENDING is not a decision, got %v", err)
-	}
-}
-
-// 5b. AwaitGate really blocks until a human decides.
-func TestAwaitGateBlocksUntilDecided(t *testing.T) {
-	k := NewKernel()
-	tkt := k.RequestGate(&GateRequest{Action: "irreversible"})
-
-	go func() {
-		k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "phil"})
-	}()
-
-	d, err := k.AwaitGate(tkt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d.Decision != DecisionApproved {
-		t.Fatalf("expected APPROVED, got %s", d.Decision)
-	}
-}
-
 // 6. DISCOVERY — the registry reports every module, capability, and contract.
 func TestRegistryReportsEverything(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{
 		Name: "recon", Version: "0.1.0",
 		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
@@ -216,6 +173,103 @@ func TestRegistryReportsEverything(t *testing.T) {
 	}
 	if !hasContract(snap.Contracts, "acme.recon.v1.ScanRequest") || !hasContract(snap.Contracts, "acme.report.v1.Report") {
 		t.Fatal("registry must report every contract")
+	}
+}
+
+// 6b. CONTRACT IDENTITY — content-addressed under ref; immutable; conflict on
+// redefinition; placeholder fill-once; ports bind to the pinned identity.
+func TestContractsAreImmutableAndIdentifiable(t *testing.T) {
+	k := NewMemoryKernel()
+
+	stored, err := k.PutContract(&Contract{
+		Ref: "acme.Host", MediaType: "application/schema+json",
+		Schema: `{"type":"object"}`, Version: "1.0.0",
+		CompatibleWith: []string{"acme.Host.v0", "acme.legacy.Host"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := ContractDigest("application/schema+json", `{"type":"object"}`, "1.0.0",
+		[]string{"acme.Host.v0", "acme.legacy.Host"})
+	if stored.Digest != wantDigest {
+		t.Fatalf("digest:\n got  %s\n want %s", stored.Digest, wantDigest)
+	}
+	// compatible_with is stored sorted UTF-8 ascending.
+	if len(stored.CompatibleWith) != 2 || stored.CompatibleWith[0] != "acme.Host.v0" {
+		t.Fatalf("compatible_with not normalized: %v", stored.CompatibleWith)
+	}
+
+	// Identical re-put is a no-op (idempotent).
+	again, err := k.PutContract(&Contract{
+		Ref: "acme.Host", MediaType: "application/schema+json",
+		Schema: `{"type":"object"}`, Version: "1.0.0",
+		CompatibleWith: []string{"acme.legacy.Host", "acme.Host.v0"}, // unsorted ok
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Digest != stored.Digest {
+		t.Fatal("identical re-put must return the same identity")
+	}
+
+	// Different content under the same ref is CONFLICT.
+	_, err = k.PutContract(&Contract{
+		Ref: "acme.Host", MediaType: "application/schema+json",
+		Schema: `{"type":"string"}`, Version: "1.0.0",
+	})
+	if err == nil || !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict on redefinition, got %v", err)
+	}
+
+	// Register creates a name-only placeholder; PutContract may fill it once.
+	k.Register(&ModuleManifest{
+		Name: "mod", Version: "1",
+		Provides: []*Capability{{Name: "do", Contract: "acme.NewThing"}},
+	})
+	filled, err := k.PutContract(&Contract{
+		Ref: "acme.NewThing", MediaType: "text/x-protobuf",
+		Schema: "message NewThing {}", Version: "1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filled.Digest == "" || IsContractPlaceholder(filled) {
+		t.Fatal("placeholder must fill to real content")
+	}
+	// Second fill with different content conflicts.
+	_, err = k.PutContract(&Contract{
+		Ref: "acme.NewThing", MediaType: "text/x-protobuf",
+		Schema: "message Other {}", Version: "1",
+	})
+	if err == nil || !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict after fill, got %v", err)
+	}
+
+	// Mismatched caller-supplied digest is INVALID.
+	_, err = k.PutContract(&Contract{
+		Ref: "acme.Other", Schema: "x", Digest: "sha256:deadbeef",
+	})
+	if err == nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expected ErrInvalid on digest mismatch, got %v", err)
+	}
+
+	// contract.registered lands in the ledger with reconstructable detail.
+	chain := k.Ledger()
+	found := false
+	for _, e := range chain {
+		if e.Kind == "contract.registered" && e.Subject == "acme.Host" {
+			var c Contract
+			if err := proto.Unmarshal(e.Detail, &c); err != nil {
+				t.Fatal(err)
+			}
+			if c.Ref != "acme.Host" || c.Digest != wantDigest {
+				t.Fatalf("ledger detail mismatch: %+v", &c)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("contract.registered must appear in the ledger")
 	}
 }
 
@@ -245,10 +299,10 @@ func hasContract(cs []*Contract, ref string) bool {
 }
 
 func TestRunFeedsForwardAndClosesOnTerminalAnswer(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{Name: "extractor", Version: "1.0.0", Provides: []*Capability{{Name: "facts.extract", Inputs: []*Port{{Name: "question", Contract: "demo.Question"}}, Outputs: []*Port{{Name: "facts", Contract: "demo.Facts"}}}}})
 	k.Register(&ModuleManifest{Name: "writer", Version: "2.0.0", Provides: []*Capability{{Name: "answer.write", Inputs: []*Port{{Name: "question", Contract: "demo.Question"}, {Name: "facts", Contract: "demo.Facts"}}, Outputs: []*Port{{Name: "answer", Contract: "demo.Answer"}}}}})
-	question := k.PutArtifact(&Artifact{Type: "demo.Question", Body: []byte("What follows?")})
+	question := mustPut(t, k, &Artifact{Type: "demo.Question", Body: []byte("What follows?")})
 	assembly := &Assembly{
 		Id:       "answer-pipeline@1",
 		Nodes:    []*AssemblyNode{{Id: "extract", Module: "extractor", ModuleVersion: "1.0.0", Capability: "facts.extract"}, {Id: "write", Module: "writer", ModuleVersion: "2.0.0", Capability: "answer.write"}},
@@ -266,7 +320,7 @@ func TestRunFeedsForwardAndClosesOnTerminalAnswer(t *testing.T) {
 	if err != nil || extract.Id == "" {
 		t.Fatalf("extract claim: %v %v", extract, err)
 	}
-	facts := k.PutArtifact(&Artifact{Type: "demo.Facts", Body: []byte("typed flow")})
+	facts := mustPut(t, k, &Artifact{Type: "demo.Facts", Body: []byte("typed flow")})
 	if _, err := k.Commit(&Derivation{RunId: "run-1", WorkId: extract.Id, NodeId: extract.NodeId, Outputs: []*NamedArtifact{{Name: "facts", Artifact: facts}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +328,7 @@ func TestRunFeedsForwardAndClosesOnTerminalAnswer(t *testing.T) {
 	if err != nil || len(write.Inputs) != 2 {
 		t.Fatalf("fan-in: work=%v err=%v", write, err)
 	}
-	answer := k.PutArtifact(&Artifact{Type: "demo.Answer", Body: []byte("Modules converge.")})
+	answer := mustPut(t, k, &Artifact{Type: "demo.Answer", Body: []byte("Modules converge.")})
 	completed, err := k.Commit(&Derivation{RunId: "run-1", WorkId: write.Id, NodeId: write.NodeId, Outputs: []*NamedArtifact{{Name: "answer", Artifact: answer}}})
 	if err != nil {
 		t.Fatal(err)
@@ -292,7 +346,7 @@ func TestRunFeedsForwardAndClosesOnTerminalAnswer(t *testing.T) {
 }
 
 func TestCyclicAssemblyIsRejected(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{Name: "loop", Version: "1.0.0", Provides: []*Capability{{Name: "loop.step", Inputs: []*Port{{Name: "in", Contract: "demo.Value", Optional: true}}, Outputs: []*Port{{Name: "out", Contract: "demo.Value"}}}}})
 	_, err := k.StartRun(&RunRequest{Id: "cycle", Assembly: &Assembly{
 		Id:       "cycle@1",
@@ -305,7 +359,7 @@ func TestCyclicAssemblyIsRejected(t *testing.T) {
 }
 
 func TestRunStallsWhenNoNodeCanBecomeReady(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{Name: "source", Version: "1", Provides: []*Capability{{Name: "source.maybe", Outputs: []*Port{{Name: "value", Contract: "demo.Value", Optional: true}}}}})
 	k.Register(&ModuleManifest{Name: "sink", Version: "1", Provides: []*Capability{{Name: "sink.answer", Inputs: []*Port{{Name: "value", Contract: "demo.Value"}}, Outputs: []*Port{{Name: "answer", Contract: "demo.Answer"}}}}})
 	_, err := k.StartRun(&RunRequest{Id: "stall", Assembly: &Assembly{Id: "stall@1", Nodes: []*AssemblyNode{{Id: "source", Module: "source", ModuleVersion: "1", Capability: "source.maybe"}, {Id: "sink", Module: "sink", ModuleVersion: "1", Capability: "sink.answer"}}, Bindings: []*Binding{{ToNode: "sink", ToPort: "value", FromNode: "source", FromPort: "value"}}, Terminal: &NodeOutput{Node: "sink", Port: "answer"}}})
@@ -323,14 +377,14 @@ func TestRunStallsWhenNoNodeCanBecomeReady(t *testing.T) {
 }
 
 func TestConvergentRunHashesMatchEverySDK(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{Name: "answerer", Version: "1.0.0", Provides: []*Capability{{Name: "answer.write", Outputs: []*Port{{Name: "answer", Contract: "demo.Answer"}}}}})
 	_, err := k.StartRun(&RunRequest{Id: "parity", Assembly: &Assembly{Id: "single@1", Nodes: []*AssemblyNode{{Id: "answer", Module: "answerer", ModuleVersion: "1.0.0", Capability: "answer.write"}}, Terminal: &NodeOutput{Node: "answer", Port: "answer"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	work, _ := k.ClaimReady(&ClaimRequest{RunId: "parity", Module: "answerer"})
-	answer := k.PutArtifact(&Artifact{Type: "demo.Answer", Body: []byte("yes")})
+	answer := mustPut(t, k, &Artifact{Type: "demo.Answer", Body: []byte("yes")})
 	if _, err := k.Commit(&Derivation{RunId: "parity", WorkId: work.Id, NodeId: work.NodeId, Outputs: []*NamedArtifact{{Name: "answer", Artifact: answer}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -366,9 +420,9 @@ func indexKind(chain []*LedgerEntry, kind string) int {
 //     round-trip from the tamper-evident chain alone. Detail is folded into the
 //     entry hash, so forging it breaks verification.
 func TestLedgerReconstructsStateFromDetail(t *testing.T) {
-	k := NewKernel()
+	k := NewMemoryKernel()
 
-	r := k.PutArtifact(&Artifact{
+	r := mustPut(t, k, &Artifact{
 		Type:        "acme.recon.v1.Host",
 		Body:        []byte("10.0.0.1"),
 		Meta:        map[string]string{"region": "eu", "scan": "full"},
@@ -380,11 +434,6 @@ func TestLedgerReconstructsStateFromDetail(t *testing.T) {
 		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
 		Requires: []string{"report.render"},
 	})
-	tkt := k.RequestGate(&GateRequest{Action: "delete production", Context: []byte("rows=42"), RequestedBy: "danger"})
-	if _, err := k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "phil", Reason: "reviewed"}); err != nil {
-		t.Fatal(err)
-	}
-
 	chain := k.Ledger()
 
 	// artifact.put reconstructs everything but the body; lineage rides along.
@@ -421,35 +470,13 @@ func TestLedgerReconstructsStateFromDetail(t *testing.T) {
 		t.Fatal("requires must round-trip")
 	}
 
-	// gate.requested / gate.decided reconstruct who / what / why.
-	var req GateRequest
-	if err := proto.Unmarshal(findKind(chain, "gate.requested").Detail, &req); err != nil {
-		t.Fatal(err)
-	}
-	if req.Action != "delete production" || req.RequestedBy != "danger" || !bytes.Equal(req.Context, []byte("rows=42")) {
-		t.Fatal("gate request must round-trip from the chain")
-	}
-	var dec GateDecision
-	if err := proto.Unmarshal(findKind(chain, "gate.decided").Detail, &dec); err != nil {
-		t.Fatal(err)
-	}
-	if dec.Decision != DecisionApproved || dec.DecidedBy != "phil" || dec.Reason != "reviewed" {
-		t.Fatal("gate decision must round-trip from the chain")
-	}
 
 	if !k.VerifyLedger() {
 		t.Fatal("the chain with fat detail must verify")
 	}
 
-	// The approval record is hash-committed: forging who approved it (re-encoding
-	// a different decider into Detail) must break verification.
-	forged := k.Ledger()
-	i := indexKind(forged, "gate.decided")
-	forged[i].Detail = marshalCanonical(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "attacker", Reason: "reviewed"})
-	if VerifyChain(forged) {
-		t.Fatal("rewriting the recorded decision must break the chain")
-	}
 }
+
 
 // 7c. CANONICAL DETAIL — the same logical value encodes to identical bytes every
 //
@@ -475,10 +502,10 @@ func TestLedgerDetailEncodesCanonically(t *testing.T) {
 // id must not move. If it did, the address would be keyed on provenance, not
 // content — exactly the overfit a metamorphic test exists to catch.
 func TestAddressIgnoresNonIdentityFields(t *testing.T) {
-	k := NewKernel()
-	base := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1")})
+	k := NewMemoryKernel()
+	base := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1")})
 
-	enriched := k.PutArtifact(&Artifact{
+	enriched := mustPut(t, k, &Artifact{
 		Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"),
 		Meta:        map[string]string{"x": "y"},
 		ProducedBy:  "whoever",
@@ -498,29 +525,212 @@ func TestAddressIgnoresNonIdentityFields(t *testing.T) {
 // chains are pinned to cross-verify. If this constant ever changes, it changes
 // in all three suites in lockstep — never one SDK alone.
 func TestLedgerHashKnownAnswerCrossSDK(t *testing.T) {
-	const want = "985f4980bda5266d03b3e7092ef2bd9eb49b12107b43f17bbe00415deca4ab6a"
+	const want = "287449b9f8f2f7462177b01d55b32cc6b65580fefa22172e8ecfaa96bdbf60a1"
 
-	k := NewKernel()
+	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{
 		Name: "recon", Version: "0.1.0",
 		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
 		Requires: []string{"report.render"},
 	})
-	k.PutArtifact(&Artifact{
+	mustPut(t, k, &Artifact{
 		Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"),
 		Meta: map[string]string{"region": "eu", "scan": "full"}, ProducedBy: "recon",
 		DerivedFrom: []string{"sha256:parent-a", "sha256:parent-b"},
 	})
-	tkt := k.RequestGate(&GateRequest{Action: "delete production", Context: []byte("rows=42"), RequestedBy: "danger"})
-	if _, err := k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "phil", Reason: "reviewed"}); err != nil {
-		t.Fatal(err)
-	}
-
 	chain := k.Ledger()
 	if !k.VerifyLedger() {
 		t.Fatal("the chain must verify")
 	}
 	if got := chain[len(chain)-1].Hash; got != want {
 		t.Fatalf("cross-SDK ledger hash drift:\n got  %s\n want %s", got, want)
+	}
+}
+
+// 12. PRODUCTION ARTIFACT BOUNDARY — small values inline; large values are
+// verified ObjectRefs into the blob store. Typed value identity ≠ blob identity.
+func TestBlobStoreIsContentAddressedAndImmutable(t *testing.T) {
+	k := NewMemoryKernel()
+	data := []byte("pcap-or-apk-bytes-go-here")
+
+	a := k.PutBlob(&PutBlobRequest{Namespace: "evidence", Data: data})
+	if a.Digest != BlobID(data) {
+		t.Fatalf("blob digest must be pure content id: %s", a.Digest)
+	}
+	if a.ByteCount != uint64(len(data)) || a.Namespace != "evidence" {
+		t.Fatal("blob ref must carry size and namespace")
+	}
+
+	// First write wins: a later put of the same content is a no-op.
+	b := k.PutBlob(&PutBlobRequest{Namespace: "evidence", Data: data})
+	if a.Digest != b.Digest {
+		t.Fatal("same bytes ⇒ same blob digest")
+	}
+
+	got, err := k.GetBlob(&GetBlobRequest{Digest: a.Digest, Namespace: "evidence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Data, data) {
+		t.Fatal("GetBlob must read back byte-identical")
+	}
+
+	has := k.HasBlob(&HasBlobRequest{Digest: a.Digest, Namespace: "evidence"})
+	if !has.Exists || has.ByteCount != uint64(len(data)) {
+		t.Fatal("HasBlob must report the stored blob")
+	}
+	if k.HasBlob(&HasBlobRequest{Digest: a.Digest, Namespace: "other"}).Exists {
+		t.Fatal("namespace isolates blob storage")
+	}
+
+	// Ledger records blob.put without data bytes.
+	entry := findKind(k.Ledger(), "blob.put")
+	if entry == nil || entry.Subject != a.Digest {
+		t.Fatal("blob.put must land with digest as subject")
+	}
+	var ref BlobRef
+	if err := proto.Unmarshal(entry.Detail, &ref); err != nil {
+		t.Fatal(err)
+	}
+	if ref.Digest != a.Digest || ref.ByteCount != a.ByteCount || ref.Namespace != "evidence" {
+		t.Fatal("blob.put detail must be the BlobRef metadata")
+	}
+}
+
+func TestExternalArtifactRefsLargeDataWithoutInlining(t *testing.T) {
+	k := NewMemoryKernel()
+	// Multi-chunk "evidence" that should never sit in Artifact.body.
+	payload := bytes.Repeat([]byte("EVIDENCE-BUNDLE-"), 64*1024) // 1 MiB-ish
+
+	blob := k.PutBlob(&PutBlobRequest{Namespace: "observer", Data: payload})
+	ref, err := k.PutArtifact(&Artifact{
+		Type:       "observer.v1.Capture",
+		ProducedBy: "observer",
+		Object: &ObjectRef{
+			Digest:    blob.Digest,
+			ByteCount: blob.ByteCount,
+			Namespace: blob.Namespace,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Typed value identity hashes object_ref_bytes, not the PCAP bytes.
+	wantID := ArtifactID("observer.v1.Capture", ObjectRefBytes(&ObjectRef{
+		Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: blob.Namespace,
+	}))
+	if ref.Id != wantID {
+		t.Fatalf("external artifact id mismatch:\n got  %s\n want %s", ref.Id, wantID)
+	}
+	if ref.Id == BlobID(payload) {
+		t.Fatal("typed value identity must not equal raw blob identity")
+	}
+
+	got, err := k.GetArtifact(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Body) != 0 {
+		t.Fatal("external artifact must not inline blob bytes in body")
+	}
+	if got.Object == nil || got.Object.Digest != blob.Digest || got.Object.ByteCount != blob.ByteCount {
+		t.Fatal("external artifact must retain verified ObjectRef")
+	}
+
+	// Same ObjectRef ⇒ same artifact id (convergence).
+	ref2, err := k.PutArtifact(&Artifact{
+		Type: "observer.v1.Capture",
+		Object: &ObjectRef{
+			Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: blob.Namespace,
+		},
+	})
+	if err != nil || ref2.Id != ref.Id {
+		t.Fatalf("equal external values must converge: %v %v", ref2, err)
+	}
+
+	// Convenience path: PutArtifactWithBlob.
+	ref3, blob3, err := k.PutArtifactWithBlob("observer.v1.Capture", "observer", payload, "observer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref3.Id != ref.Id || blob3.Digest != blob.Digest {
+		t.Fatal("PutArtifactWithBlob must be equivalent to PutBlob + PutArtifact")
+	}
+
+	// Materialize bytes only when needed.
+	data, err := k.GetBlob(&GetBlobRequest{Digest: got.Object.Digest, Namespace: got.Object.Namespace})
+	if err != nil || !bytes.Equal(data.Data, payload) {
+		t.Fatal("blob must stream back the full evidence without living in the artifact")
+	}
+
+	// Ledger artifact.put keeps ObjectRef, clears body.
+	var a Artifact
+	if err := proto.Unmarshal(findKind(k.Ledger(), "artifact.put").Detail, &a); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.Body) != 0 || a.Object == nil || a.Object.Digest != blob.Digest {
+		t.Fatal("ledger must retain ObjectRef and clear body")
+	}
+}
+
+func TestExternalArtifactRejectsMissingOrMismatchedBlob(t *testing.T) {
+	k := NewMemoryKernel()
+	data := []byte("small-but-external")
+	blob := k.PutBlob(&PutBlobRequest{Namespace: "ns", Data: data})
+
+	// Missing blob.
+	if _, err := k.PutArtifact(&Artifact{
+		Type: "t",
+		Object: &ObjectRef{Digest: BlobID([]byte("nope")), ByteCount: 4, Namespace: "ns"},
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing blob must be NotFound, got %v", err)
+	}
+
+	// Wrong size.
+	if _, err := k.PutArtifact(&Artifact{
+		Type: "t",
+		Object: &ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount + 1, Namespace: "ns"},
+	}); !errors.Is(err, ErrBlobIntegrity) {
+		t.Fatalf("size mismatch must be integrity error, got %v", err)
+	}
+
+	// Both body and object.
+	if _, err := k.PutArtifact(&Artifact{
+		Type: "t", Body: []byte("x"),
+		Object: &ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: "ns"},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("body+object must be invalid, got %v", err)
+	}
+
+	// Wrong namespace.
+	if _, err := k.PutArtifact(&Artifact{
+		Type: "t",
+		Object: &ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: "other"},
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong namespace must be NotFound, got %v", err)
+	}
+}
+
+func TestValueIdentityIndependentOfBlobIdentity(t *testing.T) {
+	k := NewMemoryKernel()
+	data := []byte("shared-raw-bytes")
+	blob := k.PutBlob(&PutBlobRequest{Namespace: "a", Data: data})
+	// Same bytes, different namespace ⇒ different blob slot and different ObjectRef.
+	blobB := k.PutBlob(&PutBlobRequest{Namespace: "b", Data: data})
+	if blob.Digest != blobB.Digest {
+		t.Fatal("blob identity is pure content — digest must match across namespaces")
+	}
+
+	artA := mustPut(t, k, &Artifact{Type: "t", Object: &ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: "a"}})
+	artB := mustPut(t, k, &Artifact{Type: "t", Object: &ObjectRef{Digest: blobB.Digest, ByteCount: blobB.ByteCount, Namespace: "b"}})
+	if artA.Id == artB.Id {
+		t.Fatal("namespace is part of ObjectRef value identity")
+	}
+
+	// Different type, same object ref ⇒ different artifact id.
+	artC := mustPut(t, k, &Artifact{Type: "other", Object: &ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: "a"}})
+	if artC.Id == artA.Id {
+		t.Fatal("type participates in typed value identity")
 	}
 }

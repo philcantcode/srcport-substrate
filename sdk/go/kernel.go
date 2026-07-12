@@ -11,29 +11,58 @@ import (
 
 // ─── errors ─────────────────────────────────────────────────────────────────
 
-// ErrNotFound is returned when no artifact or gate exists for a given id.
+// ErrNotFound is returned when no artifact, blob, or run exists for a given id.
 var ErrNotFound = errors.New("not found")
-
-// ErrNotADecision is returned when DecideGate is called with something other
-// than APPROVED or REJECTED.
-var ErrNotADecision = errors.New("gate decision must be APPROVED or REJECTED")
 
 var ErrInvalid = errors.New("invalid")
 var ErrConflict = errors.New("conflict")
 
+// ErrBlobIntegrity is returned when stored blob bytes do not match the claimed
+// digest or byte_count (verified external refs).
+var ErrBlobIntegrity = errors.New("blob integrity check failed")
+
+// RunClosedError is returned when a terminal run accepts no more work.
 type RunClosedError struct{ State RunState }
 
 func (e *RunClosedError) Error() string { return fmt.Sprintf("run is closed: %s", e.State) }
 
-// GateBlockedError is returned by EnsureApproved when the gate is not APPROVED.
-// It carries the current Decision so callers can see why it blocked.
-type GateBlockedError struct{ Decision Decision }
-
-func (e *GateBlockedError) Error() string {
-	return fmt.Sprintf("gate blocked: decision is %s, not APPROVED", e.Decision)
+// ToError projects a native error onto the portable Error wire message so
+// failure semantics are identical across languages and across the wire.
+// Mirrors KernelError::to_proto in the Rust SDK.
+func ToError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	e := &Error{Message: err.Error(), Retryable: false}
+	var closed *RunClosedError
+	switch {
+	case errors.Is(err, ErrNotFound):
+		e.Code = ErrorCodeNotFound
+	case errors.Is(err, ErrInvalid):
+		e.Code = ErrorCodeInvalid
+	case errors.Is(err, ErrConflict):
+		e.Code = ErrorCodeConflict
+		e.ConflictSubject = err.Error()
+	case errors.Is(err, ErrBlobIntegrity):
+		// Match Rust: BlobIntegrity maps to FAILED_PRECONDITION with detail.
+		e.Code = ErrorCodeFailedPrecondition
+		e.FailedPrecondition = err.Error()
+	case errors.As(err, &closed):
+		e.Code = ErrorCodeFailedPrecondition
+		e.FailedPrecondition = closed.Error()
+	default:
+		e.Code = ErrorCodeUnspecified
+	}
+	return e
 }
 
-// ─── the Kernel ─────────────────────────────────────────────────────────────
+// SubscriberBuffer is the bound on a single subscriber's undelivered-event
+// backlog. The event bus is notification, not the data plane; a subscriber
+// that falls this far behind is shed rather than allowed to OOM the kernel.
+const SubscriberBuffer = 1024
+
+
+// ─── MemoryKernel (in-memory KernelApi) ─────────────────────────────────────
 
 type moduleSlot struct {
 	manifest  *ModuleManifest
@@ -46,39 +75,73 @@ type runSlot struct {
 	committed map[string]*Derivation
 }
 
-// Kernel is the in-process microkernel. Its methods mirror the service Kernel
-// RPCs in substrate.proto one-for-one. It is safe for concurrent use; share one
-// *Kernel across module goroutines. Every meaningful action lands one
-// append-only ledger entry. Values handed in and out are cloned, so a caller
-// can never mutate stored state through a shared pointer.
-type Kernel struct {
-	mu       sync.Mutex
-	gateCond *sync.Cond
+// blobKey is the blob store address: namespace + digest. Digest is content
+// identity; namespace is storage routing / tenancy.
+type blobKey struct {
+	namespace string
+	digest    string
+}
 
+type blobSlot struct {
+	data []byte
+	ref  *BlobRef
+}
+
+// MemoryKernel is the in-memory realisation of KernelApi. Its methods mirror
+// the service Kernel RPCs in substrate.proto one-for-one. It is safe for
+// concurrent use; share one *MemoryKernel across module goroutines. Every
+// meaningful action lands one append-only ledger entry. Values handed in and
+// out are cloned, so a caller can never mutate stored state through a shared
+// pointer. Durability lives in Modules (or other KernelApi backends), not here.
+type MemoryKernel struct {
+	mu       sync.Mutex
 	modules      []moduleSlot
 	capabilities []*Capability
 	contracts    map[string]*Contract
 	artifacts    map[string]*Artifact
+	blobs        map[blobKey]*blobSlot
 	subs         []*subscriber
 	ledger       []*LedgerEntry
-	gates        map[string]*GateDecision
 	runs         map[string]*runSlot
 	derivations  []*Derivation
 	eventSeq     uint64
-	gateCounter  uint64
 }
 
-// NewKernel returns an empty, ready kernel.
-func NewKernel() *Kernel {
-	k := &Kernel{
+// NewMemoryKernel returns an empty, ready in-memory kernel.
+func NewMemoryKernel() *MemoryKernel {
+	return &MemoryKernel{
 		contracts: map[string]*Contract{},
 		artifacts: map[string]*Artifact{},
-		gates:     map[string]*GateDecision{},
+		blobs:     map[blobKey]*blobSlot{},
 		runs:      map[string]*runSlot{},
 	}
-	k.gateCond = sync.NewCond(&k.mu)
-	return k
 }
+
+// KernelApi is the portable ABI: the 16 unary RPCs of service Kernel.
+// Streaming Subscribe and the lifecycle helper Transition are inherent-only
+// on MemoryKernel. RequestContext rides as call metadata (variadic, optional)
+// and is deliberately not folded into ledger detail.
+type KernelApi interface {
+	Register(m *ModuleManifest, ctx ...*RequestContext) *RegisterAck
+	PutArtifact(a *Artifact, ctx ...*RequestContext) (*ArtifactRef, error)
+	GetArtifact(ref *ArtifactRef, ctx ...*RequestContext) (*Artifact, error)
+	PutBlob(req *PutBlobRequest, ctx ...*RequestContext) *BlobRef
+	GetBlob(req *GetBlobRequest, ctx ...*RequestContext) (*BlobData, error)
+	HasBlob(req *HasBlobRequest, ctx ...*RequestContext) *HasBlobResponse
+	PutContract(c *Contract, ctx ...*RequestContext) (*Contract, error)
+	Publish(e *Event, ctx ...*RequestContext) *PublishAck
+	Append(r *AppendRequest, ctx ...*RequestContext) *LedgerEntry
+	Snapshot(ctx ...*RequestContext) *RegistrySnapshot
+	StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, error)
+	ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*WorkItem, error)
+	Commit(submitted *Derivation, ctx ...*RequestContext) (*Run, error)
+	GetRun(ref *RunRef, ctx ...*RequestContext) (*Run, error)
+	CancelRun(ref *RunRef, ctx ...*RequestContext) (*Run, error)
+	ListDerivations(ref *RunRef, ctx ...*RequestContext) (*DerivationList, error)
+}
+
+// Compile-time check: MemoryKernel implements KernelApi.
+var _ KernelApi = (*MemoryKernel)(nil)
 
 func clone[M proto.Message](m M) M { return proto.Clone(m).(M) }
 
@@ -97,7 +160,7 @@ func marshalCanonical(m proto.Message) []byte {
 }
 
 // appendLocked is the ONLY path that creates ledger entries. Caller holds mu.
-func (k *Kernel) appendLocked(kind, subject string, detail []byte) *LedgerEntry {
+func (k *MemoryKernel) appendLocked(kind, subject string, detail []byte) *LedgerEntry {
 	seq := uint64(len(k.ledger))
 	prev := ""
 	if n := len(k.ledger); n > 0 {
@@ -117,22 +180,20 @@ func (k *Kernel) appendLocked(kind, subject string, detail []byte) *LedgerEntry 
 
 // ─── 1. Module ────────────────────────────────────────────────────────────
 
-// Register records a module, its capabilities, and (implicitly) the contracts
-// those capabilities speak. The module lands in REGISTERED; advance it with
-// Transition. Mirrors rpc Register.
-func (k *Kernel) Register(m *ModuleManifest) *RegisterAck {
+// Register records a module, its capabilities, and (implicitly) name-only
+// placeholders for the contracts those capabilities speak. The module lands in
+// REGISTERED; advance it with Transition. Mirrors rpc Register.
+// Placeholders may be filled once via PutContract; they do not write
+// contract.registered ledger entries (module.registered already names the refs).
+func (k *MemoryKernel) Register(m *ModuleManifest, ctx ...*RequestContext) *RegisterAck {
 	m = clone(m)
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	for _, c := range m.Provides {
 		k.capabilities = append(k.capabilities, clone(c))
-		if _, ok := k.contracts[c.Contract]; !ok {
-			k.contracts[c.Contract] = &Contract{Ref: c.Contract}
-		}
+		k.ensureContractPlaceholderLocked(c.Contract)
 		for _, p := range append(append([]*Port{}, c.Inputs...), c.Outputs...) {
-			if _, ok := k.contracts[p.Contract]; !ok {
-				k.contracts[p.Contract] = &Contract{Ref: p.Contract}
-			}
+			k.ensureContractPlaceholderLocked(p.Contract)
 		}
 	}
 	k.modules = append(k.modules, moduleSlot{manifest: m, lifecycle: LifecycleRegistered})
@@ -142,10 +203,25 @@ func (k *Kernel) Register(m *ModuleManifest) *RegisterAck {
 	return &RegisterAck{State: LifecycleRegistered}
 }
 
+// ensureContractPlaceholderLocked records a name-only stub if ref is new and
+// non-empty. Caller holds mu.
+func (k *MemoryKernel) ensureContractPlaceholderLocked(ref string) {
+	if ref == "" {
+		return
+	}
+	if _, ok := k.contracts[ref]; ok {
+		return
+	}
+	k.contracts[ref] = &Contract{
+		Ref:    ref,
+		Digest: ContractDigest("", "", "", nil),
+	}
+}
+
 // Transition advances a module along REGISTERED → LOADED → ACTIVE →
 // DEACTIVATED. Only forward moves are honoured; anything else is a no-op that
 // returns the current state. Returns ErrNotFound if the module is unknown.
-func (k *Kernel) Transition(module string, to Lifecycle) (Lifecycle, error) {
+func (k *MemoryKernel) Transition(module string, to Lifecycle, ctx ...*RequestContext) (Lifecycle, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	for i := range k.modules {
@@ -162,30 +238,40 @@ func (k *Kernel) Transition(module string, to Lifecycle) (Lifecycle, error) {
 
 // ─── 2. Artifact ──────────────────────────────────────────────────────────
 
-// PutArtifact content-addresses the value, stores it immutably (first write
-// wins — a later put of the same id never mutates what is stored), and returns
-// its ref. Mirrors rpc PutArtifact.
-func (k *Kernel) PutArtifact(a *Artifact) *ArtifactRef {
-	id := ArtifactID(a.Type, a.Body)
+// PutArtifact content-addresses the typed value, stores it immutably (first
+// write wins), and returns its ref. Mirrors rpc PutArtifact.
+//
+// Inline: pass body, leave object unset. External: PutBlob first, then pass
+// object (digest, byte_count, namespace) with body empty. The blob must already
+// exist and match. Exactly one of body or object may carry the value.
+func (k *MemoryKernel) PutArtifact(a *Artifact, ctx ...*RequestContext) (*ArtifactRef, error) {
+	a = clone(a)
+	if err := validateArtifactContent(a); err != nil {
+		return nil, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if HasExternalObject(a) {
+		if err := k.verifyObjectRefLocked(a.Object); err != nil {
+			return nil, err
+		}
+	}
+	id := ArtifactIDOf(a)
 	if _, ok := k.artifacts[id]; !ok {
 		stored := clone(a)
 		stored.Id = id
 		k.artifacts[id] = stored
-		// The ledger commits to everything but the body: subject (the id) already
-		// addresses (type, body), so re-inlining the body would duplicate the
-		// store into a log it can never prune. detail is the canonical Artifact
-		// with body cleared; meta, produced_by, and derived_from ride along.
+		// Ledger: clear large inline body; keep ObjectRef (small, part of value
+		// identity) so external artifacts reconstruct without blob bytes.
 		forLog := clone(stored)
 		forLog.Body = nil
 		k.appendLocked("artifact.put", id, marshalCanonical(forLog))
 	}
-	return &ArtifactRef{Id: id}
+	return &ArtifactRef{Id: id}, nil
 }
 
 // GetArtifact reads an artifact back byte-identical. Mirrors rpc GetArtifact.
-func (k *Kernel) GetArtifact(ref *ArtifactRef) (*Artifact, error) {
+func (k *MemoryKernel) GetArtifact(ref *ArtifactRef, ctx ...*RequestContext) (*Artifact, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	a, ok := k.artifacts[ref.Id]
@@ -195,23 +281,182 @@ func (k *Kernel) GetArtifact(ref *ArtifactRef) (*Artifact, error) {
 	return clone(a), nil
 }
 
-// ─── 3. Contract ──────────────────────────────────────────────────────────
+// PutBlob content-addresses raw bytes and stores them immutably under
+// (namespace, digest). First write wins. Mirrors rpc PutBlob.
+func (k *MemoryKernel) PutBlob(req *PutBlobRequest, ctx ...*RequestContext) *BlobRef {
+	data := append([]byte(nil), req.Data...)
+	digest := BlobID(data)
+	ns := req.Namespace
+	key := blobKey{namespace: ns, digest: digest}
+	ref := &BlobRef{Digest: digest, ByteCount: uint64(len(data)), Namespace: ns}
 
-// PutContract registers (or attaches schema text to) a contract explicitly.
-// Capabilities already auto-register their contract ref via Register.
-func (k *Kernel) PutContract(c *Contract) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.contracts[c.Ref] = clone(c)
+	if _, ok := k.blobs[key]; !ok {
+		k.blobs[key] = &blobSlot{data: data, ref: clone(ref)}
+		// Never chain raw blob data — subject is the digest; detail is BlobRef.
+		k.appendLocked("blob.put", digest, marshalCanonical(ref))
+	}
+	return clone(ref)
+}
+
+// GetBlob streams back (in-process: returns) verified blob bytes. Re-hashes on
+// read and rejects digest/size mismatches. Mirrors rpc GetBlob.
+func (k *MemoryKernel) GetBlob(req *GetBlobRequest, ctx ...*RequestContext) (*BlobData, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	slot, ok := k.blobs[blobKey{namespace: req.Namespace, digest: req.Digest}]
+	if !ok {
+		return nil, fmt.Errorf("%w: blob %s", ErrNotFound, req.Digest)
+	}
+	if err := verifyBlobData(slot.data, req.Digest, uint64(len(slot.data))); err != nil {
+		return nil, err
+	}
+	// Re-check stored claim against recomputed digest.
+	if got := BlobID(slot.data); got != slot.ref.Digest || uint64(len(slot.data)) != slot.ref.ByteCount {
+		return nil, fmt.Errorf("%w: stored blob corrupted", ErrBlobIntegrity)
+	}
+	return &BlobData{
+		Digest:    slot.ref.Digest,
+		ByteCount: slot.ref.ByteCount,
+		Namespace: slot.ref.Namespace,
+		Data:      append([]byte(nil), slot.data...),
+	}, nil
+}
+
+// HasBlob reports whether (namespace, digest) exists. Mirrors rpc HasBlob.
+func (k *MemoryKernel) HasBlob(req *HasBlobRequest, ctx ...*RequestContext) *HasBlobResponse {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if slot, ok := k.blobs[blobKey{namespace: req.Namespace, digest: req.Digest}]; ok {
+		return &HasBlobResponse{Exists: true, ByteCount: slot.ref.ByteCount}
+	}
+	return &HasBlobResponse{Exists: false}
+}
+
+// PutArtifactWithBlob puts the blob then an external artifact referencing it.
+// Convenience for the production path: large data → blob store + ObjectRef.
+func (k *MemoryKernel) PutArtifactWithBlob(typ, namespace string, data []byte, producedBy string, ctx ...*RequestContext) (*ArtifactRef, *BlobRef, error) {
+	blob := k.PutBlob(&PutBlobRequest{Namespace: namespace, Data: data})
+	ref, err := k.PutArtifact(&Artifact{
+		Type:       typ,
+		ProducedBy: producedBy,
+		Object: &ObjectRef{
+			Digest:    blob.Digest,
+			ByteCount: blob.ByteCount,
+			Namespace: blob.Namespace,
+		},
+	})
+	return ref, blob, err
+}
+
+func validateArtifactContent(a *Artifact) error {
+	if a == nil {
+		return fmt.Errorf("%w: artifact is required", ErrInvalid)
+	}
+	if a.Type == "" {
+		return fmt.Errorf("%w: artifact type is required", ErrInvalid)
+	}
+	hasObj := HasExternalObject(a)
+	hasBody := len(a.Body) > 0
+	if hasObj && hasBody {
+		return fmt.Errorf("%w: artifact must not set both body and object", ErrInvalid)
+	}
+	if !hasObj && a.Object != nil && a.Object.Digest == "" && (a.Object.ByteCount != 0 || a.Object.Namespace != "") {
+		return fmt.Errorf("%w: object.digest is required when object is set", ErrInvalid)
+	}
+	if hasObj && !isSHA256Digest(a.Object.Digest) {
+		return fmt.Errorf("%w: object.digest must be sha256:<hex>", ErrInvalid)
+	}
+	return nil
+}
+
+func isSHA256Digest(d string) bool {
+	const prefix = "sha256:"
+	if len(d) != len(prefix)+64 || d[:len(prefix)] != prefix {
+		return false
+	}
+	for i := len(prefix); i < len(d); i++ {
+		c := d[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyBlobData(data []byte, digest string, byteCount uint64) error {
+	if uint64(len(data)) != byteCount {
+		return fmt.Errorf("%w: size %d != claimed %d", ErrBlobIntegrity, len(data), byteCount)
+	}
+	if BlobID(data) != digest {
+		return fmt.Errorf("%w: digest mismatch", ErrBlobIntegrity)
+	}
+	return nil
+}
+
+func (k *MemoryKernel) verifyObjectRefLocked(o *ObjectRef) error {
+	slot, ok := k.blobs[blobKey{namespace: o.Namespace, digest: o.Digest}]
+	if !ok {
+		return fmt.Errorf("%w: blob %s (namespace %q)", ErrNotFound, o.Digest, o.Namespace)
+	}
+	if slot.ref.ByteCount != o.ByteCount {
+		return fmt.Errorf("%w: object.byte_count %d != stored %d", ErrBlobIntegrity, o.ByteCount, slot.ref.ByteCount)
+	}
+	if BlobID(slot.data) != o.Digest || uint64(len(slot.data)) != o.ByteCount {
+		return fmt.Errorf("%w: blob does not match object ref", ErrBlobIntegrity)
+	}
+	return nil
+}
+
+// ─── 3. Contract ──────────────────────────────────────────────────────────
+
+// PutContract registers a contract immutably under its ref. Returns the stored
+// contract (digest assigned). Identical re-puts are no-ops; a different content
+// under the same ref is ErrConflict. A name-only placeholder created by
+// Register may be filled once. Mirrors rpc PutContract.
+func (k *MemoryKernel) PutContract(c *Contract, ctx ...*RequestContext) (*Contract, error) {
+	if c == nil || c.Ref == "" {
+		return nil, fmt.Errorf("%w: contract ref is required", ErrInvalid)
+	}
+	c = clone(c)
+	// Normalize compatible_with to UTF-8 ascending for stable identity.
+	sortStringsUTF8(c.CompatibleWith)
+	digest := ContractDigest(c.MediaType, c.Schema, c.Version, c.CompatibleWith)
+	if c.Digest != "" && c.Digest != digest {
+		return nil, fmt.Errorf("%w: contract digest mismatch", ErrInvalid)
+	}
+	c.Digest = digest
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if existing, ok := k.contracts[c.Ref]; ok {
+		if existing.Digest == c.Digest {
+			return clone(existing), nil
+		}
+		// Empty placeholder → first real content is allowed once.
+		if IsContractPlaceholder(existing) && !IsContractPlaceholder(c) {
+			stored := clone(c)
+			k.contracts[c.Ref] = stored
+			k.appendLocked("contract.registered", c.Ref, marshalCanonical(stored))
+			return clone(stored), nil
+		}
+		return nil, fmt.Errorf("%w: contract %s already registered with different content", ErrConflict, c.Ref)
+	}
+	stored := clone(c)
+	k.contracts[c.Ref] = stored
+	k.appendLocked("contract.registered", c.Ref, marshalCanonical(stored))
+	return clone(stored), nil
 }
 
 // ─── 4. Event ─────────────────────────────────────────────────────────────
 
 // Subscribe returns a channel of events on the given topics, in kernel Seq
 // order. A subscriber only ever receives events on topics it named. The channel
-// is unbounded (a background pump forwards from an internal queue), so the
-// publisher is never blocked. Mirrors rpc Subscribe (stream Event).
-func (k *Kernel) Subscribe(s *Subscription) <-chan *Event {
+// is buffered (SubscriberBuffer); delivery is non-blocking. A subscriber that
+// falls behind is shed on Publish so one slow consumer cannot OOM the kernel.
+// Mirrors rpc Subscribe (stream Event).
+func (k *MemoryKernel) Subscribe(s *Subscription, ctx ...*RequestContext) <-chan *Event {
 	sub := newSubscriber(s.Topics)
 	k.mu.Lock()
 	k.subs = append(k.subs, sub)
@@ -221,18 +466,26 @@ func (k *Kernel) Subscribe(s *Subscription) <-chan *Event {
 
 // Publish assigns a monotonic Seq (the total order), delivers to exactly the
 // subscribers of Event.Topic and never to anyone else, and returns the assigned
-// Seq. Mirrors rpc Publish.
-func (k *Kernel) Publish(e *Event) *PublishAck {
+// Seq. Mirrors rpc Publish. A slow subscriber whose buffer is full is shed;
+// dropped notifications remain reconstructable from the ledger.
+func (k *MemoryKernel) Publish(e *Event, ctx ...*RequestContext) *PublishAck {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.eventSeq++
 	e = clone(e)
 	e.Seq = k.eventSeq
+	alive := k.subs[:0]
 	for _, sub := range k.subs {
 		if sub.wants(e.Topic) {
-			sub.enqueue(clone(e))
+			if sub.tryEnqueue(clone(e)) {
+				alive = append(alive, sub)
+			}
+			// else shed: buffer full or receiver gone
+		} else {
+			alive = append(alive, sub)
 		}
 	}
+	k.subs = alive
 	forLog := clone(e)
 	forLog.Payload = nil
 	k.appendLocked("event.published", e.Topic, marshalCanonical(forLog))
@@ -243,7 +496,7 @@ func (k *Kernel) Publish(e *Event) *PublishAck {
 
 // Append lets modules write their own domain facts into the same tamper-evident
 // chain. Mirrors rpc Append.
-func (k *Kernel) Append(r *AppendRequest) *LedgerEntry {
+func (k *MemoryKernel) Append(r *AppendRequest, ctx ...*RequestContext) *LedgerEntry {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	return k.appendLocked(r.Kind, r.Subject, r.Detail)
@@ -251,7 +504,7 @@ func (k *Kernel) Append(r *AppendRequest) *LedgerEntry {
 
 // Ledger returns a snapshot (deep copy) of the whole ledger, for
 // verification/audit. Mutating the result never affects the kernel.
-func (k *Kernel) Ledger() []*LedgerEntry {
+func (k *MemoryKernel) Ledger() []*LedgerEntry {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	out := make([]*LedgerEntry, len(k.ledger))
@@ -262,101 +515,17 @@ func (k *Kernel) Ledger() []*LedgerEntry {
 }
 
 // VerifyLedger verifies the kernel's own live ledger.
-func (k *Kernel) VerifyLedger() bool {
+func (k *MemoryKernel) VerifyLedger() bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	return VerifyChain(k.ledger)
 }
 
-// ─── 6. Gate ──────────────────────────────────────────────────────────────
-
-// RequestGate opens a human-held checkpoint in PENDING. The module must not
-// proceed with the guarded action until a human decides. Mirrors rpc RequestGate.
-func (k *Kernel) RequestGate(r *GateRequest) *GateTicket {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	id := r.Id
-	if id == "" {
-		k.gateCounter++
-		id = fmt.Sprintf("gate-%d", k.gateCounter)
-	}
-	k.gates[id] = &GateDecision{RequestId: id, Decision: DecisionPending}
-	// The full request lands in the tamper-evident chain — action, requested_by,
-	// and context are the evidence a human (or an auditor after a restart)
-	// reconstructs. detail is the canonical GateRequest, with its assigned id.
-	req := clone(r)
-	req.Id = id
-	k.appendLocked("gate.requested", id, marshalCanonical(req))
-	return &GateTicket{RequestId: id}
-}
-
-// DecideGate records a human's APPROVED or REJECTED and wakes any AwaitGate
-// waiters. Mirrors rpc DecideGate.
-func (k *Kernel) DecideGate(d *GateDecision) (*GateDecision, error) {
-	if d.Decision != DecisionApproved && d.Decision != DecisionRejected {
-		return nil, ErrNotADecision
-	}
-	d = clone(d)
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if _, ok := k.gates[d.RequestId]; !ok {
-		return nil, fmt.Errorf("%w: %s", ErrNotFound, d.RequestId)
-	}
-	k.gates[d.RequestId] = d
-	// The decision itself — who decided, what, and why — is hash-committed, so
-	// the approval record can't be rewritten without breaking the chain.
-	k.appendLocked("gate.decided", d.RequestId, marshalCanonical(d))
-	k.gateCond.Broadcast()
-	return clone(d), nil
-}
-
-// AwaitGate blocks until the gate is no longer PENDING, then returns the human's
-// decision. Mirrors rpc AwaitGate.
-func (k *Kernel) AwaitGate(t *GateTicket) (*GateDecision, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	for {
-		g, ok := k.gates[t.RequestId]
-		if !ok {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, t.RequestId)
-		}
-		if g.Decision != DecisionPending {
-			return clone(g), nil
-		}
-		k.gateCond.Wait()
-	}
-}
-
-// GateStatus is a non-blocking peek at a gate's current decision.
-func (k *Kernel) GateStatus(t *GateTicket) (Decision, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	g, ok := k.gates[t.RequestId]
-	if !ok {
-		return DecisionUnspecified, fmt.Errorf("%w: %s", ErrNotFound, t.RequestId)
-	}
-	return g.Decision, nil
-}
-
-// EnsureApproved is the non-bypass guard. It returns nil ONLY when the gate is
-// APPROVED; PENDING and REJECTED both return *GateBlockedError. Call it
-// immediately before an irreversible act.
-func (k *Kernel) EnsureApproved(t *GateTicket) error {
-	d, err := k.GateStatus(t)
-	if err != nil {
-		return err
-	}
-	if d != DecisionApproved {
-		return &GateBlockedError{Decision: d}
-	}
-	return nil
-}
-
-// ─── 7. Registry ──────────────────────────────────────────────────────────
+// ─── 6. Registry ──────────────────────────────────────────────────────────
 
 // Snapshot answers "what exists right now": every registered module,
 // capability, and contract. Mirrors rpc Snapshot.
-func (k *Kernel) Snapshot() *RegistrySnapshot {
+func (k *MemoryKernel) Snapshot(ctx ...*RequestContext) *RegistrySnapshot {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	snap := &RegistrySnapshot{
@@ -379,7 +548,7 @@ func (k *Kernel) Snapshot() *RegistrySnapshot {
 
 // StartRun validates and freezes a finite feed-forward assembly. Mirrors rpc
 // StartRun. No domain payload is interpreted; readiness follows typed bindings.
-func (k *Kernel) StartRun(req *RunRequest) (*Run, error) {
+func (k *MemoryKernel) StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, error) {
 	req = clone(req)
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -411,7 +580,7 @@ func (k *Kernel) StartRun(req *RunRequest) (*Run, error) {
 // ClaimReady atomically claims one ready node for module. An empty WorkItem
 // means this module has no ready node. If no work exists anywhere, the run is
 // closed as STALLED.
-func (k *Kernel) ClaimReady(req *ClaimRequest) (*WorkItem, error) {
+func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*WorkItem, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	slot, ok := k.runs[req.RunId]
@@ -452,7 +621,7 @@ func (k *Kernel) ClaimReady(req *ClaimRequest) (*WorkItem, error) {
 
 // Commit validates and records one production path, then releases downstream
 // nodes or closes the run when the declared terminal artifact appears.
-func (k *Kernel) Commit(submitted *Derivation) (*Run, error) {
+func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*Run, error) {
 	submitted = clone(submitted)
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -529,7 +698,7 @@ func (k *Kernel) Commit(submitted *Derivation) (*Run, error) {
 	return clone(slot.run), nil
 }
 
-func (k *Kernel) GetRun(ref *RunRef) (*Run, error) {
+func (k *MemoryKernel) GetRun(ref *RunRef, ctx ...*RequestContext) (*Run, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if slot := k.runs[ref.Id]; slot != nil {
@@ -538,7 +707,7 @@ func (k *Kernel) GetRun(ref *RunRef) (*Run, error) {
 	return nil, fmt.Errorf("%w: %s", ErrNotFound, ref.Id)
 }
 
-func (k *Kernel) CancelRun(ref *RunRef) (*Run, error) {
+func (k *MemoryKernel) CancelRun(ref *RunRef, ctx ...*RequestContext) (*Run, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	slot := k.runs[ref.Id]
@@ -555,7 +724,7 @@ func (k *Kernel) CancelRun(ref *RunRef) (*Run, error) {
 	return clone(slot.run), nil
 }
 
-func (k *Kernel) Derivations() []*Derivation {
+func (k *MemoryKernel) Derivations() []*Derivation {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	out := make([]*Derivation, len(k.derivations))
@@ -565,7 +734,7 @@ func (k *Kernel) Derivations() []*Derivation {
 	return out
 }
 
-func (k *Kernel) ListDerivations(ref *RunRef) (*DerivationList, error) {
+func (k *MemoryKernel) ListDerivations(ref *RunRef, ctx ...*RequestContext) (*DerivationList, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.runs[ref.Id] == nil {
@@ -588,7 +757,7 @@ func cloneNamed(values []*NamedArtifact) []*NamedArtifact {
 	return out
 }
 
-func (k *Kernel) capabilityFor(module, version, capability string) (*Capability, error) {
+func (k *MemoryKernel) capabilityFor(module, version, capability string) (*Capability, error) {
 	var found *Capability
 	for _, m := range k.modules {
 		if m.manifest.Name == module && m.manifest.Version == version {
@@ -617,7 +786,7 @@ func findPort(ports []*Port, name string) *Port {
 	return nil
 }
 
-func (k *Kernel) validateAssembly(a *Assembly, inputs []*NamedArtifact) error {
+func (k *MemoryKernel) validateAssembly(a *Assembly, inputs []*NamedArtifact) error {
 	if a.Id == "" {
 		return fmt.Errorf("%w: assembly id is required", ErrInvalid)
 	}
@@ -779,7 +948,7 @@ func resolveInputs(slot *runSlot, node *AssemblyNode) ([]*NamedArtifact, bool) {
 	return out, true
 }
 
-func (k *Kernel) validateOutputs(cap *Capability, outputs []*NamedArtifact) error {
+func (k *MemoryKernel) validateOutputs(cap *Capability, outputs []*NamedArtifact) error {
 	for _, expected := range cap.Outputs {
 		count := 0
 		for _, o := range outputs {
@@ -827,22 +996,18 @@ func derivationID(d *Derivation) string {
 	return "sha256:" + fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// ─── subscriber: an unbounded, in-order, non-blocking delivery queue ────────
+// ─── subscriber: bounded, in-order, non-blocking delivery ───────────────────
 
 type subscriber struct {
 	topics []string
-	out    chan *Event
-
-	mu   sync.Mutex
-	cond *sync.Cond
-	buf  []*Event
+	out    chan *Event // capacity SubscriberBuffer
 }
 
 func newSubscriber(topics []string) *subscriber {
-	s := &subscriber{topics: append([]string(nil), topics...), out: make(chan *Event)}
-	s.cond = sync.NewCond(&s.mu)
-	go s.pump()
-	return s
+	return &subscriber{
+		topics: append([]string(nil), topics...),
+		out:    make(chan *Event, SubscriberBuffer),
+	}
 }
 
 func (s *subscriber) wants(topic string) bool {
@@ -854,26 +1019,14 @@ func (s *subscriber) wants(topic string) bool {
 	return false
 }
 
-// enqueue appends under the subscriber's own lock — quick, never blocks the
-// publisher even if the consumer is slow.
-func (s *subscriber) enqueue(e *Event) {
-	s.mu.Lock()
-	s.buf = append(s.buf, e)
-	s.cond.Signal()
-	s.mu.Unlock()
-}
-
-// pump forwards buffered events to out in FIFO (== Seq) order.
-func (s *subscriber) pump() {
-	for {
-		s.mu.Lock()
-		for len(s.buf) == 0 {
-			s.cond.Wait()
-		}
-		e := s.buf[0]
-		s.buf = s.buf[1:]
-		s.mu.Unlock()
-		s.out <- e
+// tryEnqueue delivers without blocking. Returns false if the buffer is full
+// (caller should shed this subscriber).
+func (s *subscriber) tryEnqueue(e *Event) bool {
+	select {
+	case s.out <- e:
+		return true
+	default:
+		return false
 	}
 }
 

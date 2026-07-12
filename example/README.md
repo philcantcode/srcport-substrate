@@ -22,7 +22,7 @@ Three Modules with typed capability ports form a **diamond fan-in**:
                  └─▶ retrieve (question ─▶ sources)─┘
 ```
 
-The example walks all eight primitives end to end:
+The example walks the seven primitives end to end:
 
 1. **Module** — `extractor`, `retriever`, `writer` register with typed
    input/output ports; they couple only through **Contract** refs, never to each

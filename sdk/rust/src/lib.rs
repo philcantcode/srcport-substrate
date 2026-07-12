@@ -1,19 +1,25 @@
-//! # srcport-substrate — Rust SDK (v0.1, in-process)
+//! # srcport-substrate — Rust SDK (v1.0.0, in-process)
 //!
-//! One pluggable core: **eight primitives** (Module · Artifact · Contract ·
-//! Event · Ledger · Gate · Registry · Run) and **one ABI** (the [`Kernel`]). This
-//! crate realises the ABI *in-process* — the [`Kernel`] methods mirror the
-//! `service Kernel` RPCs in `substrate.proto` one-for-one — and upholds every
-//! invariant in `SPEC.md`. The wire types are generated from the canonical
-//! proto (see `build.rs`); nothing here re-derives the contract.
+//! One pluggable core: **seven primitives** (Module · Artifact · Contract ·
+//! Event · Ledger · Registry · Run) and **one ABI** (the [`KernelApi`] trait).
+//! This crate realises that ABI *in-process* as [`MemoryKernel`] — whose methods
+//! mirror the `service Kernel` RPCs in `substrate.proto` one-for-one — and
+//! upholds every invariant in `SPEC.md`. The wire types are generated from the
+//! canonical proto (see `build.rs`); nothing here re-derives the contract.
+//!
+//! **Durability lives in Modules, not the core.** [`MemoryKernel`] keeps all
+//! state in memory; it is one implementation of [`KernelApi`], not *the*
+//! authority. A consumer that needs to survive a restart implements the same
+//! trait over durable storage, or layers persistence as a Module — the core
+//! stays small, bounded, and domain-neutral either way.
 //!
 //! The kernel knows about no domain. Targets, findings, entities, terrain and
 //! content are all Modules built *on top* of this, coupling only through
 //! contract refs. See `SPEC.md` for the two-page human-owned specification.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Condvar, Mutex};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
@@ -37,39 +43,75 @@ pub use prost::Message;
 /// Everything that can go wrong at the ABI seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelError {
-    /// No artifact / gate exists for the given id.
+    /// No artifact / blob / run exists for the given id.
     NotFound(String),
-    /// A [`GateDecision`] carried something other than APPROVED/REJECTED.
-    NotADecision,
-    /// An irreversible action was attempted while the gate was not APPROVED.
-    /// Carries the current [`Decision`] so callers can see *why* it blocked.
-    GateBlocked(Decision),
     /// A manifest, assembly, binding, work result, or state transition is invalid.
     Invalid(String),
     /// An id already exists or work has already been claimed/committed.
     Conflict(String),
     /// A terminal run is immutable and accepts no more work.
     RunClosed(RunState),
+    /// Stored blob bytes do not match the claimed digest or byte_count.
+    BlobIntegrity(String),
 }
 
 impl std::fmt::Display for KernelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KernelError::NotFound(id) => write!(f, "not found: {id}"),
-            KernelError::NotADecision => {
-                write!(f, "gate decision must be APPROVED or REJECTED")
-            }
-            KernelError::GateBlocked(d) => {
-                write!(f, "gate blocked: decision is {d:?}, not APPROVED")
-            }
             KernelError::Invalid(reason) => write!(f, "invalid: {reason}"),
             KernelError::Conflict(reason) => write!(f, "conflict: {reason}"),
             KernelError::RunClosed(state) => write!(f, "run is closed: {state:?}"),
+            KernelError::BlobIntegrity(reason) => write!(f, "blob integrity: {reason}"),
         }
     }
 }
 
 impl std::error::Error for KernelError {}
+
+impl KernelError {
+    /// The portable [`ErrorCode`] this failure maps to. Every SDK — in-process
+    /// or gRPC, Rust/Go/Python — reports the same code for the same condition,
+    /// so failure semantics are identical across languages and over the wire.
+    pub fn code(&self) -> ErrorCode {
+        match self {
+            KernelError::NotFound(_) => ErrorCode::NotFound,
+            KernelError::Invalid(_) => ErrorCode::Invalid,
+            KernelError::Conflict(_) => ErrorCode::Conflict,
+            KernelError::RunClosed(_) => ErrorCode::FailedPrecondition,
+            KernelError::BlobIntegrity(_) => ErrorCode::FailedPrecondition,
+        }
+    }
+
+    /// Whether re-issuing the identical call may later succeed. None of the
+    /// current conditions clear on retry alone; a bounded-buffer backpressure
+    /// (`RESOURCE_EXHAUSTED`, wire-only) would be the retryable case.
+    pub fn retryable(&self) -> bool {
+        false
+    }
+
+    /// Project this native error onto the portable [`Error`] wire message, so a
+    /// caller across the ABI sees identical failure semantics regardless of the
+    /// SDK's implementation language.
+    pub fn to_proto(&self) -> Error {
+        let mut e = Error {
+            code: self.code() as i32,
+            message: self.to_string(),
+            retryable: self.retryable(),
+            conflict_subject: String::new(),
+            failed_precondition: String::new(),
+        };
+        match self {
+            KernelError::Conflict(subject) => e.conflict_subject = subject.clone(),
+            KernelError::RunClosed(state) => {
+                e.failed_precondition = format!("run closed: {state:?}")
+            }
+            KernelError::BlobIntegrity(reason) => e.failed_precondition = reason.clone(),
+            _ => {}
+        }
+        e
+    }
+}
 
 pub type Result<T> = std::result::Result<T, KernelError>;
 
@@ -79,16 +121,124 @@ pub type Result<T> = std::result::Result<T, KernelError>;
 
 const SEP: u8 = 0x00;
 
-/// The Artifact address: `id = "sha256:" + hex(sha256(type + 0x00 + body))`.
+/// Advisory ceiling for `Artifact.body`. Larger payloads should `put_blob` and
+/// place a verified [`ObjectRef`]. The kernel does not hard-reject oversized
+/// inline bodies (backward compat); production modules SHOULD honour this.
+pub const MAX_INLINE_ARTIFACT_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Bound on a single subscriber's undelivered-event backlog. The event bus is
+/// notification, not the data plane (artifact refs are), and the ledger is the
+/// durable record — so rather than let one slow subscriber grow the kernel's
+/// memory without bound (an unbounded queue is unsuitable inside an evidence
+/// kernel), a subscriber that falls this far behind is shed: its `Receiver`
+/// disconnects. Over the wire this surfaces as `ERROR_CODE_RESOURCE_EXHAUSTED`.
+pub const SUBSCRIBER_BUFFER: usize = 1024;
+
+/// Pure blob identity: `"sha256:" + hex(sha256(data))`. Namespace and typed
+/// Artifact fields are NOT part of blob identity.
+pub fn blob_id(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    format!("sha256:{}", hex(&h.finalize()))
+}
+
+/// Address payload for an external Artifact value:
+/// `digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace`.
+pub fn object_ref_bytes(object: &ObjectRef) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        object.digest.len() + 1 + 8 + 1 + object.namespace.len(),
+    );
+    out.extend_from_slice(object.digest.as_bytes());
+    out.push(SEP);
+    out.extend_from_slice(&object.byte_count.to_be_bytes());
+    out.push(SEP);
+    out.extend_from_slice(object.namespace.as_bytes());
+    out
+}
+
+/// Bytes folded into the Artifact address: inline body, or object_ref_bytes.
+pub fn artifact_content(artifact: &Artifact) -> Vec<u8> {
+    if let Some(obj) = artifact.object.as_ref() {
+        if !obj.digest.is_empty() {
+            return object_ref_bytes(obj);
+        }
+    }
+    artifact.body.clone()
+}
+
+/// The Artifact address over an explicit content payload:
+/// `id = "sha256:" + hex(sha256(type + 0x00 + content))`.
 ///
-/// Same `(type, body)` ⇒ same id; a one-byte change ⇒ a different id. `meta`
-/// and `produced_by` are deliberately NOT part of the address.
-pub fn artifact_id(r#type: &str, body: &[u8]) -> String {
+/// For inline values pass body; for external values pass [`object_ref_bytes`].
+/// Prefer [`artifact_id_of`] when you have a full Artifact. `meta` and
+/// `produced_by` are deliberately NOT part of the address.
+pub fn artifact_id(r#type: &str, content: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(r#type.as_bytes());
     h.update([SEP]);
-    h.update(body);
+    h.update(content);
     format!("sha256:{}", hex(&h.finalize()))
+}
+
+/// Typed value address for a full Artifact (inline or external).
+pub fn artifact_id_of(artifact: &Artifact) -> String {
+    artifact_id(&artifact.r#type, &artifact_content(artifact))
+}
+
+/// Whether `artifact` holds a verified external [`ObjectRef`].
+pub fn has_external_object(artifact: &Artifact) -> bool {
+    artifact
+        .object
+        .as_ref()
+        .map(|o| !o.digest.is_empty())
+        .unwrap_or(false)
+}
+
+/// Contract content address:
+///
+/// ```text
+/// digest = "sha256:" + hex(sha256(
+///   media_type ‖ 0x00 ‖ schema ‖ 0x00 ‖ version ‖ 0x00 ‖
+///   compatible_with… (UTF-8 ascending; each entry followed by 0x00)
+/// ))
+/// ```
+///
+/// `ref` is the registry key and is NOT folded into the digest. Pass
+/// `compatible_with` already sorted, or use [`contract_digest_of`].
+pub fn contract_digest(
+    media_type: &str,
+    schema: &str,
+    version: &str,
+    compatible_with: &[String],
+) -> String {
+    let mut h = Sha256::new();
+    h.update(media_type.as_bytes());
+    h.update([SEP]);
+    h.update(schema.as_bytes());
+    h.update([SEP]);
+    h.update(version.as_bytes());
+    h.update([SEP]);
+    for c in compatible_with {
+        h.update(c.as_bytes());
+        h.update([SEP]);
+    }
+    format!("sha256:{}", hex(&h.finalize()))
+}
+
+/// Compute the content digest for a [`Contract`], sorting `compatible_with`
+/// ascending as raw UTF-8 before hashing.
+pub fn contract_digest_of(c: &Contract) -> String {
+    let mut compat = c.compatible_with.clone();
+    compat.sort();
+    contract_digest(&c.media_type, &c.schema, &c.version, &compat)
+}
+
+/// A name-only stub (empty content fields) created by [`MemoryKernel::register`].
+pub fn is_contract_placeholder(c: &Contract) -> bool {
+    c.media_type.is_empty()
+        && c.schema.is_empty()
+        && c.version.is_empty()
+        && c.compatible_with.is_empty()
 }
 
 /// A ledger entry's hash: `sha256` over `(seq, kind, subject, detail, prev_hash)`
@@ -136,13 +286,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// The Kernel — the one ABI. Methods mirror `service Kernel` in the proto.
+// The MemoryKernel — the in-memory implementation of the ABI. Methods mirror
+// `service Kernel` in the proto.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// One live subscription: the topics it wants, and the channel we push to.
+/// One live subscription: the topics it wants, and the bounded channel we push
+/// to. The channel is `sync_channel(SUBSCRIBER_BUFFER)` so delivery is
+/// non-blocking but memory-bounded; see [`SUBSCRIBER_BUFFER`].
 struct Sub {
     topics: Vec<String>,
-    tx: Sender<Event>,
+    tx: SyncSender<Event>,
 }
 
 /// A registered module plus its current lifecycle state.
@@ -158,6 +311,12 @@ struct RunSlot {
     committed: HashMap<String, Derivation>,
 }
 
+#[derive(Clone)]
+struct BlobSlot {
+    data: Vec<u8>,
+    r#ref: BlobRef,
+}
+
 /// Everything the kernel owns, behind one lock. Small on purpose.
 #[derive(Default)]
 struct State {
@@ -165,34 +324,33 @@ struct State {
     capabilities: Vec<Capability>,
     contracts: HashMap<String, Contract>,
     artifacts: HashMap<String, Artifact>,
+    /// Keyed by `(namespace, digest)`.
+    blobs: HashMap<(String, String), BlobSlot>,
     subs: Vec<Sub>,
     ledger: Vec<LedgerEntry>,
-    gates: HashMap<String, GateDecision>,
     runs: HashMap<String, RunSlot>,
     derivations: Vec<Derivation>,
     event_seq: u64,
-    gate_counter: u64,
 }
 
-/// The in-process microkernel. `Send + Sync`; share it behind an `Arc` across
-/// module threads. Every meaningful action lands one append-only ledger entry.
-pub struct Kernel {
+/// The in-memory realisation of [`KernelApi`]. `Send + Sync`; share it behind
+/// an `Arc` across module threads. Every meaningful action lands one
+/// append-only ledger entry. Durability lives in Modules (or other
+/// [`KernelApi`] implementations), not in this type.
+pub struct MemoryKernel {
     state: Mutex<State>,
-    /// Signalled whenever a gate decision changes, so [`Kernel::await_gate`] wakes.
-    gate_signal: Condvar,
 }
 
-impl Default for Kernel {
+impl Default for MemoryKernel {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Kernel {
+impl MemoryKernel {
     pub fn new() -> Self {
-        Kernel {
+        MemoryKernel {
             state: Mutex::new(State::default()),
-            gate_signal: Condvar::new(),
         }
     }
 
@@ -221,28 +379,17 @@ impl Kernel {
     // ── 1. MODULE ─────────────────────────────────────────────────────────
 
     /// `rpc Register(ModuleManifest) -> RegisterAck`. Records the module, its
-    /// capabilities, and (implicitly) the contracts those capabilities speak.
-    /// The module lands in `REGISTERED`; advance it with [`Kernel::transition`].
+    /// capabilities, and (implicitly) name-only placeholders for the contracts
+    /// those capabilities speak. The module lands in `REGISTERED`; advance it
+    /// with [`MemoryKernel::transition`]. Placeholders may be filled once via
+    /// [`MemoryKernel::put_contract`].
     pub fn register(&self, manifest: ModuleManifest) -> RegisterAck {
         let mut state = self.state.lock().unwrap();
         for cap in &manifest.provides {
             state.capabilities.push(cap.clone());
-            // Registering a capability registers the contract it speaks.
-            state
-                .contracts
-                .entry(cap.contract.clone())
-                .or_insert_with(|| Contract {
-                    r#ref: cap.contract.clone(),
-                    schema: String::new(),
-                });
+            Self::ensure_contract_placeholder(&mut state, &cap.contract);
             for port in cap.inputs.iter().chain(cap.outputs.iter()) {
-                state
-                    .contracts
-                    .entry(port.contract.clone())
-                    .or_insert_with(|| Contract {
-                        r#ref: port.contract.clone(),
-                        schema: String::new(),
-                    });
+                Self::ensure_contract_placeholder(&mut state, &port.contract);
             }
         }
         let name = manifest.name.clone();
@@ -258,6 +405,17 @@ impl Kernel {
         RegisterAck {
             state: Lifecycle::Registered as i32,
         }
+    }
+
+    fn ensure_contract_placeholder(state: &mut State, r#ref: &str) {
+        if r#ref.is_empty() {
+            return;
+        }
+        state.contracts.entry(r#ref.to_string()).or_insert_with(|| Contract {
+            r#ref: r#ref.to_string(),
+            digest: contract_digest("", "", "", &[]),
+            ..Default::default()
+        });
     }
 
     /// Advance a module along `REGISTERED → LOADED → ACTIVE → DEACTIVATED`.
@@ -286,26 +444,31 @@ impl Kernel {
 
     // ── 2. ARTIFACT ────────────────────────────────────────────────────────
 
-    /// `rpc PutArtifact(Artifact) -> ArtifactRef`. Content-addresses the value,
-    /// stores it **immutably** (first write wins — a later put of the same id
-    /// never mutates what is stored), and returns its ref.
-    pub fn put_artifact(&self, mut artifact: Artifact) -> ArtifactRef {
-        let id = artifact_id(&artifact.r#type, &artifact.body);
-        artifact.id = id.clone();
+    /// `rpc PutArtifact(Artifact) -> ArtifactRef`. Content-addresses the typed
+    /// value, stores it **immutably** (first write wins), and returns its ref.
+    ///
+    /// Inline: set `body`, leave `object` unset. External: `put_blob` first,
+    /// then set `object` with empty `body`. The blob must already exist and
+    /// match. Exactly one of body or object may carry the value.
+    pub fn put_artifact(&self, mut artifact: Artifact) -> Result<ArtifactRef> {
+        validate_artifact_content(&artifact)?;
         let mut state = self.state.lock().unwrap();
+        if has_external_object(&artifact) {
+            verify_object_ref_locked(&state, artifact.object.as_ref().unwrap())?;
+        }
+        let id = artifact_id_of(&artifact);
+        artifact.id = id.clone();
         // Immutability: only the first writer of an id sets the stored bytes.
         if !state.artifacts.contains_key(&id) {
-            // The ledger commits to everything but the body: `subject` (the id)
-            // already addresses (type, body), so re-inlining the body would
-            // duplicate the store into a log it can never prune. `detail` is the
-            // canonical Artifact with `body` cleared; see SPEC.md "Ledger detail".
+            // Clear large inline body in the ledger; keep ObjectRef (small,
+            // part of value identity) so external artifacts reconstruct.
             let body = std::mem::take(&mut artifact.body);
             let detail = artifact.encode_to_vec();
             artifact.body = body;
             state.artifacts.insert(id.clone(), artifact);
             Self::append_locked(&mut state, "artifact.put", &id, detail);
         }
-        ArtifactRef { id }
+        Ok(ArtifactRef { id })
     }
 
     /// `rpc GetArtifact(ArtifactRef) -> Artifact`. Reads back byte-identical.
@@ -318,14 +481,137 @@ impl Kernel {
             .ok_or_else(|| KernelError::NotFound(r#ref.id.clone()))
     }
 
+    /// `rpc PutBlob(PutBlobRequest) -> BlobRef`. Content-addresses raw bytes
+    /// under `(namespace, digest)`. First write wins.
+    pub fn put_blob(&self, req: PutBlobRequest) -> BlobRef {
+        let digest = blob_id(&req.data);
+        let r#ref = BlobRef {
+            digest: digest.clone(),
+            byte_count: req.data.len() as u64,
+            namespace: req.namespace.clone(),
+        };
+        let key = (req.namespace, digest.clone());
+        let mut state = self.state.lock().unwrap();
+        // First write wins; use entry to avoid double-lookup (clippy map_entry).
+        if let std::collections::hash_map::Entry::Vacant(e) = state.blobs.entry(key) {
+            let detail = r#ref.encode_to_vec();
+            e.insert(BlobSlot {
+                data: req.data,
+                r#ref: r#ref.clone(),
+            });
+            Self::append_locked(&mut state, "blob.put", &digest, detail);
+        }
+        r#ref
+    }
+
+    /// `rpc GetBlob(GetBlobRequest) -> BlobData`. Returns verified blob bytes.
+    pub fn get_blob(&self, req: GetBlobRequest) -> Result<BlobData> {
+        let state = self.state.lock().unwrap();
+        let slot = state
+            .blobs
+            .get(&(req.namespace.clone(), req.digest.clone()))
+            .ok_or_else(|| KernelError::NotFound(format!("blob {}", req.digest)))?;
+        if blob_id(&slot.data) != slot.r#ref.digest
+            || slot.data.len() as u64 != slot.r#ref.byte_count
+        {
+            return Err(KernelError::BlobIntegrity(
+                "stored blob corrupted".into(),
+            ));
+        }
+        Ok(BlobData {
+            digest: slot.r#ref.digest.clone(),
+            byte_count: slot.r#ref.byte_count,
+            namespace: slot.r#ref.namespace.clone(),
+            data: slot.data.clone(),
+        })
+    }
+
+    /// `rpc HasBlob(HasBlobRequest) -> HasBlobResponse`.
+    pub fn has_blob(&self, req: HasBlobRequest) -> HasBlobResponse {
+        let state = self.state.lock().unwrap();
+        if let Some(slot) = state.blobs.get(&(req.namespace, req.digest)) {
+            HasBlobResponse {
+                exists: true,
+                byte_count: slot.r#ref.byte_count,
+            }
+        } else {
+            HasBlobResponse {
+                exists: false,
+                byte_count: 0,
+            }
+        }
+    }
+
+    /// Put the blob then an external artifact referencing it (production path).
+    pub fn put_artifact_with_blob(
+        &self,
+        r#type: &str,
+        namespace: &str,
+        data: &[u8],
+        produced_by: &str,
+    ) -> Result<(ArtifactRef, BlobRef)> {
+        let blob = self.put_blob(PutBlobRequest {
+            namespace: namespace.into(),
+            data: data.to_vec(),
+        });
+        let artifact = self.put_artifact(Artifact {
+            r#type: r#type.into(),
+            produced_by: produced_by.into(),
+            object: Some(ObjectRef {
+                digest: blob.digest.clone(),
+                byte_count: blob.byte_count,
+                namespace: blob.namespace.clone(),
+            }),
+            ..Default::default()
+        })?;
+        Ok((artifact, blob))
+    }
+
     // ── 3. CONTRACT ────────────────────────────────────────────────────────
 
-    /// Register (or attach schema text to) a contract explicitly. Capabilities
-    /// already auto-register their contract ref via [`Kernel::register`]; use
-    /// this when you also want to carry the schema.
-    pub fn put_contract(&self, contract: Contract) {
+    /// `rpc PutContract(Contract) -> Contract`. Registers a contract immutably
+    /// under its ref. Returns the stored contract (digest assigned). Identical
+    /// re-puts are no-ops; different content under the same ref is
+    /// [`KernelError::Conflict`]. A name-only placeholder from
+    /// [`MemoryKernel::register`] may be filled once.
+    pub fn put_contract(&self, mut contract: Contract) -> Result<Contract> {
+        if contract.r#ref.is_empty() {
+            return Err(KernelError::Invalid("contract ref is required".into()));
+        }
+        contract.compatible_with.sort();
+        let digest = contract_digest(
+            &contract.media_type,
+            &contract.schema,
+            &contract.version,
+            &contract.compatible_with,
+        );
+        if !contract.digest.is_empty() && contract.digest != digest {
+            return Err(KernelError::Invalid("contract digest mismatch".into()));
+        }
+        contract.digest = digest;
+
         let mut state = self.state.lock().unwrap();
-        state.contracts.insert(contract.r#ref.clone(), contract);
+        if let Some(existing) = state.contracts.get(&contract.r#ref) {
+            if existing.digest == contract.digest {
+                return Ok(existing.clone());
+            }
+            if is_contract_placeholder(existing) && !is_contract_placeholder(&contract) {
+                let detail = contract.encode_to_vec();
+                let r#ref = contract.r#ref.clone();
+                state.contracts.insert(r#ref.clone(), contract.clone());
+                Self::append_locked(&mut state, "contract.registered", &r#ref, detail);
+                return Ok(contract);
+            }
+            return Err(KernelError::Conflict(format!(
+                "contract {} already registered with different content",
+                contract.r#ref
+            )));
+        }
+        let detail = contract.encode_to_vec();
+        let r#ref = contract.r#ref.clone();
+        state.contracts.insert(r#ref.clone(), contract.clone());
+        Self::append_locked(&mut state, "contract.registered", &r#ref, detail);
+        Ok(contract)
     }
 
     // ── 4. EVENT ───────────────────────────────────────────────────────────
@@ -334,7 +620,7 @@ impl Kernel {
     /// is an mpsc [`Receiver`]; events arrive in kernel `seq` order. A module
     /// only ever receives events on topics it named here.
     pub fn subscribe(&self, sub: Subscription) -> Receiver<Event> {
-        let (tx, rx) = channel();
+        let (tx, rx) = sync_channel(SUBSCRIBER_BUFFER);
         let mut state = self.state.lock().unwrap();
         state.subs.push(Sub {
             topics: sub.topics,
@@ -352,10 +638,14 @@ impl Kernel {
         let seq = state.event_seq;
         event.seq = seq;
 
-        // Deliver in-order to matching subs; drop any whose receiver is gone.
+        // Deliver in-order to matching subs. A bounded, non-blocking `try_send`:
+        // a subscriber whose buffer is full (fallen SUBSCRIBER_BUFFER behind) or
+        // whose receiver is gone is shed here, so one slow consumer can never
+        // grow the kernel's memory without bound. Dropped notifications remain
+        // reconstructable from the ledger — the bus is only notification.
         state.subs.retain(|sub| {
             if sub.topics.iter().any(|t| t == &event.topic) {
-                sub.tx.send(event.clone()).is_ok()
+                sub.tx.try_send(event.clone()).is_ok()
             } else {
                 true
             }
@@ -387,96 +677,7 @@ impl Kernel {
         verify_chain(&self.state.lock().unwrap().ledger)
     }
 
-    // ── 6. GATE ────────────────────────────────────────────────────────────
-
-    /// `rpc RequestGate(GateRequest) -> GateTicket`. Opens a human-held
-    /// checkpoint in `PENDING`. The module must not proceed with the guarded
-    /// action until a human decides. The full request is committed to the
-    /// tamper-evident ledger.
-    pub fn request_gate(&self, mut req: GateRequest) -> GateTicket {
-        let mut state = self.state.lock().unwrap();
-        if req.id.is_empty() {
-            state.gate_counter += 1;
-            req.id = format!("gate-{}", state.gate_counter);
-        }
-        let id = req.id.clone();
-        state.gates.insert(
-            id.clone(),
-            GateDecision {
-                request_id: id.clone(),
-                decision: Decision::Pending as i32,
-                decided_by: String::new(),
-                reason: String::new(),
-            },
-        );
-        // The full request lands in the tamper-evident chain — action,
-        // requested_by, and context are the evidence an auditor (or a human
-        // after a restart) reconstructs. `detail` is the canonical encoding of
-        // the GateRequest; see SPEC.md "Ledger detail".
-        let detail = req.encode_to_vec();
-        Self::append_locked(&mut state, "gate.requested", &id, detail);
-        GateTicket { request_id: id }
-    }
-
-    /// `rpc DecideGate(GateDecision) -> GateDecision`. A human records
-    /// APPROVED or REJECTED. Wakes anyone in [`Kernel::await_gate`]. The
-    /// decision is committed to the tamper-evident ledger.
-    pub fn decide_gate(&self, decision: GateDecision) -> Result<GateDecision> {
-        let d = decision.decision();
-        if d != Decision::Approved && d != Decision::Rejected {
-            return Err(KernelError::NotADecision);
-        }
-        let mut state = self.state.lock().unwrap();
-        if !state.gates.contains_key(&decision.request_id) {
-            return Err(KernelError::NotFound(decision.request_id.clone()));
-        }
-        let id = decision.request_id.clone();
-        state.gates.insert(id.clone(), decision.clone());
-        // The decision itself — who decided, what, and why — is hash-committed,
-        // so the approval record can't be rewritten without breaking the chain.
-        // Previously only the gate id landed here, leaving the decision outside
-        // the tamper-evident log. `detail` is the canonical GateDecision.
-        let detail = decision.encode_to_vec();
-        Self::append_locked(&mut state, "gate.decided", &id, detail);
-        drop(state);
-        self.gate_signal.notify_all();
-        Ok(decision)
-    }
-
-    /// `rpc AwaitGate(GateTicket) -> GateDecision`. Blocks until the gate is no
-    /// longer `PENDING`, then returns the human's decision.
-    pub fn await_gate(&self, ticket: &GateTicket) -> Result<GateDecision> {
-        let mut state = self.state.lock().unwrap();
-        loop {
-            match state.gates.get(&ticket.request_id) {
-                None => return Err(KernelError::NotFound(ticket.request_id.clone())),
-                Some(g) if g.decision() != Decision::Pending => return Ok(g.clone()),
-                Some(_) => state = self.gate_signal.wait(state).unwrap(),
-            }
-        }
-    }
-
-    /// Non-blocking peek at a gate's current decision.
-    pub fn gate_status(&self, ticket: &GateTicket) -> Result<Decision> {
-        let state = self.state.lock().unwrap();
-        state
-            .gates
-            .get(&ticket.request_id)
-            .map(|g| g.decision())
-            .ok_or_else(|| KernelError::NotFound(ticket.request_id.clone()))
-    }
-
-    /// The non-bypass guard. Returns `Ok(())` **only** when the gate is
-    /// APPROVED; `PENDING` and `REJECTED` both return `GateBlocked`. Call this
-    /// immediately before an irreversible act.
-    pub fn ensure_approved(&self, ticket: &GateTicket) -> Result<()> {
-        match self.gate_status(ticket)? {
-            Decision::Approved => Ok(()),
-            other => Err(KernelError::GateBlocked(other)),
-        }
-    }
-
-    // ── 7. REGISTRY ────────────────────────────────────────────────────────
+    // ── 6. REGISTRY ────────────────────────────────────────────────────────
 
     /// `rpc Snapshot(SnapshotRequest) -> RegistrySnapshot`. "What exists right
     /// now": every registered module, capability, and contract.
@@ -489,7 +690,7 @@ impl Kernel {
         }
     }
 
-    // ── 8. RUN / CONVERGENCE ─────────────────────────────────────────────
+    // ── 7. RUN / CONVERGENCE ─────────────────────────────────────────────
 
     /// Validate and start one finite feed-forward assembly. The graph, module
     /// versions, bindings, input artifacts, and terminal output are frozen into
@@ -767,6 +968,149 @@ impl Kernel {
                 .collect(),
         })
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// KernelApi — the portable ABI (16 unary RPCs of `service Kernel`).
+// Streaming `Subscribe` and the lifecycle helper `transition` stay
+// inherent-only on [`MemoryKernel`].
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The Kernel ABI: one method per unary `service Kernel` RPC, each taking a
+/// [`RequestContext`] as call metadata. Context is **not** folded into ledger
+/// detail (that would break the cross-SDK known-answer chain hashes); it rides
+/// beside the call — gRPC headers on the wire, this parameter in-process.
+///
+/// [`MemoryKernel`] implements this trait by delegating to its ctx-free
+/// inherent methods, so existing call sites need not change. Other backends
+/// (durable store, remote) implement the same trait.
+pub trait KernelApi {
+    fn register(&self, manifest: ModuleManifest, ctx: &RequestContext) -> RegisterAck;
+    fn put_artifact(&self, artifact: Artifact, ctx: &RequestContext) -> Result<ArtifactRef>;
+    fn get_artifact(&self, r#ref: &ArtifactRef, ctx: &RequestContext) -> Result<Artifact>;
+    fn put_blob(&self, req: PutBlobRequest, ctx: &RequestContext) -> BlobRef;
+    fn get_blob(&self, req: GetBlobRequest, ctx: &RequestContext) -> Result<BlobData>;
+    fn has_blob(&self, req: HasBlobRequest, ctx: &RequestContext) -> HasBlobResponse;
+    fn put_contract(&self, contract: Contract, ctx: &RequestContext) -> Result<Contract>;
+    fn publish(&self, event: Event, ctx: &RequestContext) -> PublishAck;
+    fn append(&self, req: AppendRequest, ctx: &RequestContext) -> LedgerEntry;
+    fn snapshot(&self, req: SnapshotRequest, ctx: &RequestContext) -> RegistrySnapshot;
+    fn start_run(&self, req: RunRequest, ctx: &RequestContext) -> Result<Run>;
+    fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<WorkItem>;
+    fn commit(&self, submitted: Derivation, ctx: &RequestContext) -> Result<Run>;
+    fn get_run(&self, r: &RunRef, ctx: &RequestContext) -> Result<Run>;
+    fn cancel_run(&self, r: &RunRef, ctx: &RequestContext) -> Result<Run>;
+    fn list_derivations(&self, r: &RunRef, ctx: &RequestContext) -> Result<DerivationList>;
+}
+
+impl KernelApi for MemoryKernel {
+    fn register(&self, manifest: ModuleManifest, _ctx: &RequestContext) -> RegisterAck {
+        // Inherent method (ctx-free) takes precedence by arity — no recursion.
+        MemoryKernel::register(self, manifest)
+    }
+    fn put_artifact(&self, artifact: Artifact, _ctx: &RequestContext) -> Result<ArtifactRef> {
+        MemoryKernel::put_artifact(self, artifact)
+    }
+    fn get_artifact(&self, r#ref: &ArtifactRef, _ctx: &RequestContext) -> Result<Artifact> {
+        MemoryKernel::get_artifact(self, r#ref)
+    }
+    fn put_blob(&self, req: PutBlobRequest, _ctx: &RequestContext) -> BlobRef {
+        MemoryKernel::put_blob(self, req)
+    }
+    fn get_blob(&self, req: GetBlobRequest, _ctx: &RequestContext) -> Result<BlobData> {
+        MemoryKernel::get_blob(self, req)
+    }
+    fn has_blob(&self, req: HasBlobRequest, _ctx: &RequestContext) -> HasBlobResponse {
+        MemoryKernel::has_blob(self, req)
+    }
+    fn put_contract(&self, contract: Contract, _ctx: &RequestContext) -> Result<Contract> {
+        MemoryKernel::put_contract(self, contract)
+    }
+    fn publish(&self, event: Event, _ctx: &RequestContext) -> PublishAck {
+        MemoryKernel::publish(self, event)
+    }
+    fn append(&self, req: AppendRequest, _ctx: &RequestContext) -> LedgerEntry {
+        MemoryKernel::append(self, req)
+    }
+    fn snapshot(&self, _req: SnapshotRequest, _ctx: &RequestContext) -> RegistrySnapshot {
+        MemoryKernel::snapshot(self)
+    }
+    fn start_run(&self, req: RunRequest, _ctx: &RequestContext) -> Result<Run> {
+        MemoryKernel::start_run(self, req)
+    }
+    fn claim_ready(&self, req: ClaimRequest, _ctx: &RequestContext) -> Result<WorkItem> {
+        MemoryKernel::claim_ready(self, req)
+    }
+    fn commit(&self, submitted: Derivation, _ctx: &RequestContext) -> Result<Run> {
+        MemoryKernel::commit(self, submitted)
+    }
+    fn get_run(&self, r: &RunRef, _ctx: &RequestContext) -> Result<Run> {
+        MemoryKernel::get_run(self, r)
+    }
+    fn cancel_run(&self, r: &RunRef, _ctx: &RequestContext) -> Result<Run> {
+        MemoryKernel::cancel_run(self, r)
+    }
+    fn list_derivations(&self, r: &RunRef, _ctx: &RequestContext) -> Result<DerivationList> {
+        MemoryKernel::list_derivations(self, r)
+    }
+}
+
+fn is_sha256_digest(d: &str) -> bool {
+    const PREFIX: &str = "sha256:";
+    if d.len() != PREFIX.len() + 64 || !d.starts_with(PREFIX) {
+        return false;
+    }
+    d[PREFIX.len()..]
+        .bytes()
+        .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn validate_artifact_content(artifact: &Artifact) -> Result<()> {
+    if artifact.r#type.is_empty() {
+        return Err(KernelError::Invalid("artifact type is required".into()));
+    }
+    let has_obj = has_external_object(artifact);
+    let has_body = !artifact.body.is_empty();
+    if has_obj && has_body {
+        return Err(KernelError::Invalid(
+            "artifact must not set both body and object".into(),
+        ));
+    }
+    if let Some(obj) = artifact.object.as_ref() {
+        if obj.digest.is_empty() && (obj.byte_count != 0 || !obj.namespace.is_empty()) {
+            return Err(KernelError::Invalid(
+                "object.digest is required when object is set".into(),
+            ));
+        }
+        if has_obj && !is_sha256_digest(&obj.digest) {
+            return Err(KernelError::Invalid(
+                "object.digest must be sha256:<hex>".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_object_ref_locked(state: &State, object: &ObjectRef) -> Result<()> {
+    let key = (object.namespace.clone(), object.digest.clone());
+    let slot = state.blobs.get(&key).ok_or_else(|| {
+        KernelError::NotFound(format!(
+            "blob {} (namespace {:?})",
+            object.digest, object.namespace
+        ))
+    })?;
+    if slot.r#ref.byte_count != object.byte_count {
+        return Err(KernelError::BlobIntegrity(format!(
+            "object.byte_count {} != stored {}",
+            object.byte_count, slot.r#ref.byte_count
+        )));
+    }
+    if blob_id(&slot.data) != object.digest || slot.data.len() as u64 != object.byte_count {
+        return Err(KernelError::BlobIntegrity(
+            "blob does not match object ref".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn capability_for_node<'a>(state: &'a State, node: &AssemblyNode) -> Result<&'a Capability> {

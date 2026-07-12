@@ -1,9 +1,11 @@
-# srcport-substrate — Rust SDK (v0.1)
+# srcport-substrate — Rust SDK (v1.0.0)
 
 The in-process Rust realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
-It conforms to [`SPEC.md`](../../SPEC.md) — the eight primitives and the one ABI,
-nothing more.
+It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI,
+nothing more. The in-memory type is [`MemoryKernel`](src/lib.rs); it implements
+the [`KernelApi`](src/lib.rs) trait. **Durability lives in Modules, not the
+core** — `MemoryKernel` is one backend, not the authority.
 
 > This crate does **not** re-derive the core. Its wire types are generated from
 > `substrate.proto` at build time (`build.rs`, via `protox` — no `protoc`
@@ -15,7 +17,7 @@ nothing more.
 ```rust
 use srcport_substrate::*;
 
-let kernel = Kernel::new();
+let kernel = MemoryKernel::new();
 
 // 1. A module registers, declaring the contracts it speaks.
 kernel.register(ModuleManifest {
@@ -30,12 +32,20 @@ kernel.register(ModuleManifest {
 });
 
 // 2. It produces an immutable, content-addressed artifact...
+// Small values inline; large values put_blob then place a verified ObjectRef.
 let host = kernel.put_artifact(Artifact {
     r#type: "acme.recon.v1.Host".into(),
     body: b"10.0.0.1".to_vec(),
     produced_by: "recon".into(),
     ..Default::default()
-});
+})?;
+// Large evidence without copying into the artifact store:
+// let blob = kernel.put_blob(PutBlobRequest { namespace: "evidence".into(), data: pcap });
+// let capture = kernel.put_artifact(Artifact {
+//     r#type: "observer.v1.Capture".into(),
+//     object: Some(ObjectRef { digest: blob.digest, byte_count: blob.byte_count, namespace: blob.namespace }),
+//     ..Default::default()
+// })?;
 
 // 3. ...and publishes an event. Artifact refs are the data plane; coupling is
 //    only through contract refs.
@@ -47,25 +57,26 @@ kernel.publish(Event {
     ..Default::default()
 });
 
-// 4. Before anything irreversible, open a human-held gate and wait.
-let ticket = kernel.request_gate(GateRequest {
-    action: "exploit host 10.0.0.1".into(),
-    requested_by: "recon".into(),
+// 4. Contracts are immutable identities — put_contract pins ref → digest.
+//    Re-registering the same ref with different content is a conflict.
+kernel.put_contract(Contract {
+    r#ref: "acme.recon.v1.Host".into(),
+    media_type: "application/schema+json".into(),
+    schema: r#"{"type":"object"}"#.into(),
+    version: "1.0.0".into(),
     ..Default::default()
-});
-kernel.ensure_approved(&ticket)?; // Err(GateBlocked) until a human APPROVES.
+})?;
 
 // 5. The registry always answers "what exists right now."
 let snapshot = kernel.snapshot();
 ```
 
-The `Kernel` methods mirror the `service Kernel` RPCs one-for-one
-(`register`, `put_artifact`, `get_artifact`, `publish`, `subscribe`, `append`,
-`request_gate`, `decide_gate`, `await_gate`, `snapshot`, and the convergent-run
-methods `start_run`, `claim_ready`, `commit`, `get_run`, `cancel_run`,
-`list_derivations`). `subscribe` returns an mpsc `Receiver<Event>` as the
-in-process "stream". The `Kernel` is `Send + Sync` — share it across module
-threads behind an `Arc`.
+`MemoryKernel` implements `KernelApi` — the 16 unary RPCs one-for-one
+(`register`, `put_artifact`, `get_artifact`, `put_blob`, `get_blob`, `has_blob`,
+`put_contract`, `publish`, `append`, `snapshot`, and the convergent-run methods).
+`subscribe` returns a bounded mpsc `Receiver<Event>` (`SUBSCRIBER_BUFFER`).
+`MemoryKernel` is `Send + Sync` — share it across module threads behind an
+`Arc`.
 
 ## Convergent runs
 

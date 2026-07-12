@@ -1,4 +1,4 @@
-"""The in-process microkernel. Methods mirror ``service Kernel`` in the proto."""
+"""The in-memory microkernel. Methods mirror ``service Kernel`` in the proto."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import copy
 import hashlib
 import queue
 import threading
+from typing import Protocol, runtime_checkable
 
 from ._types import (
     AppendRequest,
@@ -13,32 +14,48 @@ from ._types import (
     ArtifactRef,
     Assembly,
     AssemblyNode,
+    BlobData,
+    BlobRef,
     ClaimRequest,
     Contract,
-    Decision,
     Derivation,
     DerivationList,
+    Error,
+    ErrorCode,
     Event,
-    GateDecision,
-    GateRequest,
-    GateTicket,
+    GetBlobRequest,
+    HasBlobRequest,
+    HasBlobResponse,
     LedgerEntry,
     Lifecycle,
     ModuleManifest,
     NamedArtifact,
+    ObjectRef,
     PublishAck,
+    PutBlobRequest,
     RegisterAck,
     RegistrySnapshot,
+    RequestContext,
     Run,
     RunRef,
     RunRequest,
     RunState,
+    SnapshotRequest,
     Subscription,
     WorkItem,
     _ledger_hash,
-    artifact_id,
+    artifact_id_of,
+    blob_id,
+    contract_digest,
+    has_external_object,
+    is_contract_placeholder,
     verify_chain,
 )
+
+# Bound on a single subscriber's undelivered-event backlog. The bus is
+# notification, not the data plane; a subscriber that falls this far behind is
+# shed rather than allowed to OOM the kernel.
+SUBSCRIBER_BUFFER = 1024
 
 # ─── errors ─────────────────────────────────────────────────────────────────
 
@@ -46,30 +63,47 @@ from ._types import (
 class KernelError(Exception):
     """Base for everything that can go wrong at the ABI seam."""
 
+    def code(self) -> ErrorCode:
+        """Portable ErrorCode this failure maps to (same across every SDK)."""
+        return ErrorCode.ERROR_CODE_UNSPECIFIED
+
+    def retryable(self) -> bool:
+        """Whether re-issuing the identical call may later succeed."""
+        return False
+
+    def to_proto(self) -> Error:
+        """Project this exception onto the portable Error wire message."""
+        return Error(
+            code=self.code(),
+            message=str(self),
+            retryable=self.retryable(),
+        )
+
 
 class NotFound(KernelError):
-    """No artifact or gate exists for the given id."""
+    """No artifact, blob, or run exists for the given id."""
 
-
-class NotADecision(KernelError):
-    """A GateDecision carried something other than APPROVED/REJECTED."""
-
-
-class GateBlocked(KernelError):
-    """An irreversible action was attempted while the gate was not APPROVED."""
-
-    def __init__(self, decision: Decision) -> None:
-        self.decision = decision
-        name = Decision.Name(decision)
-        super().__init__(f"gate blocked: decision is {name}, not APPROVED")
+    def code(self) -> ErrorCode:
+        return ErrorCode.ERROR_CODE_NOT_FOUND
 
 
 class Invalid(KernelError):
     """The assembly, binding, work result, or transition is invalid."""
 
+    def code(self) -> ErrorCode:
+        return ErrorCode.ERROR_CODE_INVALID
+
 
 class Conflict(KernelError):
     """An id or unit of work already exists."""
+
+    def code(self) -> ErrorCode:
+        return ErrorCode.ERROR_CODE_CONFLICT
+
+    def to_proto(self) -> Error:
+        e = super().to_proto()
+        e.conflict_subject = str(self)
+        return e
 
 
 class RunClosed(KernelError):
@@ -78,6 +112,33 @@ class RunClosed(KernelError):
     def __init__(self, state: RunState) -> None:
         self.state = state
         super().__init__(f"run is closed: {RunState.Name(state)}")
+
+    def code(self) -> ErrorCode:
+        return ErrorCode.ERROR_CODE_FAILED_PRECONDITION
+
+    def to_proto(self) -> Error:
+        e = super().to_proto()
+        e.failed_precondition = str(self)
+        return e
+
+
+class BlobIntegrity(KernelError):
+    """Stored blob bytes do not match the claimed digest or byte_count."""
+
+    def code(self) -> ErrorCode:
+        # Match Rust: BlobIntegrity maps to FAILED_PRECONDITION with detail.
+        return ErrorCode.ERROR_CODE_FAILED_PRECONDITION
+
+    def to_proto(self) -> Error:
+        e = super().to_proto()
+        e.failed_precondition = str(self)
+        return e
+
+
+def _is_sha256_digest(d: str) -> bool:
+    if not d.startswith("sha256:") or len(d) != len("sha256:") + 64:
+        return False
+    return all(c in "0123456789abcdef" for c in d[len("sha256:"):])
 
 
 _LIFECYCLE_VERB = {
@@ -99,27 +160,87 @@ def _canonical(msg) -> bytes:
     return msg.SerializeToString(deterministic=True)
 
 
-class Kernel:
-    """The in-process microkernel. Thread-safe; share one instance across
-    module threads. Every meaningful action lands one append-only ledger entry.
-    Values handed in and out are copied, so a caller can never mutate stored
-    state through a shared message.
+@runtime_checkable
+class KernelApi(Protocol):
+    """The portable ABI: the 16 unary RPCs of ``service Kernel``.
+
+    Streaming ``subscribe`` and the lifecycle helper ``transition`` stay
+    inherent-only on :class:`MemoryKernel`. ``RequestContext`` rides as call
+    metadata (optional kwarg) and is deliberately not folded into ledger detail.
+    """
+
+    def register(
+        self, manifest: ModuleManifest, ctx: RequestContext | None = None
+    ) -> RegisterAck: ...
+    def put_artifact(
+        self, artifact: Artifact, ctx: RequestContext | None = None
+    ) -> ArtifactRef: ...
+    def get_artifact(
+        self, ref: ArtifactRef, ctx: RequestContext | None = None
+    ) -> Artifact: ...
+    def put_blob(
+        self, req: PutBlobRequest, ctx: RequestContext | None = None
+    ) -> BlobRef: ...
+    def get_blob(
+        self, req: GetBlobRequest, ctx: RequestContext | None = None
+    ) -> BlobData: ...
+    def has_blob(
+        self, req: HasBlobRequest, ctx: RequestContext | None = None
+    ) -> HasBlobResponse: ...
+    def put_contract(
+        self, contract: Contract, ctx: RequestContext | None = None
+    ) -> Contract: ...
+    def publish(
+        self, event: Event, ctx: RequestContext | None = None
+    ) -> PublishAck: ...
+    def append(
+        self, req: AppendRequest, ctx: RequestContext | None = None
+    ) -> LedgerEntry: ...
+    def snapshot(
+        self, req: SnapshotRequest | None = None, ctx: RequestContext | None = None
+    ) -> RegistrySnapshot: ...
+    def start_run(
+        self, req: RunRequest, ctx: RequestContext | None = None
+    ) -> Run: ...
+    def claim_ready(
+        self, req: ClaimRequest, ctx: RequestContext | None = None
+    ) -> WorkItem: ...
+    def commit(
+        self, submitted: Derivation, ctx: RequestContext | None = None
+    ) -> Run: ...
+    def get_run(
+        self, ref: RunRef, ctx: RequestContext | None = None
+    ) -> Run: ...
+    def cancel_run(
+        self, ref: RunRef, ctx: RequestContext | None = None
+    ) -> Run: ...
+    def list_derivations(
+        self, ref: RunRef, ctx: RequestContext | None = None
+    ) -> DerivationList: ...
+
+
+class MemoryKernel:
+    """In-memory realisation of :class:`KernelApi`. Thread-safe; share one
+    instance across module threads. Every meaningful action lands one
+    append-only ledger entry. Values handed in and out are copied, so a caller
+    can never mutate stored state through a shared message.
+
+    **Durability lives in Modules, not the core** — this type is one backend.
     """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._gate_cv = threading.Condition(self._lock)
         self._modules: list[list] = []  # [manifest, lifecycle] pairs
         self._capabilities: list = []
         self._contracts: dict = {}
         self._artifacts: dict = {}
+        # (namespace, digest) -> {"data": bytes, "ref": BlobRef}
+        self._blobs: dict[tuple[str, str], dict] = {}
         self._subs: list[tuple[list[str], queue.Queue]] = []
         self._ledger: list[LedgerEntry] = []
-        self._gates: dict[str, GateDecision] = {}
         self._runs: dict[str, dict] = {}
         self._derivations: list[Derivation] = []
         self._event_seq = 0
-        self._gate_counter = 0
 
     # ── ledger helper: the ONLY path that creates entries. Caller holds lock.
     def _append_locked(
@@ -140,16 +261,17 @@ class Kernel:
 
     # ── 1. Module ──────────────────────────────────────────────────────────
 
-    def register(self, manifest: ModuleManifest) -> RegisterAck:
+    def register(self, manifest: ModuleManifest, ctx: RequestContext | None = None) -> RegisterAck:
         """rpc Register. Records the module, its capabilities, and (implicitly)
-        the contracts they speak. Lands in REGISTERED; advance with transition().
+        name-only placeholders for the contracts they speak. Lands in REGISTERED;
+        advance with transition(). Placeholders may be filled once via put_contract.
         """
         with self._lock:
             for cap in manifest.provides:
                 self._capabilities.append(copy.deepcopy(cap))
-                self._contracts.setdefault(cap.contract, Contract(ref=cap.contract))
+                self._ensure_contract_placeholder(cap.contract)
                 for port in list(cap.inputs) + list(cap.outputs):
-                    self._contracts.setdefault(port.contract, Contract(ref=port.contract))
+                    self._ensure_contract_placeholder(port.contract)
             self._modules.append(
                 [copy.deepcopy(manifest), Lifecycle.LIFECYCLE_REGISTERED]
             )
@@ -161,7 +283,15 @@ class Kernel:
             )
             return RegisterAck(state=Lifecycle.LIFECYCLE_REGISTERED)
 
-    def transition(self, module: str, to: Lifecycle) -> Lifecycle:
+    def _ensure_contract_placeholder(self, ref: str) -> None:
+        """Caller holds lock. Name-only stub if ref is new and non-empty."""
+        if not ref or ref in self._contracts:
+            return
+        self._contracts[ref] = Contract(
+            ref=ref, digest=contract_digest("", "", "", [])
+        )
+
+    def transition(self, module: str, to: Lifecycle, ctx: RequestContext | None = None) -> Lifecycle:
         """Advance REGISTERED → LOADED → ACTIVE → DEACTIVATED. Only forward
         moves are honoured; anything else is a no-op returning the current state.
         """
@@ -176,27 +306,31 @@ class Kernel:
 
     # ── 2. Artifact ────────────────────────────────────────────────────────
 
-    def put_artifact(self, artifact: Artifact) -> ArtifactRef:
-        """rpc PutArtifact. Content-addresses and stores immutably (first write
-        wins — a later put of the same id never mutates what is stored).
+    def put_artifact(self, artifact: Artifact, ctx: RequestContext | None = None) -> ArtifactRef:
+        """rpc PutArtifact. Content-addresses the typed value and stores it
+        immutably (first write wins).
+
+        Inline: set ``body``, leave ``object`` unset. External: ``put_blob``
+        first, then set ``object`` with empty ``body``. The blob must already
+        exist and match. Exactly one of body or object may carry the value.
         """
-        aid = artifact_id(artifact.type, artifact.body)
+        self._validate_artifact_content(artifact)
         with self._lock:
+            if has_external_object(artifact):
+                self._verify_object_ref_locked(artifact.object)
+            aid = artifact_id_of(artifact)
             if aid not in self._artifacts:
                 stored = copy.deepcopy(artifact)
                 stored.id = aid
                 self._artifacts[aid] = stored
-                # The ledger commits to everything but the body: subject (the id)
-                # already addresses (type, body), so re-inlining the body would
-                # duplicate the store into a log it can never prune. detail is the
-                # canonical Artifact with body cleared; meta, produced_by, and
-                # derived_from ride along.
+                # Clear large inline body; keep ObjectRef (small, part of value
+                # identity) so external artifacts reconstruct without blob bytes.
                 for_log = copy.deepcopy(stored)
                 for_log.ClearField("body")
                 self._append_locked("artifact.put", aid, _canonical(for_log))
             return ArtifactRef(id=aid)
 
-    def get_artifact(self, ref: ArtifactRef) -> Artifact:
+    def get_artifact(self, ref: ArtifactRef, ctx: RequestContext | None = None) -> Artifact:
         """rpc GetArtifact. Reads back byte-identical."""
         with self._lock:
             a = self._artifacts.get(ref.id)
@@ -204,35 +338,168 @@ class Kernel:
                 raise NotFound(ref.id)
             return copy.deepcopy(a)
 
+    def put_blob(self, req: PutBlobRequest, ctx: RequestContext | None = None) -> BlobRef:
+        """rpc PutBlob. Content-addresses raw bytes under (namespace, digest)."""
+        data = bytes(req.data)
+        digest = blob_id(data)
+        ns = req.namespace
+        ref = BlobRef(digest=digest, byte_count=len(data), namespace=ns)
+        key = (ns, digest)
+        with self._lock:
+            if key not in self._blobs:
+                self._blobs[key] = {"data": data, "ref": copy.deepcopy(ref)}
+                self._append_locked("blob.put", digest, _canonical(ref))
+            return copy.deepcopy(ref)
+
+    def get_blob(self, req: GetBlobRequest, ctx: RequestContext | None = None) -> BlobData:
+        """rpc GetBlob. Returns verified blob bytes (re-hashes on read)."""
+        with self._lock:
+            slot = self._blobs.get((req.namespace, req.digest))
+            if slot is None:
+                raise NotFound(f"blob {req.digest}")
+            data = slot["data"]
+            ref = slot["ref"]
+            if blob_id(data) != ref.digest or len(data) != ref.byte_count:
+                raise BlobIntegrity("stored blob corrupted")
+            return BlobData(
+                digest=ref.digest,
+                byte_count=ref.byte_count,
+                namespace=ref.namespace,
+                data=data,
+            )
+
+    def has_blob(self, req: HasBlobRequest, ctx: RequestContext | None = None) -> HasBlobResponse:
+        """rpc HasBlob."""
+        with self._lock:
+            slot = self._blobs.get((req.namespace, req.digest))
+            if slot is None:
+                return HasBlobResponse(exists=False)
+            return HasBlobResponse(exists=True, byte_count=slot["ref"].byte_count)
+
+    def put_artifact_with_blob(
+        self,
+        type: str,
+        namespace: str,
+        data: bytes,
+        produced_by: str = "",
+        ctx: RequestContext | None = None,
+    ) -> tuple[ArtifactRef, BlobRef]:
+        """Put the blob then an external artifact referencing it."""
+        blob = self.put_blob(PutBlobRequest(namespace=namespace, data=data))
+        ref = self.put_artifact(
+            Artifact(
+                type=type,
+                produced_by=produced_by,
+                object=ObjectRef(
+                    digest=blob.digest,
+                    byte_count=blob.byte_count,
+                    namespace=blob.namespace,
+                ),
+            )
+        )
+        return ref, blob
+
+    @staticmethod
+    def _validate_artifact_content(artifact: Artifact) -> None:
+        if not artifact.type:
+            raise Invalid("artifact type is required")
+        has_obj = has_external_object(artifact)
+        has_body = bool(artifact.body)
+        if has_obj and has_body:
+            raise Invalid("artifact must not set both body and object")
+        obj = artifact.object
+        if obj.digest == "" and (obj.byte_count != 0 or obj.namespace != ""):
+            raise Invalid("object.digest is required when object is set")
+        if has_obj and not _is_sha256_digest(obj.digest):
+            raise Invalid("object.digest must be sha256:<hex>")
+
+    def _verify_object_ref_locked(self, obj: ObjectRef) -> None:
+        slot = self._blobs.get((obj.namespace, obj.digest))
+        if slot is None:
+            raise NotFound(f"blob {obj.digest} (namespace {obj.namespace!r})")
+        ref = slot["ref"]
+        data = slot["data"]
+        if ref.byte_count != obj.byte_count:
+            raise BlobIntegrity(
+                f"object.byte_count {obj.byte_count} != stored {ref.byte_count}"
+            )
+        if blob_id(data) != obj.digest or len(data) != obj.byte_count:
+            raise BlobIntegrity("blob does not match object ref")
+
     # ── 3. Contract ────────────────────────────────────────────────────────
 
-    def put_contract(self, contract: Contract) -> None:
-        """Register (or attach schema text to) a contract explicitly."""
+    def put_contract(self, contract: Contract, ctx: RequestContext | None = None) -> Contract:
+        """rpc PutContract. Register a contract immutably under its ref.
+
+        Returns the stored contract (digest assigned). Identical re-puts are
+        no-ops; different content under the same ref raises :class:`Conflict`.
+        A name-only placeholder from :meth:`register` may be filled once.
+        """
+        if not contract.ref:
+            raise Invalid("contract ref is required")
+        c = copy.deepcopy(contract)
+        # Normalize compatible_with to UTF-8 ascending for stable identity.
+        c.ClearField("compatible_with")
+        c.compatible_with.extend(sorted(contract.compatible_with))
+        digest = contract_digest(c.media_type, c.schema, c.version, list(c.compatible_with))
+        if c.digest and c.digest != digest:
+            raise Invalid("contract digest mismatch")
+        c.digest = digest
+
         with self._lock:
-            self._contracts[contract.ref] = copy.deepcopy(contract)
+            existing = self._contracts.get(c.ref)
+            if existing is not None:
+                if existing.digest == c.digest:
+                    return copy.deepcopy(existing)
+                if is_contract_placeholder(existing) and not is_contract_placeholder(c):
+                    stored = copy.deepcopy(c)
+                    self._contracts[c.ref] = stored
+                    self._append_locked(
+                        "contract.registered", c.ref, _canonical(stored)
+                    )
+                    return copy.deepcopy(stored)
+                raise Conflict(
+                    f"contract {c.ref} already registered with different content"
+                )
+            stored = copy.deepcopy(c)
+            self._contracts[c.ref] = stored
+            self._append_locked("contract.registered", c.ref, _canonical(stored))
+            return copy.deepcopy(stored)
 
     # ── 4. Event ───────────────────────────────────────────────────────────
 
-    def subscribe(self, sub: Subscription) -> "queue.Queue[Event]":
-        """rpc Subscribe. In-process the "stream" is a Queue; events arrive in
-        kernel seq order. A module only receives events on topics it named.
+    def subscribe(self, sub: Subscription, ctx: RequestContext | None = None) -> "queue.Queue[Event]":
+        """rpc Subscribe. In-process the "stream" is a bounded Queue; events
+        arrive in kernel seq order. A module only receives events on topics it
+        named. A subscriber that falls SUBSCRIBER_BUFFER behind is shed on
+        publish so one slow consumer cannot OOM the kernel.
         """
-        q: "queue.Queue[Event]" = queue.Queue()
+        q: "queue.Queue[Event]" = queue.Queue(maxsize=SUBSCRIBER_BUFFER)
         with self._lock:
             self._subs.append((list(sub.topics), q))
         return q
 
-    def publish(self, event: Event) -> PublishAck:
+    def publish(self, event: Event, ctx: RequestContext | None = None) -> PublishAck:
         """rpc Publish. Assigns a monotonic seq, delivers to exactly the
         subscribers of event.topic and no one else, returns the assigned seq.
+        A slow subscriber whose buffer is full is shed; dropped notifications
+        remain reconstructable from the ledger.
         """
         with self._lock:
             self._event_seq += 1
             event = copy.deepcopy(event)
             event.seq = self._event_seq
+            alive: list[tuple[list[str], queue.Queue]] = []
             for topics, q in self._subs:
                 if event.topic in topics:
-                    q.put(copy.deepcopy(event))
+                    try:
+                        q.put_nowait(copy.deepcopy(event))
+                        alive.append((topics, q))
+                    except queue.Full:
+                        pass  # shed
+                else:
+                    alive.append((topics, q))
+            self._subs = alive
             for_log = copy.deepcopy(event)
             for_log.ClearField("payload")
             self._append_locked("event.published", event.topic, _canonical(for_log))
@@ -240,7 +507,7 @@ class Kernel:
 
     # ── 5. Ledger ──────────────────────────────────────────────────────────
 
-    def append(self, req: AppendRequest) -> LedgerEntry:
+    def append(self, req: AppendRequest, ctx: RequestContext | None = None) -> LedgerEntry:
         """rpc Append. Modules write their own domain facts into the same chain."""
         with self._lock:
             return self._append_locked(req.kind, req.subject, req.detail)
@@ -255,73 +522,9 @@ class Kernel:
         with self._lock:
             return verify_chain(self._ledger)
 
-    # ── 6. Gate ────────────────────────────────────────────────────────────
+    # ── 6. Registry ────────────────────────────────────────────────────────
 
-    def request_gate(self, req: GateRequest) -> GateTicket:
-        """rpc RequestGate. Opens a human-held checkpoint in PENDING."""
-        with self._lock:
-            rid = req.id
-            if not rid:
-                self._gate_counter += 1
-                rid = f"gate-{self._gate_counter}"
-            self._gates[rid] = GateDecision(
-                request_id=rid, decision=Decision.DECISION_PENDING
-            )
-            # The full request lands in the tamper-evident chain — action,
-            # requested_by, and context are the evidence a human (or an auditor
-            # after a restart) reconstructs. detail is the canonical GateRequest,
-            # with its assigned id.
-            logged = copy.deepcopy(req)
-            logged.id = rid
-            self._append_locked("gate.requested", rid, _canonical(logged))
-            return GateTicket(request_id=rid)
-
-    def decide_gate(self, decision: GateDecision) -> GateDecision:
-        """rpc DecideGate. Records APPROVED/REJECTED and wakes await_gate()."""
-        if decision.decision not in (Decision.DECISION_APPROVED, Decision.DECISION_REJECTED):
-            raise NotADecision()
-        with self._gate_cv:
-            if decision.request_id not in self._gates:
-                raise NotFound(decision.request_id)
-            self._gates[decision.request_id] = copy.deepcopy(decision)
-            # The decision itself — who decided, what, and why — is hash-committed,
-            # so the approval record can't be rewritten without breaking the chain.
-            self._append_locked(
-                "gate.decided", decision.request_id, _canonical(decision)
-            )
-            self._gate_cv.notify_all()
-            return copy.deepcopy(decision)
-
-    def await_gate(self, ticket: GateTicket) -> GateDecision:
-        """rpc AwaitGate. Blocks until the gate is no longer PENDING."""
-        with self._gate_cv:
-            while True:
-                g = self._gates.get(ticket.request_id)
-                if g is None:
-                    raise NotFound(ticket.request_id)
-                if g.decision != Decision.DECISION_PENDING:
-                    return copy.deepcopy(g)
-                self._gate_cv.wait()
-
-    def gate_status(self, ticket: GateTicket) -> Decision:
-        """Non-blocking peek at a gate's current decision."""
-        with self._lock:
-            g = self._gates.get(ticket.request_id)
-            if g is None:
-                raise NotFound(ticket.request_id)
-            return g.decision
-
-    def ensure_approved(self, ticket: GateTicket) -> None:
-        """The non-bypass guard: returns None only when APPROVED; PENDING and
-        REJECTED both raise GateBlocked. Call before an irreversible act.
-        """
-        d = self.gate_status(ticket)
-        if d != Decision.DECISION_APPROVED:
-            raise GateBlocked(d)
-
-    # ── 7. Registry ────────────────────────────────────────────────────────
-
-    def snapshot(self) -> RegistrySnapshot:
+    def snapshot(self, req: SnapshotRequest | None = None, ctx: RequestContext | None = None) -> RegistrySnapshot:
         """rpc Snapshot. "What exists right now": every module, capability, contract."""
         with self._lock:
             return RegistrySnapshot(
@@ -330,9 +533,9 @@ class Kernel:
                 contracts=[copy.deepcopy(c) for c in self._contracts.values()],
             )
 
-    # ── 8. Run / convergence ──────────────────────────────────────────────
+    # ── 7. Run / convergence ──────────────────────────────────────────────
 
-    def start_run(self, req: RunRequest) -> Run:
+    def start_run(self, req: RunRequest, ctx: RequestContext | None = None) -> Run:
         """Validate and freeze one finite feed-forward assembly."""
         with self._lock:
             if not req.id:
@@ -361,7 +564,7 @@ class Kernel:
             self._append_locked("run.started", run.id, _canonical(run))
             return copy.deepcopy(run)
 
-    def claim_ready(self, req: ClaimRequest) -> WorkItem:
+    def claim_ready(self, req: ClaimRequest, ctx: RequestContext | None = None) -> WorkItem:
         """Atomically claim one ready node for a module, or return an empty item."""
         with self._lock:
             slot = self._runs.get(req.run_id)
@@ -400,7 +603,7 @@ class Kernel:
                 self._append_locked("run.stalled", run.id, _canonical(run))
             return WorkItem()
 
-    def commit(self, submitted: Derivation) -> Run:
+    def commit(self, submitted: Derivation, ctx: RequestContext | None = None) -> Run:
         """Commit one claimed transformation and release its downstream nodes."""
         with self._lock:
             slot = self._runs.get(submitted.run_id)
@@ -472,14 +675,14 @@ class Kernel:
             self._append_locked(kind, run.id, _canonical(run))
             return copy.deepcopy(run)
 
-    def get_run(self, ref: RunRef) -> Run:
+    def get_run(self, ref: RunRef, ctx: RequestContext | None = None) -> Run:
         with self._lock:
             slot = self._runs.get(ref.id)
             if slot is None:
                 raise NotFound(ref.id)
             return copy.deepcopy(slot["run"])
 
-    def cancel_run(self, ref: RunRef) -> Run:
+    def cancel_run(self, ref: RunRef, ctx: RequestContext | None = None) -> Run:
         with self._lock:
             slot = self._runs.get(ref.id)
             if slot is None:
@@ -497,7 +700,7 @@ class Kernel:
         with self._lock:
             return copy.deepcopy(self._derivations)
 
-    def list_derivations(self, ref: RunRef) -> DerivationList:
+    def list_derivations(self, ref: RunRef, ctx: RequestContext | None = None) -> DerivationList:
         with self._lock:
             if ref.id not in self._runs:
                 raise NotFound(ref.id)

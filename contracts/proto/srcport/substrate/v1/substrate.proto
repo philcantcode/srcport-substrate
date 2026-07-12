@@ -2,7 +2,7 @@
 // srcport-substrate — the frozen, domain-neutral microkernel contract.
 //
 // THIS FILE IS THE CONTRACT. It is the one artifact a human owns and reads.
-// Every SDK conforms to it. It defines EIGHT primitives and one ABI, and it
+// Every SDK conforms to it. It defines SEVEN primitives and one ABI, and it
 // knows nothing about any domain — no targets, trials, findings, entities,
 // terrain, or content. All of that is a Module built ON TOP of this.
 //
@@ -26,10 +26,13 @@ enum Lifecycle {
   LIFECYCLE_DEACTIVATED = 4;
 }
 
-// A named thing a module can do, bound to the contract it speaks.
+// A named thing a module can do, bound to the contract identity it speaks.
 message Capability {
   string name     = 1;  // e.g. "recon.scan"
-  string contract = 2;  // legacy primary contract; prefer typed ports below
+  // Contract *ref* (registry key). The kernel pins ref → digest at PutContract;
+  // the string is an identity handle, not a redefinable label. Prefer typed
+  // ports below for multi-port capabilities.
+  string contract = 2;
   repeated Port inputs  = 3;
   repeated Port outputs = 4;
 }
@@ -39,6 +42,7 @@ message Capability {
 // is true. These rules let the kernel determine readiness without parsing data.
 message Port {
   string name     = 1;
+  // Contract *ref* — same identity semantics as Capability.contract.
   string contract = 2;
   bool multiple   = 3;
   bool optional   = 4;
@@ -55,31 +59,111 @@ message ModuleManifest {
 
 // ─── 2. ARTIFACT ───────────────────────────────────────────────────────────
 // A typed, content-addressed, IMMUTABLE value that flows between modules.
-// id = "sha256:" + hex(sha256(type + 0x00 + body)). Same content ⇒ same id.
-// The kernel never parses `body`; the `type` (a contract ref) says what it is.
+//
+// Value identity and blob identity are distinct:
+//
+//   • Inline (small):  id = H(type ‖ 0x00 ‖ body)
+//   • External (large): id = H(type ‖ 0x00 ‖ object_ref_bytes(object))
+//       object_ref_bytes = digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace
+//   • Blob identity is pure content: digest = "sha256:" + hex(sha256(data))
+//
+// Exactly one of `body` or `object` carries the value. Prefer inline for small
+// payloads; place a verified ObjectRef for large blobs so a module can commit a
+// typed value without copying PCAP / APK / evidence bytes into the artifact store.
+// The kernel never parses domain payload; `type` is the contract ref.
+
+// Content-addressed blob. Digest is over raw bytes only (not type, not namespace).
+message BlobRef {
+  string digest     = 1;  // "sha256:" + hex(sha256(data))
+  uint64 byte_count = 2;
+  string namespace  = 3;  // storage namespace / tenancy; empty = default
+}
+
+// Verified external object reference. Same fields as BlobRef; named separately
+// because it participates in typed Artifact value identity.
+message ObjectRef {
+  string digest     = 1;  // blob digest; must match stored bytes
+  uint64 byte_count = 2;  // expected size; verified on put and get
+  string namespace  = 3;  // which blob store namespace holds the bytes
+}
 
 message Artifact {
   string id                  = 1;  // content address, assigned by the kernel
-  string type                = 2;  // contract ref describing body
-  bytes  body                = 3;  // opaque encoded value
+  string type                = 2;  // contract ref describing the value
+  // Small inline value. Must be empty when `object` is set.
+  bytes  body                = 3;
   map<string, string> meta   = 4;
   string produced_by         = 5;  // module name
   // Legacy/advisory provenance. It is NOT part of the address and first-write
   // value storage cannot preserve competing paths. Run Derivation records are
   // the authoritative provenance: they preserve every distinct production.
   repeated string derived_from = 6;
+  // Large external value: a verified ref to a blob. When digest is non-empty,
+  // Artifact id hashes object_ref_bytes(object), not the blob bytes, and body
+  // must be empty. The blob must already exist in `object.namespace`.
+  ObjectRef object           = 7;
 }
 
 message ArtifactRef { string id = 1; }
 
+// Blob store ABI (streaming-capable on the wire; in-process SDKs take full bytes).
+message PutBlobRequest {
+  string namespace = 1;  // empty = default
+  bytes  data      = 2;
+}
+
+message GetBlobRequest {
+  string digest    = 1;
+  string namespace = 2;
+}
+
+message BlobData {
+  string digest     = 1;
+  uint64 byte_count = 2;
+  string namespace  = 3;
+  bytes  data       = 4;
+}
+
+message HasBlobRequest {
+  string digest    = 1;
+  string namespace = 2;
+}
+
+message HasBlobResponse {
+  bool   exists     = 1;
+  uint64 byte_count = 2;
+}
+
 // ─── 3. CONTRACT ───────────────────────────────────────────────────────────
 // The declarative schema that is the SOLE coupling point. Modules couple to a
-// contract ref, never to each other's code. Registering a capability registers
-// the contract it speaks.
+// contract *identity*, never to each other's code.
+//
+// Identity & immutability:
+//   • `ref` is the stable human name and the registry key.
+//   • `digest` is the content address, assigned by the kernel:
+//         digest = "sha256:" + hex(sha256(
+//           media_type ‖ 0x00 ‖ schema ‖ 0x00 ‖ version ‖ 0x00 ‖
+//           compatible_with… (UTF-8 ascending, each entry 0x00-delimited)
+//         ))
+//   • PutContract is immutable: first write of a ref wins. An identical re-put
+//     is a no-op. A different content under the same ref is CONFLICT.
+//   • Register may create an empty name-only placeholder for a ref named by a
+//     capability/port; that placeholder may be filled once via PutContract.
+//
+// Port.contract, Capability.contract, Artifact.type, and Event.type hold the
+// ref. The kernel pins that ref to one digest — the string is never redefinable.
 
 message Contract {
-  string ref    = 1;  // fully-qualified name, e.g. "acme.recon.v1.Host"
-  string schema = 2;  // schema text (proto / JSON Schema); may be empty
+  string ref         = 1;  // fully-qualified name, e.g. "acme.recon.v1.Host"
+  string schema      = 2;  // schema text; may be empty for name-only placeholders
+  // Schema language / media type, e.g. "text/x-protobuf",
+  // "application/schema+json", "application/json". Empty only for placeholders.
+  string media_type  = 3;
+  string version     = 4;  // optional explicit version metadata (e.g. semver)
+  string digest      = 5;  // content address; assigned by the kernel on put
+  // Optional: other contract refs this one claims compatibility with. Advisory
+  // only — does not rewrite or alias those refs. Sorted UTF-8 on registration.
+  repeated string compatible_with = 6;
 }
 
 // ─── 4. EVENT ──────────────────────────────────────────────────────────────
@@ -108,38 +192,15 @@ message LedgerEntry {
   string kind      = 2;  // "module.activated", "artifact.put", "event.published", …
   string subject   = 3;  // id of the thing this entry is about
   bytes  detail    = 4;  // canonical proto of one message, keyed by `kind` (see
-                         // SPEC.md "Ledger detail"); content already addressed by
-                         // `subject`, e.g. an artifact body, is cleared.
+                         // SPEC.md "Ledger detail"); large content already
+                         // addressed by `subject` (artifact body bytes, blob
+                         // data) is cleared; verified ObjectRef / BlobRef
+                         // metadata remains.
   string prev_hash = 5;  // hash of entry seq-1 ("" for genesis)
   string hash      = 6;  // sha256 over (seq, kind, subject, detail, prev_hash)
 }
 
-// ─── 6. GATE ───────────────────────────────────────────────────────────────
-// A human-held checkpoint before anything irreversible. A module REQUESTS a
-// gate and must not proceed until a human DECIDES. Non-bypassable by design.
-
-enum Decision {
-  DECISION_UNSPECIFIED = 0;
-  DECISION_PENDING     = 1;
-  DECISION_APPROVED    = 2;
-  DECISION_REJECTED    = 3;
-}
-
-message GateRequest {
-  string id           = 1;
-  string action       = 2;  // human-readable description of the irreversible act
-  bytes  context      = 3;  // evidence the human decides on
-  string requested_by = 4;  // module name
-}
-
-message GateDecision {
-  string   request_id = 1;
-  Decision decision   = 2;
-  string   decided_by = 3;  // human identity
-  string   reason     = 4;
-}
-
-// ─── 7. REGISTRY ───────────────────────────────────────────────────────────
+// ─── 6. REGISTRY ───────────────────────────────────────────────────────────
 // Discovery: what modules, capabilities, and contracts exist right now.
 
 message RegistrySnapshot {
@@ -148,7 +209,7 @@ message RegistrySnapshot {
   repeated Contract        contracts    = 3;
 }
 
-// ─── 8. RUN / CONVERGENCE ──────────────────────────────────────────────────
+// ─── 7. RUN / CONVERGENCE ──────────────────────────────────────────────────
 // An Assembly is the small, human-owned feed-forward seam. It pins module
 // versions, connects typed ports, and names exactly one terminal output. A Run
 // applies an immutable set of input artifacts to one Assembly. It can close
@@ -254,28 +315,80 @@ message Derivation {
 
 message DerivationList { repeated Derivation derivations = 1; }
 
+// ─── ABI ENVELOPE: request context & portable errors ───────────────────────
+// Cross-cutting shapes every SDK shares. Neither belongs to a primitive.
+//
+// RequestContext rides as call metadata — gRPC headers over the wire, a
+// parameter in-process — so retry-safety, deadlines and tracing have ONE clean,
+// add-only home instead of leaking into each RPC's domain message. It is
+// deliberately kept OUT of the hash-chained ledger detail: the canonical chain
+// records WHAT happened to state, not who asked; folding a caller or trace id
+// into the hash would make identical histories diverge.
+//
+// There is no kernel-level authorisation: systems built on this core are
+// trusted. `caller` is observational only (audit / routing hints), never an
+// access-control principal.
+message RequestContext {
+  string caller           = 1;  // module or process identity making the call
+  string request_key      = 2;  // idempotency key; retried calls carrying the
+                                // same key must be safe to de-duplicate
+  int64  deadline_unix_ms = 3;  // absolute deadline, unix epoch ms; 0 = none
+  string correlation_id   = 4;  // trace ref linking related calls
+}
+
+// A portable failure. Every SDK — in-process or gRPC, Rust/Go/Python — maps its
+// native error (Result/error/exception) into exactly this shape, so failure
+// semantics are identical across languages and across the wire. Retryability is
+// explicit so callers never guess whether re-issuing a call is safe.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED         = 0;
+  ERROR_CODE_NOT_FOUND           = 1;  // no such artifact / blob / run
+  ERROR_CODE_INVALID             = 2;  // malformed request, manifest, or assembly
+  ERROR_CODE_CONFLICT            = 3;  // id exists / work already claimed
+  ERROR_CODE_FAILED_PRECONDITION = 4;  // run closed / other unmet precondition
+  ERROR_CODE_RESOURCE_EXHAUSTED  = 5;  // a bounded buffer is full (backpressure)
+  ERROR_CODE_BLOB_INTEGRITY      = 6;  // stored bytes do not match digest/size
+}
+
+message Error {
+  ErrorCode code                = 1;
+  string    message             = 2;  // human-readable detail
+  bool      retryable           = 3;  // true ⇒ the same call may succeed later
+  string    conflict_subject    = 4;  // for CONFLICT: the id in contention
+  string    failed_precondition = 5;  // for FAILED_PRECONDITION: what was unmet
+}
+
 // ─── KERNEL ABI ─────────────────────────────────────────────────────────────
 // The seam every SDK implements. Rust, Go, and Python each realise it IN-PROCESS
 // today (methods mirroring these RPCs). This service definition is the canonical
 // WIRE ABI for the day a cross-process SDK is needed.
+//
+// Every RPC additionally receives a RequestContext (as call metadata, not shown
+// in these signatures) and reports failure as a portable Error. In-process SDKs
+// surface the same two shapes: an optional RequestContext parameter and an
+// error type that maps one-to-one onto Error.
 
 message RegisterAck   { Lifecycle state = 1; }
 message PublishAck    { uint64 seq = 1; }
 message Subscription  { string module = 1; repeated string topics = 2; }
 message SnapshotRequest {}
-message GateTicket    { string request_id = 1; }
 message AppendRequest { string kind = 1; string subject = 2; bytes detail = 3; }
 
 service Kernel {
   rpc Register    (ModuleManifest)  returns (RegisterAck);
   rpc PutArtifact (Artifact)        returns (ArtifactRef);
   rpc GetArtifact (ArtifactRef)     returns (Artifact);
+  // Content-addressed blob store: large opaque bytes live here; Artifacts
+  // either inline small values or hold a verified ObjectRef into this store.
+  rpc PutBlob     (PutBlobRequest)  returns (BlobRef);
+  rpc GetBlob     (GetBlobRequest)  returns (BlobData);
+  rpc HasBlob     (HasBlobRequest)  returns (HasBlobResponse);
+  // Immutable contract registration. Returns the stored Contract (digest set).
+  // CONFLICT when the same ref is re-registered with different content.
+  rpc PutContract (Contract)        returns (Contract);
   rpc Publish     (Event)           returns (PublishAck);
   rpc Subscribe   (Subscription)    returns (stream Event);
   rpc Append      (AppendRequest)   returns (LedgerEntry);
-  rpc RequestGate (GateRequest)     returns (GateTicket);
-  rpc DecideGate  (GateDecision)    returns (GateDecision);
-  rpc AwaitGate   (GateTicket)      returns (GateDecision);
   rpc Snapshot    (SnapshotRequest) returns (RegistrySnapshot);
   rpc StartRun    (RunRequest)      returns (Run);
   rpc ClaimReady  (ClaimRequest)    returns (WorkItem);

@@ -12,11 +12,11 @@ lint:
     - STANDARD
   except:
     # The Kernel ABI is deliberately a union of the primitive operations and
-    # reuses small messages across RPCs (e.g. GateDecision is both the request
-    # and response of DecideGate; GateTicket is the response of RequestGate).
-    # That reuse is the design — the invariants, not one-message-per-RPC
-    # ceremony, are the contract. These STANDARD rules fight that on purpose, so
-    # we opt out of them explicitly rather than rename the human-owned surface.
+    # reuses small messages across RPCs (e.g. Run is both the response of
+    # StartRun/Commit/GetRun/CancelRun). That reuse is the design — the
+    # invariants, not one-message-per-RPC ceremony, are the contract. These
+    # STANDARD rules fight that on purpose, so we opt out of them explicitly
+    # rather than rename the human-owned surface.
     - RPC_REQUEST_STANDARD_NAME
     - RPC_RESPONSE_STANDARD_NAME
     - RPC_REQUEST_RESPONSE_UNIQUE

@@ -3,7 +3,6 @@ conformant iff all invariants pass. Runs with the stdlib: ``python -m unittest``
 """
 
 import queue
-import threading
 import unittest
 
 from srcport_substrate import (
@@ -12,25 +11,34 @@ from srcport_substrate import (
     Assembly,
     AssemblyNode,
     Binding,
+    BlobIntegrity,
+    BlobRef,
     Capability,
     ClaimRequest,
-    Decision,
+    Conflict,
+    Contract,
     Derivation,
     Event,
-    GateBlocked,
-    GateDecision,
-    GateRequest,
-    Kernel,
+    GetBlobRequest,
+    HasBlobRequest,
+    Invalid,
+    MemoryKernel,
     ModuleManifest,
     NamedArtifact,
     NodeOutput,
+    NotFound,
+    ObjectRef,
     Port,
+    PutBlobRequest,
     RunRequest,
     RunRef,
     RunState,
-    NotADecision,
     Subscription,
     artifact_id,
+    blob_id,
+    contract_digest,
+    is_contract_placeholder,
+    object_ref_bytes,
     verify_chain,
 )
 
@@ -38,7 +46,7 @@ from srcport_substrate import (
 class Conformance(unittest.TestCase):
     # 1. ADDRESSING — same (type, body) ⇒ same id; a one-byte change ⇒ a new id.
     def test_addressing_is_content_derived_and_metamorphic(self):
-        k = Kernel()
+        k = MemoryKernel()
         a = k.put_artifact(
             Artifact(type="acme.recon.v1.Host", body=b"10.0.0.1", produced_by="recon")
         )
@@ -58,7 +66,7 @@ class Conformance(unittest.TestCase):
 
     # 2. IMMUTABILITY — reads back byte-identical; a later put never mutates it.
     def test_artifacts_are_immutable(self):
-        k = Kernel()
+        k = MemoryKernel()
         r = k.put_artifact(Artifact(type="t", body=b"payload", meta={"first": "true"}))
         got = k.get_artifact(r)
         self.assertEqual(got.body, b"payload", "reads back byte-identical")
@@ -77,7 +85,7 @@ class Conformance(unittest.TestCase):
     # 3. ORDERING & ISOLATION — events reach exactly their subscribers, in seq
     #    order, and never reach non-subscribers.
     def test_events_are_ordered_and_isolated(self):
-        k = Kernel()
+        k = MemoryKernel()
         hosts = k.subscribe(Subscription(module="a", topics=["recon.host.found"]))
         ports = k.subscribe(Subscription(module="b", topics=["recon.port.found"]))
 
@@ -101,7 +109,7 @@ class Conformance(unittest.TestCase):
 
     # 4. LEDGER INTEGRITY — the chain verifies; tampering breaks verification.
     def test_ledger_is_tamper_evident(self):
-        k = Kernel()
+        k = MemoryKernel()
         k.register(ModuleManifest(name="m", version="0.1.0"))
         k.put_artifact(Artifact(type="t", body=b"x"))
         k.append(AppendRequest(kind="domain.fact", subject="s", detail=b"d"))
@@ -119,57 +127,9 @@ class Conformance(unittest.TestCase):
         del spliced[1]
         self.assertFalse(verify_chain(spliced), "removing an entry breaks the chain")
 
-    # 5. GATE NON-BYPASS — blocked while PENDING/REJECTED; permitted only APPROVED.
-    def test_gates_are_non_bypassable(self):
-        k = Kernel()
-        t = k.request_gate(GateRequest(action="delete production", requested_by="danger"))
-        with self.assertRaises(GateBlocked) as cm:
-            k.ensure_approved(t)
-        self.assertEqual(cm.exception.decision, Decision.DECISION_PENDING)
-
-        k.decide_gate(
-            GateDecision(
-                request_id=t.request_id, decision=Decision.DECISION_REJECTED, decided_by="phil"
-            )
-        )
-        with self.assertRaises(GateBlocked) as cm:
-            k.ensure_approved(t)
-        self.assertEqual(cm.exception.decision, Decision.DECISION_REJECTED)
-
-        t2 = k.request_gate(GateRequest(action="delete production"))
-        with self.assertRaises(GateBlocked):
-            k.ensure_approved(t2)
-        k.decide_gate(
-            GateDecision(
-                request_id=t2.request_id, decision=Decision.DECISION_APPROVED, decided_by="phil"
-            )
-        )
-        k.ensure_approved(t2)  # APPROVED permits — must not raise
-
-        with self.assertRaises(NotADecision):
-            k.decide_gate(
-                GateDecision(request_id=t2.request_id, decision=Decision.DECISION_PENDING)
-            )
-
-    # 5b. await_gate really blocks until a human decides.
-    def test_await_gate_blocks_until_decided(self):
-        k = Kernel()
-        t = k.request_gate(GateRequest(action="irreversible"))
-
-        def decide():
-            k.decide_gate(
-                GateDecision(
-                    request_id=t.request_id, decision=Decision.DECISION_APPROVED, decided_by="phil"
-                )
-            )
-
-        threading.Timer(0.05, decide).start()
-        decision = k.await_gate(t)
-        self.assertEqual(decision.decision, Decision.DECISION_APPROVED)
-
     # 6. DISCOVERY — the registry reports every module, capability, and contract.
     def test_registry_reports_everything(self):
-        k = Kernel()
+        k = MemoryKernel()
         k.register(
             ModuleManifest(
                 name="recon",
@@ -194,13 +154,101 @@ class Conformance(unittest.TestCase):
         refs = {c.ref for c in snap.contracts}
         self.assertTrue({"acme.recon.v1.ScanRequest", "acme.report.v1.Report"} <= refs)
 
+    # 6b. CONTRACT IDENTITY — content-addressed under ref; immutable; conflict on
+    # redefinition; placeholder fill-once; ports bind to the pinned identity.
+    def test_contracts_are_immutable_and_identifiable(self):
+        k = MemoryKernel()
+
+        stored = k.put_contract(
+            Contract(
+                ref="acme.Host",
+                media_type="application/schema+json",
+                schema='{"type":"object"}',
+                version="1.0.0",
+                compatible_with=["acme.Host.v0", "acme.legacy.Host"],
+            )
+        )
+        want = contract_digest(
+            "application/schema+json",
+            '{"type":"object"}',
+            "1.0.0",
+            ["acme.Host.v0", "acme.legacy.Host"],
+        )
+        self.assertEqual(stored.digest, want)
+        self.assertEqual(list(stored.compatible_with), ["acme.Host.v0", "acme.legacy.Host"])
+
+        # Identical re-put (unsorted compatible_with) is idempotent.
+        again = k.put_contract(
+            Contract(
+                ref="acme.Host",
+                media_type="application/schema+json",
+                schema='{"type":"object"}',
+                version="1.0.0",
+                compatible_with=["acme.legacy.Host", "acme.Host.v0"],
+            )
+        )
+        self.assertEqual(again.digest, stored.digest)
+
+        with self.assertRaises(Conflict):
+            k.put_contract(
+                Contract(
+                    ref="acme.Host",
+                    media_type="application/schema+json",
+                    schema='{"type":"string"}',
+                    version="1.0.0",
+                )
+            )
+
+        # Register creates a name-only placeholder; PutContract may fill it once.
+        k.register(
+            ModuleManifest(
+                name="mod",
+                version="1",
+                provides=[Capability(name="do", contract="acme.NewThing")],
+            )
+        )
+        filled = k.put_contract(
+            Contract(
+                ref="acme.NewThing",
+                media_type="text/x-protobuf",
+                schema="message NewThing {}",
+                version="1",
+            )
+        )
+        self.assertFalse(is_contract_placeholder(filled))
+        self.assertTrue(filled.digest)
+
+        with self.assertRaises(Conflict):
+            k.put_contract(
+                Contract(
+                    ref="acme.NewThing",
+                    media_type="text/x-protobuf",
+                    schema="message Other {}",
+                    version="1",
+                )
+            )
+
+        with self.assertRaises(Invalid):
+            k.put_contract(Contract(ref="acme.Other", schema="x", digest="sha256:deadbeef"))
+
+        # contract.registered lands in the ledger with reconstructable detail.
+        found = False
+        for e in k.ledger():
+            if e.kind == "contract.registered" and e.subject == "acme.Host":
+                c = Contract()
+                c.ParseFromString(e.detail)
+                self.assertEqual(c.ref, "acme.Host")
+                self.assertEqual(c.digest, want)
+                found = True
+        self.assertTrue(found, "contract.registered must appear in the ledger")
+
     # 7. LEDGER RECONSTRUCTION & CANONICAL DETAIL — a state-bearing entry's detail
     #    decodes to the message named for its kind and reproduces the original
     #    value, so the registry, the artifact store, and the approval record all
     #    round-trip from the tamper-evident chain alone. detail is folded into the
     #    entry hash, so forging it breaks verification.
     def test_ledger_reconstructs_state_from_detail(self):
-        k = Kernel()
+        k = MemoryKernel()
         r = k.put_artifact(
             Artifact(
                 type="acme.recon.v1.Host",
@@ -218,18 +266,6 @@ class Conformance(unittest.TestCase):
                 requires=["report.render"],
             )
         )
-        t = k.request_gate(
-            GateRequest(action="delete production", context=b"rows=42", requested_by="danger")
-        )
-        k.decide_gate(
-            GateDecision(
-                request_id=t.request_id,
-                decision=Decision.DECISION_APPROVED,
-                decided_by="phil",
-                reason="reviewed",
-            )
-        )
-
         chain = k.ledger()
 
         def detail_of(kind):
@@ -259,33 +295,9 @@ class Conformance(unittest.TestCase):
         self.assertEqual(m.provides[0].name, "recon.scan")
         self.assertEqual(list(m.requires), ["report.render"])
 
-        # gate.requested / gate.decided reconstruct who / what / why.
-        req = GateRequest()
-        req.ParseFromString(detail_of("gate.requested"))
-        self.assertEqual(
-            (req.action, req.requested_by, req.context),
-            ("delete production", "danger", b"rows=42"),
-        )
-        dec = GateDecision()
-        dec.ParseFromString(detail_of("gate.decided"))
-        self.assertEqual(
-            (dec.decision, dec.decided_by, dec.reason),
-            (Decision.DECISION_APPROVED, "phil", "reviewed"),
-        )
 
         self.assertTrue(k.verify_ledger(), "the chain with fat detail verifies")
 
-        # The approval record is hash-committed: forging who approved it (by
-        # re-encoding a different decider into detail) breaks verification.
-        forged = k.ledger()
-        i = next(i for i, e in enumerate(forged) if e.kind == "gate.decided")
-        forged[i].detail = GateDecision(
-            request_id=t.request_id,
-            decision=Decision.DECISION_APPROVED,
-            decided_by="attacker",
-            reason="reviewed",
-        ).SerializeToString(deterministic=True)
-        self.assertFalse(verify_chain(forged), "rewriting the recorded decision breaks the chain")
 
     # 7c. CANONICAL DETAIL — the same logical value encodes to identical bytes, so
     #     ledger detail hashes reproducibly across runs and SDKs (sorted map keys).
@@ -304,7 +316,7 @@ class Conformance(unittest.TestCase):
     # that aren't identity (meta, produced_by, derived_from) is a known no-op: the
     # id must not move, or the address would be keyed on provenance, not content.
     def test_address_ignores_non_identity_fields(self):
-        k = Kernel()
+        k = MemoryKernel()
         base = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"10.0.0.1"))
         enriched = k.put_artifact(
             Artifact(
@@ -327,9 +339,9 @@ class Conformance(unittest.TestCase):
     # three chains are pinned to cross-verify. If it ever changes, it changes in
     # all three suites in lockstep — never one SDK alone.
     def test_ledger_hash_known_answer_cross_sdk(self):
-        want = "985f4980bda5266d03b3e7092ef2bd9eb49b12107b43f17bbe00415deca4ab6a"
+        want = "287449b9f8f2f7462177b01d55b32cc6b65580fefa22172e8ecfaa96bdbf60a1"
 
-        k = Kernel()
+        k = MemoryKernel()
         k.register(
             ModuleManifest(
                 name="recon",
@@ -347,24 +359,12 @@ class Conformance(unittest.TestCase):
                 derived_from=["sha256:parent-a", "sha256:parent-b"],
             )
         )
-        t = k.request_gate(
-            GateRequest(action="delete production", context=b"rows=42", requested_by="danger")
-        )
-        k.decide_gate(
-            GateDecision(
-                request_id=t.request_id,
-                decision=Decision.DECISION_APPROVED,
-                decided_by="phil",
-                reason="reviewed",
-            )
-        )
-
         chain = k.ledger()
         self.assertTrue(k.verify_ledger(), "the chain must verify")
         self.assertEqual(chain[-1].hash, want, "cross-SDK ledger hash drift")
 
     def test_run_feeds_forward_and_closes_on_terminal_answer(self):
-        k = Kernel()
+        k = MemoryKernel()
         k.register(
             ModuleManifest(
                 name="extractor",
@@ -470,7 +470,7 @@ class Conformance(unittest.TestCase):
     def test_cyclic_assembly_is_rejected(self):
         from srcport_substrate import Invalid
 
-        k = Kernel()
+        k = MemoryKernel()
         k.register(
             ModuleManifest(
                 name="loop",
@@ -518,7 +518,7 @@ class Conformance(unittest.TestCase):
             k.start_run(RunRequest(id="cycle", assembly=assembly))
 
     def test_run_stalls_when_no_node_can_become_ready(self):
-        k = Kernel()
+        k = MemoryKernel()
         k.register(ModuleManifest(name="source", version="1", provides=[Capability(name="source.maybe", outputs=[Port(name="value", contract="demo.Value", optional=True)])]))
         k.register(ModuleManifest(name="sink", version="1", provides=[Capability(name="sink.answer", inputs=[Port(name="value", contract="demo.Value")], outputs=[Port(name="answer", contract="demo.Answer")])]))
         assembly = Assembly(id="stall@1", nodes=[AssemblyNode(id="source", module="source", module_version="1", capability="source.maybe"), AssemblyNode(id="sink", module="sink", module_version="1", capability="sink.answer")], bindings=[Binding(to_node="sink", to_port="value", from_node="source", from_port="value")], terminal=NodeOutput(node="sink", port="answer"))
@@ -528,7 +528,7 @@ class Conformance(unittest.TestCase):
         self.assertEqual(run.state, RunState.RUN_STATE_STALLED)
 
     def test_convergent_run_hashes_match_every_sdk(self):
-        k = Kernel()
+        k = MemoryKernel()
         k.register(ModuleManifest(name="answerer", version="1.0.0", provides=[Capability(name="answer.write", outputs=[Port(name="answer", contract="demo.Answer")])]))
         k.start_run(RunRequest(id="parity", assembly=Assembly(id="single@1", nodes=[AssemblyNode(id="answer", module="answerer", module_version="1.0.0", capability="answer.write")], terminal=NodeOutput(node="answer", port="answer"))))
         work = k.claim_ready(ClaimRequest(run_id="parity", module="answerer"))
@@ -536,6 +536,188 @@ class Conformance(unittest.TestCase):
         k.commit(Derivation(run_id="parity", work_id=work.id, node_id=work.node_id, outputs=[NamedArtifact(name="answer", artifact=answer)]))
         self.assertEqual(k.derivations()[0].id, "sha256:0e3e167112e6bb8f19d736de4592b72a2856cb494cc4dcb00fbcd5682d595cf6")
         self.assertEqual(k.ledger()[-1].hash, "faad7e3ce2d2e030cf37ff6001fe18f7dec0430ce14642f9ae878d66875bc28f")
+
+    # 12. PRODUCTION ARTIFACT BOUNDARY — inline small; external verified ObjectRef.
+    def test_blob_store_is_content_addressed_and_immutable(self):
+        k = MemoryKernel()
+        data = b"pcap-or-apk-bytes-go-here"
+        a = k.put_blob(PutBlobRequest(namespace="evidence", data=data))
+        self.assertEqual(a.digest, blob_id(data))
+        self.assertEqual(a.byte_count, len(data))
+        self.assertEqual(a.namespace, "evidence")
+
+        b = k.put_blob(PutBlobRequest(namespace="evidence", data=data))
+        self.assertEqual(a.digest, b.digest)
+
+        got = k.get_blob(GetBlobRequest(digest=a.digest, namespace="evidence"))
+        self.assertEqual(got.data, data)
+
+        has = k.has_blob(HasBlobRequest(digest=a.digest, namespace="evidence"))
+        self.assertTrue(has.exists)
+        self.assertEqual(has.byte_count, len(data))
+        self.assertFalse(
+            k.has_blob(HasBlobRequest(digest=a.digest, namespace="other")).exists
+        )
+
+        entry = next(e for e in k.ledger() if e.kind == "blob.put")
+        self.assertEqual(entry.subject, a.digest)
+        ref = BlobRef()
+        ref.ParseFromString(entry.detail)
+        self.assertEqual(ref.digest, a.digest)
+        self.assertEqual(ref.namespace, "evidence")
+
+    def test_external_artifact_refs_large_data_without_inlining(self):
+        k = MemoryKernel()
+        payload = b"EVIDENCE-BUNDLE-" * (64 * 1024)
+
+        blob = k.put_blob(PutBlobRequest(namespace="observer", data=payload))
+        ref = k.put_artifact(
+            Artifact(
+                type="observer.v1.Capture",
+                produced_by="observer",
+                object=ObjectRef(
+                    digest=blob.digest,
+                    byte_count=blob.byte_count,
+                    namespace=blob.namespace,
+                ),
+            )
+        )
+        want = artifact_id(
+            "observer.v1.Capture",
+            object_ref_bytes(
+                ObjectRef(
+                    digest=blob.digest,
+                    byte_count=blob.byte_count,
+                    namespace=blob.namespace,
+                )
+            ),
+        )
+        self.assertEqual(ref.id, want)
+        self.assertNotEqual(ref.id, blob_id(payload))
+
+        got = k.get_artifact(ref)
+        self.assertEqual(got.body, b"")
+        self.assertEqual(got.object.digest, blob.digest)
+        self.assertEqual(got.object.byte_count, blob.byte_count)
+
+        ref2 = k.put_artifact(
+            Artifact(
+                type="observer.v1.Capture",
+                object=ObjectRef(
+                    digest=blob.digest,
+                    byte_count=blob.byte_count,
+                    namespace=blob.namespace,
+                ),
+            )
+        )
+        self.assertEqual(ref2.id, ref.id)
+
+        ref3, blob3 = k.put_artifact_with_blob(
+            "observer.v1.Capture", "observer", payload, "observer"
+        )
+        self.assertEqual(ref3.id, ref.id)
+        self.assertEqual(blob3.digest, blob.digest)
+
+        data = k.get_blob(
+            GetBlobRequest(digest=got.object.digest, namespace=got.object.namespace)
+        )
+        self.assertEqual(data.data, payload)
+
+        entry = next(e for e in k.ledger() if e.kind == "artifact.put")
+        a = Artifact()
+        a.ParseFromString(entry.detail)
+        self.assertEqual(a.body, b"")
+        self.assertEqual(a.object.digest, blob.digest)
+
+    def test_external_artifact_rejects_missing_or_mismatched_blob(self):
+        k = MemoryKernel()
+        data = b"small-but-external"
+        blob = k.put_blob(PutBlobRequest(namespace="ns", data=data))
+
+        with self.assertRaises(NotFound):
+            k.put_artifact(
+                Artifact(
+                    type="t",
+                    object=ObjectRef(
+                        digest=blob_id(b"nope"), byte_count=4, namespace="ns"
+                    ),
+                )
+            )
+        with self.assertRaises(BlobIntegrity):
+            k.put_artifact(
+                Artifact(
+                    type="t",
+                    object=ObjectRef(
+                        digest=blob.digest,
+                        byte_count=blob.byte_count + 1,
+                        namespace="ns",
+                    ),
+                )
+            )
+        with self.assertRaises(Invalid):
+            k.put_artifact(
+                Artifact(
+                    type="t",
+                    body=b"x",
+                    object=ObjectRef(
+                        digest=blob.digest,
+                        byte_count=blob.byte_count,
+                        namespace="ns",
+                    ),
+                )
+            )
+        with self.assertRaises(NotFound):
+            k.put_artifact(
+                Artifact(
+                    type="t",
+                    object=ObjectRef(
+                        digest=blob.digest,
+                        byte_count=blob.byte_count,
+                        namespace="other",
+                    ),
+                )
+            )
+
+    def test_value_identity_independent_of_blob_identity(self):
+        k = MemoryKernel()
+        data = b"shared-raw-bytes"
+        blob_a = k.put_blob(PutBlobRequest(namespace="a", data=data))
+        blob_b = k.put_blob(PutBlobRequest(namespace="b", data=data))
+        self.assertEqual(blob_a.digest, blob_b.digest)
+
+        art_a = k.put_artifact(
+            Artifact(
+                type="t",
+                object=ObjectRef(
+                    digest=blob_a.digest,
+                    byte_count=blob_a.byte_count,
+                    namespace="a",
+                ),
+            )
+        )
+        art_b = k.put_artifact(
+            Artifact(
+                type="t",
+                object=ObjectRef(
+                    digest=blob_b.digest,
+                    byte_count=blob_b.byte_count,
+                    namespace="b",
+                ),
+            )
+        )
+        self.assertNotEqual(art_a.id, art_b.id)
+
+        art_c = k.put_artifact(
+            Artifact(
+                type="other",
+                object=ObjectRef(
+                    digest=blob_a.digest,
+                    byte_count=blob_a.byte_count,
+                    namespace="a",
+                ),
+            )
+        )
+        self.assertNotEqual(art_c.id, art_a.id)
 
 
 if __name__ == "__main__":

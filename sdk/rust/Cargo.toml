@@ -1,12 +1,11 @@
 [package]
 name = "srcport-substrate"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.74"
-license = "LicenseRef-srcport-all-rights-reserved"
-description = "In-process Rust SDK for the srcport-substrate microkernel: eight primitives and one Kernel ABI, conformant to SPEC.md (v0.1)."
+license = "MIT OR Apache-2.0"
+description = "In-process Rust SDK for the srcport-substrate microkernel: seven primitives and one KernelApi, conformant to SPEC.md (v1.0)."
 repository = "https://github.com/philcantcode/srcport-substrate"
-publish = false
 
 # The generated protobuf types ARE the contract. `build.rs` compiles
 # ../../contracts/proto/.../substrate.proto with protox (pure Rust — no protoc

@@ -9,7 +9,7 @@ the core.
 
 Note the generated ergonomics: construct with keyword args
 (``Artifact(type="…", body=b"…")``); enum values are fully qualified
-(``Decision.DECISION_APPROVED``, ``Lifecycle.LIFECYCLE_REGISTERED``).
+(``Lifecycle.LIFECYCLE_REGISTERED``, ``RunState.RUN_STATE_RUNNING``).
 """
 
 from __future__ import annotations
@@ -23,30 +23,37 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     Assembly,
     AssemblyNode,
     Binding,
+    BlobData,
+    BlobRef,
     Capability,
     ClaimRequest,
     Contract,
-    Decision,
     Derivation,
     DerivationList,
+    Error,
+    ErrorCode,
     Event,
-    GateDecision,
-    GateRequest,
-    GateTicket,
+    GetBlobRequest,
+    HasBlobRequest,
+    HasBlobResponse,
     LedgerEntry,
     Lifecycle,
     Limits,
     ModuleManifest,
     NamedArtifact,
     NodeOutput,
+    ObjectRef,
     Port,
     PublishAck,
+    PutBlobRequest,
     RegisterAck,
     RegistrySnapshot,
+    RequestContext,
     Run,
     RunRef,
     RunRequest,
     RunState,
+    SnapshotRequest,
     Subscription,
     WorkItem,
 )
@@ -55,18 +62,106 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
 
 _SEP = b"\x00"
 
+# Advisory ceiling for Artifact.body. Larger payloads should put_blob and place
+# a verified ObjectRef. The kernel does not hard-reject oversized inline bodies.
+MAX_INLINE_ARTIFACT_BYTES = 1 << 20  # 1 MiB
 
-def artifact_id(type: str, body: bytes) -> str:
-    """The content address: ``"sha256:" + hex(sha256(type + 0x00 + body))``.
 
-    Same ``(type, body)`` yields the same id; a one-byte change yields a new
-    id. ``meta`` and ``produced_by`` are deliberately NOT part of the address.
+def blob_id(data: bytes) -> str:
+    """Pure blob identity: ``"sha256:" + hex(sha256(data))``."""
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def object_ref_bytes(obj: ObjectRef) -> bytes:
+    """Address payload for an external Artifact value.
+
+    ``digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace``
+    """
+    return (
+        obj.digest.encode("utf-8")
+        + _SEP
+        + int(obj.byte_count).to_bytes(8, "big")
+        + _SEP
+        + obj.namespace.encode("utf-8")
+    )
+
+
+def has_external_object(artifact: Artifact) -> bool:
+    """Whether *artifact* holds a verified external ObjectRef."""
+    return bool(artifact.object and artifact.object.digest)
+
+
+def artifact_content(artifact: Artifact) -> bytes:
+    """Bytes folded into the Artifact address: body or object_ref_bytes."""
+    if has_external_object(artifact):
+        return object_ref_bytes(artifact.object)
+    return bytes(artifact.body)
+
+
+def artifact_id(type: str, content: bytes) -> str:
+    """Content address: ``"sha256:" + hex(sha256(type + 0x00 + content))``.
+
+    For inline values pass body; for external values pass ``object_ref_bytes``.
+    Prefer :func:`artifact_id_of` when you have a full Artifact. ``meta`` and
+    ``produced_by`` are deliberately NOT part of the address.
     """
     h = hashlib.sha256()
     h.update(type.encode("utf-8"))
     h.update(_SEP)
-    h.update(body)
+    h.update(content)
     return "sha256:" + h.hexdigest()
+
+
+def artifact_id_of(artifact: Artifact) -> str:
+    """Typed value address for a full Artifact (inline or external)."""
+    return artifact_id(artifact.type, artifact_content(artifact))
+
+
+def contract_digest(
+    media_type: str,
+    schema: str,
+    version: str,
+    compatible_with: list[str] | None = None,
+) -> str:
+    """Contract content address.
+
+    ``digest = "sha256:" + hex(sha256(
+      media_type ‖ 0x00 ‖ schema ‖ 0x00 ‖ version ‖ 0x00 ‖
+      compatible_with… (UTF-8 ascending; each entry followed by 0x00)
+    ))``
+
+    ``ref`` is the registry key and is NOT folded into the digest. Pass
+    ``compatible_with`` already sorted, or use :func:`contract_digest_of`.
+    """
+    h = hashlib.sha256()
+    h.update(media_type.encode("utf-8"))
+    h.update(_SEP)
+    h.update(schema.encode("utf-8"))
+    h.update(_SEP)
+    h.update(version.encode("utf-8"))
+    h.update(_SEP)
+    for c in compatible_with or []:
+        h.update(c.encode("utf-8"))
+        h.update(_SEP)
+    return "sha256:" + h.hexdigest()
+
+
+def contract_digest_of(contract: Contract) -> str:
+    """Compute the content digest, sorting ``compatible_with`` first."""
+    compat = sorted(contract.compatible_with)
+    return contract_digest(
+        contract.media_type, contract.schema, contract.version, compat
+    )
+
+
+def is_contract_placeholder(contract: Contract) -> bool:
+    """True for a name-only stub (empty content fields)."""
+    return (
+        not contract.media_type
+        and not contract.schema
+        and not contract.version
+        and len(contract.compatible_with) == 0
+    )
 
 
 def _ledger_hash(

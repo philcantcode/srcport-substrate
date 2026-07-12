@@ -3,28 +3,27 @@
 //! it pins down. If you widen the contract, add tests here — never weaken these.
 
 use std::collections::BTreeMap;
-use std::thread;
 
 use srcport_substrate::*;
 
 // 1. ADDRESSING — same (type, body) ⇒ same id; a one-byte change ⇒ a new id.
 #[test]
 fn addressing_is_content_derived_and_metamorphic() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
 
     let a = k.put_artifact(Artifact {
         r#type: "acme.recon.v1.Host".into(),
         body: b"10.0.0.1".to_vec(),
         produced_by: "recon".into(),
         ..Default::default()
-    });
+    }).unwrap();
     // Identical content, different producer/meta — must land the SAME address.
     let b = k.put_artifact(Artifact {
         r#type: "acme.recon.v1.Host".into(),
         body: b"10.0.0.1".to_vec(),
         produced_by: "someone-else".into(),
         ..Default::default()
-    });
+    }).unwrap();
     assert_eq!(a.id, b.id, "same (type, body) must yield the same id");
     assert!(a.id.starts_with("sha256:"));
 
@@ -33,7 +32,7 @@ fn addressing_is_content_derived_and_metamorphic() {
         r#type: "acme.recon.v1.Host".into(),
         body: b"10.0.0.2".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
     assert_ne!(a.id, c.id, "a one-byte change must change the address");
 
     // Type participates in the address too.
@@ -41,7 +40,7 @@ fn addressing_is_content_derived_and_metamorphic() {
         r#type: "acme.recon.v1.Port".into(),
         body: b"10.0.0.1".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
     assert_ne!(a.id, d.id, "type must participate in the address");
 
     // Pure function agrees with the kernel.
@@ -51,7 +50,7 @@ fn addressing_is_content_derived_and_metamorphic() {
 // 2. IMMUTABILITY — reads back byte-identical; a later put never mutates it.
 #[test]
 fn artifacts_are_immutable() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
 
     let mut meta = BTreeMap::new();
     meta.insert("first".into(), "true".into());
@@ -60,7 +59,7 @@ fn artifacts_are_immutable() {
         body: b"payload".to_vec(),
         meta,
         ..Default::default()
-    });
+    }).unwrap();
 
     let got = k.get_artifact(&r).unwrap();
     assert_eq!(got.body, b"payload", "reads back byte-identical");
@@ -76,7 +75,7 @@ fn artifacts_are_immutable() {
         body: b"payload".to_vec(),
         meta: meta2,
         ..Default::default()
-    });
+    }).unwrap();
     assert_eq!(r2.id, r.id, "same content ⇒ same id");
 
     let after = k.get_artifact(&r).unwrap();
@@ -91,7 +90,7 @@ fn artifacts_are_immutable() {
 //    order, and never reach non-subscribers.
 #[test]
 fn events_are_ordered_and_isolated() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
 
     let hosts = k.subscribe(Subscription {
         module: "a".into(),
@@ -147,7 +146,7 @@ fn events_are_ordered_and_isolated() {
 // 4. LEDGER INTEGRITY — the chain verifies; tampering breaks verification.
 #[test]
 fn ledger_is_tamper_evident() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "m".into(),
         version: "0.1.0".into(),
@@ -157,7 +156,7 @@ fn ledger_is_tamper_evident() {
         r#type: "t".into(),
         body: b"x".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
     k.append(AppendRequest {
         kind: "domain.fact".into(),
         subject: "s".into(),
@@ -183,160 +182,13 @@ fn ledger_is_tamper_evident() {
     );
 }
 
-// 5. GATE NON-BYPASS — blocked while PENDING/REJECTED; permitted only APPROVED.
-#[test]
-fn gates_are_non_bypassable() {
-    let k = Kernel::new();
-
-    // PENDING blocks.
-    let t = k.request_gate(GateRequest {
-        action: "delete production".into(),
-        requested_by: "danger-module".into(),
-        ..Default::default()
-    });
-    assert_eq!(
-        k.ensure_approved(&t),
-        Err(KernelError::GateBlocked(Decision::Pending)),
-        "an irreversible act is blocked while PENDING"
-    );
-
-    // REJECTED still blocks.
-    k.decide_gate(GateDecision {
-        request_id: t.request_id.clone(),
-        decision: Decision::Rejected as i32,
-        decided_by: "phil".into(),
-        reason: "no".into(),
-    })
-    .unwrap();
-    assert_eq!(
-        k.ensure_approved(&t),
-        Err(KernelError::GateBlocked(Decision::Rejected)),
-        "REJECTED blocks too"
-    );
-
-    // A fresh gate, APPROVED, permits — and only then.
-    let t2 = k.request_gate(GateRequest {
-        action: "delete production".into(),
-        ..Default::default()
-    });
-    assert!(k.ensure_approved(&t2).is_err());
-    k.decide_gate(GateDecision {
-        request_id: t2.request_id.clone(),
-        decision: Decision::Approved as i32,
-        decided_by: "phil".into(),
-        ..Default::default()
-    })
-    .unwrap();
-    assert!(k.ensure_approved(&t2).is_ok(), "APPROVED permits the act");
-
-    // A non-decision (PENDING/UNSPECIFIED) is rejected at the ABI.
-    assert_eq!(
-        k.decide_gate(GateDecision {
-            request_id: t2.request_id.clone(),
-            decision: Decision::Pending as i32,
-            ..Default::default()
-        }),
-        Err(KernelError::NotADecision)
-    );
-}
-
-// 5b. AwaitGate really blocks until a human decides (exercises the condvar).
-#[test]
-fn await_gate_blocks_until_decided() {
-    use std::sync::Arc;
-    let k = Arc::new(Kernel::new());
-    let t = k.request_gate(GateRequest {
-        action: "irreversible".into(),
-        ..Default::default()
-    });
-
-    let k2 = Arc::clone(&k);
-    let id = t.request_id.clone();
-    let decider = thread::spawn(move || {
-        // Decide from another thread; the waiter must wake.
-        k2.decide_gate(GateDecision {
-            request_id: id,
-            decision: Decision::Approved as i32,
-            decided_by: "phil".into(),
-            ..Default::default()
-        })
-        .unwrap();
-    });
-
-    let decision = k.await_gate(&t).unwrap();
-    assert_eq!(decision.decision(), Decision::Approved);
-    decider.join().unwrap();
-}
-
-// 7. LEDGER RECONSTRUCTION & CANONICAL DETAIL — a gate's request and decision
-//    round-trip from the tamper-evident chain alone (`detail` carries the
-//    canonical message), and forging the recorded decision breaks verification.
-#[test]
-fn gate_request_and_decision_are_in_the_chain() {
-    let k = Kernel::new();
-
-    let t = k.request_gate(GateRequest {
-        action: "delete production".into(),
-        context: b"rows=42".to_vec(),
-        requested_by: "danger-module".into(),
-        ..Default::default()
-    });
-    k.decide_gate(GateDecision {
-        request_id: t.request_id.clone(),
-        decision: Decision::Approved as i32,
-        decided_by: "phil".into(),
-        reason: "reviewed the evidence".into(),
-    })
-    .unwrap();
-
-    let chain = k.ledger();
-
-    // The request reconstructs from the chain: action, requester, and evidence.
-    let req_entry = chain.iter().find(|e| e.kind == "gate.requested").unwrap();
-    let req = GateRequest::decode(&req_entry.detail[..]).unwrap();
-    assert_eq!(req.action, "delete production");
-    assert_eq!(req.requested_by, "danger-module");
-    assert_eq!(req.context, b"rows=42");
-
-    // The decision reconstructs too: who decided, what, and why.
-    let dec_entry = chain.iter().find(|e| e.kind == "gate.decided").unwrap();
-    let dec = GateDecision::decode(&dec_entry.detail[..]).unwrap();
-    assert_eq!(dec.decision(), Decision::Approved);
-    assert_eq!(dec.decided_by, "phil");
-    assert_eq!(dec.reason, "reviewed the evidence");
-
-    assert!(
-        k.verify_ledger(),
-        "the chain with fat detail still verifies"
-    );
-
-    // The approval record is now hash-committed: forging who approved it (by
-    // re-encoding a different decider into `detail`) breaks verification.
-    let mut forged = chain.clone();
-    let idx = forged
-        .iter()
-        .position(|e| e.kind == "gate.decided")
-        .unwrap();
-    forged[idx].detail = GateDecision {
-        request_id: t.request_id.clone(),
-        decision: Decision::Approved as i32,
-        decided_by: "attacker".into(),
-        reason: "reviewed the evidence".into(),
-    }
-    .encode_to_vec();
-    assert!(
-        !verify_chain(&forged),
-        "rewriting the recorded decision must break the chain"
-    );
-}
-
 // 7b. Fat detail for artifact.put and module.registered — both reconstruct from
 //     the chain (including the artifact's `derived_from` lineage), and the body
 //     is cleared (already addressed by the id in `subject`, so the log never
 //     duplicates blob content).
 #[test]
 fn artifact_and_module_reconstruct_from_the_chain() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
 
     let mut meta = BTreeMap::new();
     meta.insert("region".into(), "eu".into());
@@ -348,7 +200,7 @@ fn artifact_and_module_reconstruct_from_the_chain() {
         produced_by: "recon".into(),
         derived_from: vec!["sha256:parent-a".into(), "sha256:parent-b".into()],
         ..Default::default()
-    });
+    }).unwrap();
 
     k.register(ModuleManifest {
         name: "recon".into(),
@@ -425,12 +277,12 @@ fn map_detail_encodes_canonically() {
 //    an identity-preserving change must NOT change the address (metamorphic).
 #[test]
 fn address_ignores_non_identity_fields() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     let base = k.put_artifact(Artifact {
         r#type: "acme.recon.v1.Host".into(),
         body: b"10.0.0.1".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
 
     let mut meta = BTreeMap::new();
     meta.insert("x".into(), "y".into());
@@ -441,7 +293,7 @@ fn address_ignores_non_identity_fields() {
         produced_by: "whoever".into(),
         derived_from: vec!["sha256:some-parent".into()],
         ..Default::default()
-    });
+    }).unwrap();
 
     assert_eq!(
         enriched.id, base.id,
@@ -457,9 +309,9 @@ fn address_ignores_non_identity_fields() {
 // all three suites in lockstep — never one SDK alone.
 #[test]
 fn ledger_hash_known_answer_cross_sdk() {
-    const WANT: &str = "985f4980bda5266d03b3e7092ef2bd9eb49b12107b43f17bbe00415deca4ab6a";
+    const WANT: &str = "287449b9f8f2f7462177b01d55b32cc6b65580fefa22172e8ecfaa96bdbf60a1";
 
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "recon".into(),
         version: "0.1.0".into(),
@@ -480,21 +332,7 @@ fn ledger_hash_known_answer_cross_sdk() {
         produced_by: "recon".into(),
         derived_from: vec!["sha256:parent-a".into(), "sha256:parent-b".into()],
         ..Default::default()
-    });
-    let t = k.request_gate(GateRequest {
-        action: "delete production".into(),
-        context: b"rows=42".to_vec(),
-        requested_by: "danger".into(),
-        ..Default::default()
-    });
-    k.decide_gate(GateDecision {
-        request_id: t.request_id,
-        decision: Decision::Approved as i32,
-        decided_by: "phil".into(),
-        reason: "reviewed".into(),
-    })
-    .unwrap();
-
+    }).unwrap();
     let chain = k.ledger();
     assert!(k.verify_ledger(), "the chain must verify");
     assert_eq!(
@@ -507,7 +345,7 @@ fn ledger_hash_known_answer_cross_sdk() {
 // 6. DISCOVERY — the registry reports every module, capability, and contract.
 #[test]
 fn registry_reports_everything() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "recon".into(),
         version: "0.1.0".into(),
@@ -542,12 +380,115 @@ fn registry_reports_everything() {
     assert!(contracts.contains(&"acme.report.v1.Report"));
 }
 
+// 6b. CONTRACT IDENTITY — content-addressed under ref; immutable; conflict on
+// redefinition; placeholder fill-once; ports bind to the pinned identity.
+#[test]
+fn contracts_are_immutable_and_identifiable() {
+    let k = MemoryKernel::new();
+
+    let stored = k
+        .put_contract(Contract {
+            r#ref: "acme.Host".into(),
+            media_type: "application/schema+json".into(),
+            schema: r#"{"type":"object"}"#.into(),
+            version: "1.0.0".into(),
+            compatible_with: vec!["acme.Host.v0".into(), "acme.legacy.Host".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let want = contract_digest(
+        "application/schema+json",
+        r#"{"type":"object"}"#,
+        "1.0.0",
+        &["acme.Host.v0".into(), "acme.legacy.Host".into()],
+    );
+    assert_eq!(stored.digest, want);
+    assert_eq!(
+        stored.compatible_with,
+        vec!["acme.Host.v0".to_string(), "acme.legacy.Host".to_string()]
+    );
+
+    // Identical re-put (unsorted compatible_with) is idempotent.
+    let again = k
+        .put_contract(Contract {
+            r#ref: "acme.Host".into(),
+            media_type: "application/schema+json".into(),
+            schema: r#"{"type":"object"}"#.into(),
+            version: "1.0.0".into(),
+            compatible_with: vec!["acme.legacy.Host".into(), "acme.Host.v0".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(again.digest, stored.digest);
+
+    // Different content under the same ref is CONFLICT.
+    let conflict = k.put_contract(Contract {
+        r#ref: "acme.Host".into(),
+        media_type: "application/schema+json".into(),
+        schema: r#"{"type":"string"}"#.into(),
+        version: "1.0.0".into(),
+        ..Default::default()
+    });
+    assert!(matches!(conflict, Err(KernelError::Conflict(_))));
+
+    // Register creates a name-only placeholder; PutContract may fill it once.
+    k.register(ModuleManifest {
+        name: "mod".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "do".into(),
+            contract: "acme.NewThing".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let filled = k
+        .put_contract(Contract {
+            r#ref: "acme.NewThing".into(),
+            media_type: "text/x-protobuf".into(),
+            schema: "message NewThing {}".into(),
+            version: "1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!is_contract_placeholder(&filled));
+    assert!(!filled.digest.is_empty());
+
+    let refill = k.put_contract(Contract {
+        r#ref: "acme.NewThing".into(),
+        media_type: "text/x-protobuf".into(),
+        schema: "message Other {}".into(),
+        version: "1".into(),
+        ..Default::default()
+    });
+    assert!(matches!(refill, Err(KernelError::Conflict(_))));
+
+    // Mismatched caller-supplied digest is INVALID.
+    let bad = k.put_contract(Contract {
+        r#ref: "acme.Other".into(),
+        schema: "x".into(),
+        digest: "sha256:deadbeef".into(),
+        ..Default::default()
+    });
+    assert!(matches!(bad, Err(KernelError::Invalid(_))));
+
+    // contract.registered lands in the ledger with reconstructable detail.
+    let chain = k.ledger();
+    let entry = chain
+        .iter()
+        .find(|e| e.kind == "contract.registered" && e.subject == "acme.Host")
+        .expect("contract.registered must appear in the ledger");
+    let c = Contract::decode(entry.detail.as_slice()).unwrap();
+    assert_eq!(c.r#ref, "acme.Host");
+    assert_eq!(c.digest, want);
+}
+
 // 9. CONVERGENCE — typed artifacts flow through a pinned finite assembly;
 // fan-in waits for all inputs, the terminal artifact closes the run, and a
 // closed run cannot be reopened.
 #[test]
 fn run_feeds_forward_and_closes_on_its_terminal_answer() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "extractor".into(),
         version: "1.0.0".into(),
@@ -597,7 +538,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
         r#type: "demo.Question".into(),
         body: b"What follows?".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
     let assembly = Assembly {
         id: "answer-pipeline@1".into(),
         nodes: vec![
@@ -672,7 +613,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
         r#type: "demo.Facts".into(),
         body: b"typed flow".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
     let progressed = k
         .commit(Derivation {
             run_id: "run-1".into(),
@@ -698,7 +639,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
         r#type: "demo.Answer".into(),
         body: b"Modules converge.".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
     let completed = k
         .commit(Derivation {
             run_id: "run-1".into(),
@@ -731,7 +672,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
 
 #[test]
 fn cyclic_assembly_is_rejected_before_it_can_expand_forever() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "loop".into(),
         version: "1.0.0".into(),
@@ -798,7 +739,7 @@ fn cyclic_assembly_is_rejected_before_it_can_expand_forever() {
 
 #[test]
 fn run_stalls_when_no_remaining_node_can_become_ready() {
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "source".into(),
         version: "1".into(),
@@ -888,7 +829,7 @@ fn convergent_run_hashes_match_every_sdk() {
     const DERIVATION: &str =
         "sha256:0e3e167112e6bb8f19d736de4592b72a2856cb494cc4dcb00fbcd5682d595cf6";
     const LEDGER: &str = "faad7e3ce2d2e030cf37ff6001fe18f7dec0430ce14642f9ae878d66875bc28f";
-    let k = Kernel::new();
+    let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "answerer".into(),
         version: "1.0.0".into(),
@@ -932,7 +873,7 @@ fn convergent_run_hashes_match_every_sdk() {
         r#type: "demo.Answer".into(),
         body: b"yes".to_vec(),
         ..Default::default()
-    });
+    }).unwrap();
     k.commit(Derivation {
         run_id: "parity".into(),
         work_id: work.id,
@@ -946,4 +887,235 @@ fn convergent_run_hashes_match_every_sdk() {
     .unwrap();
     assert_eq!(k.derivations()[0].id, DERIVATION);
     assert_eq!(k.ledger().last().unwrap().hash, LEDGER);
+}
+
+// 12. PRODUCTION ARTIFACT BOUNDARY — inline small; external verified ObjectRef.
+#[test]
+fn blob_store_is_content_addressed_and_immutable() {
+    let k = MemoryKernel::new();
+    let data = b"pcap-or-apk-bytes-go-here".to_vec();
+
+    let a = k.put_blob(PutBlobRequest {
+        namespace: "evidence".into(),
+        data: data.clone(),
+    });
+    assert_eq!(a.digest, blob_id(&data));
+    assert_eq!(a.byte_count, data.len() as u64);
+    assert_eq!(a.namespace, "evidence");
+
+    let b = k.put_blob(PutBlobRequest {
+        namespace: "evidence".into(),
+        data: data.clone(),
+    });
+    assert_eq!(a.digest, b.digest);
+
+    let got = k
+        .get_blob(GetBlobRequest {
+            digest: a.digest.clone(),
+            namespace: "evidence".into(),
+        })
+        .unwrap();
+    assert_eq!(got.data, data);
+
+    let has = k.has_blob(HasBlobRequest {
+        digest: a.digest.clone(),
+        namespace: "evidence".into(),
+    });
+    assert!(has.exists);
+    assert_eq!(has.byte_count, data.len() as u64);
+    assert!(!k
+        .has_blob(HasBlobRequest {
+            digest: a.digest.clone(),
+            namespace: "other".into(),
+        })
+        .exists);
+
+    let entry = k.ledger().into_iter().find(|e| e.kind == "blob.put").unwrap();
+    assert_eq!(entry.subject, a.digest);
+    let ref_msg = BlobRef::decode(entry.detail.as_slice()).unwrap();
+    assert_eq!(ref_msg.digest, a.digest);
+    assert_eq!(ref_msg.namespace, "evidence");
+}
+
+#[test]
+fn external_artifact_refs_large_data_without_inlining() {
+    let k = MemoryKernel::new();
+    let payload = b"EVIDENCE-BUNDLE-".repeat(64 * 1024);
+
+    let blob = k.put_blob(PutBlobRequest {
+        namespace: "observer".into(),
+        data: payload.clone(),
+    });
+    let r#ref = k
+        .put_artifact(Artifact {
+            r#type: "observer.v1.Capture".into(),
+            produced_by: "observer".into(),
+            object: Some(ObjectRef {
+                digest: blob.digest.clone(),
+                byte_count: blob.byte_count,
+                namespace: blob.namespace.clone(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let want = artifact_id(
+        "observer.v1.Capture",
+        &object_ref_bytes(&ObjectRef {
+            digest: blob.digest.clone(),
+            byte_count: blob.byte_count,
+            namespace: blob.namespace.clone(),
+        }),
+    );
+    assert_eq!(r#ref.id, want);
+    assert_ne!(r#ref.id, blob_id(&payload));
+
+    let got = k.get_artifact(&r#ref).unwrap();
+    assert!(got.body.is_empty());
+    let obj = got.object.as_ref().unwrap();
+    assert_eq!(obj.digest, blob.digest);
+    assert_eq!(obj.byte_count, blob.byte_count);
+
+    let ref2 = k
+        .put_artifact(Artifact {
+            r#type: "observer.v1.Capture".into(),
+            object: Some(ObjectRef {
+                digest: blob.digest.clone(),
+                byte_count: blob.byte_count,
+                namespace: blob.namespace.clone(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ref2.id, r#ref.id);
+
+    let (ref3, blob3) = k
+        .put_artifact_with_blob("observer.v1.Capture", "observer", &payload, "observer")
+        .unwrap();
+    assert_eq!(ref3.id, r#ref.id);
+    assert_eq!(blob3.digest, blob.digest);
+
+    let data = k
+        .get_blob(GetBlobRequest {
+            digest: obj.digest.clone(),
+            namespace: obj.namespace.clone(),
+        })
+        .unwrap();
+    assert_eq!(data.data, payload);
+
+    let entry = k
+        .ledger()
+        .into_iter()
+        .find(|e| e.kind == "artifact.put")
+        .unwrap();
+    let a = Artifact::decode(entry.detail.as_slice()).unwrap();
+    assert!(a.body.is_empty());
+    assert_eq!(a.object.as_ref().unwrap().digest, blob.digest);
+}
+
+#[test]
+fn external_artifact_rejects_missing_or_mismatched_blob() {
+    let k = MemoryKernel::new();
+    let data = b"small-but-external".to_vec();
+    let blob = k.put_blob(PutBlobRequest {
+        namespace: "ns".into(),
+        data: data.clone(),
+    });
+
+    let missing = k.put_artifact(Artifact {
+        r#type: "t".into(),
+        object: Some(ObjectRef {
+            digest: blob_id(b"nope"),
+            byte_count: 4,
+            namespace: "ns".into(),
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(missing, Err(KernelError::NotFound(_))));
+
+    let bad_size = k.put_artifact(Artifact {
+        r#type: "t".into(),
+        object: Some(ObjectRef {
+            digest: blob.digest.clone(),
+            byte_count: blob.byte_count + 1,
+            namespace: "ns".into(),
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(bad_size, Err(KernelError::BlobIntegrity(_))));
+
+    let both = k.put_artifact(Artifact {
+        r#type: "t".into(),
+        body: b"x".to_vec(),
+        object: Some(ObjectRef {
+            digest: blob.digest.clone(),
+            byte_count: blob.byte_count,
+            namespace: "ns".into(),
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(both, Err(KernelError::Invalid(_))));
+
+    let wrong_ns = k.put_artifact(Artifact {
+        r#type: "t".into(),
+        object: Some(ObjectRef {
+            digest: blob.digest,
+            byte_count: blob.byte_count,
+            namespace: "other".into(),
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(wrong_ns, Err(KernelError::NotFound(_))));
+}
+
+#[test]
+fn value_identity_independent_of_blob_identity() {
+    let k = MemoryKernel::new();
+    let data = b"shared-raw-bytes".to_vec();
+    let blob_a = k.put_blob(PutBlobRequest {
+        namespace: "a".into(),
+        data: data.clone(),
+    });
+    let blob_b = k.put_blob(PutBlobRequest {
+        namespace: "b".into(),
+        data: data.clone(),
+    });
+    assert_eq!(blob_a.digest, blob_b.digest);
+
+    let art_a = k
+        .put_artifact(Artifact {
+            r#type: "t".into(),
+            object: Some(ObjectRef {
+                digest: blob_a.digest.clone(),
+                byte_count: blob_a.byte_count,
+                namespace: "a".into(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let art_b = k
+        .put_artifact(Artifact {
+            r#type: "t".into(),
+            object: Some(ObjectRef {
+                digest: blob_b.digest.clone(),
+                byte_count: blob_b.byte_count,
+                namespace: "b".into(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_ne!(art_a.id, art_b.id);
+
+    let art_c = k
+        .put_artifact(Artifact {
+            r#type: "other".into(),
+            object: Some(ObjectRef {
+                digest: blob_a.digest,
+                byte_count: blob_a.byte_count,
+                namespace: "a".into(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_ne!(art_c.id, art_a.id);
 }

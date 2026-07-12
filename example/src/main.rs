@@ -49,23 +49,38 @@ fn rule(title: &str) {
 }
 
 fn main() {
-    let k = Kernel::new();
+    // MemoryKernel is one in-process implementation of KernelApi — durability
+    // lives in Modules (or other backends), not the core.
+    let k = MemoryKernel::new();
+
+    // RequestContext rides as call metadata (not ledger detail). Demonstrate
+    // the ABI surface once; remaining calls use the ctx-free inherent methods
+    // so call sites stay zero-churn.
+    let ctx = RequestContext {
+        caller: "flow-example".into(),
+        correlation_id: "demo-flow".into(),
+        ..Default::default()
+    };
 
     // ── 1. THE DOMAIN — three modules, typed ports, coupled only by contract ─
     rule("1. register the domain (Modules + typed Capability ports)");
 
-    // extractor:  question ─▶ facts
-    k.register(ModuleManifest {
-        name: "extractor".into(),
-        version: "1.0.0".into(),
-        provides: vec![Capability {
-            name: "facts.extract".into(),
-            contract: "demo.v1.Extract".into(),
-            inputs: vec![port("question", "demo.v1.Question")],
-            outputs: vec![port("facts", "demo.v1.Facts")],
-        }],
-        ..Default::default()
-    });
+    // extractor:  question ─▶ facts  (via KernelApi — shows RequestContext)
+    KernelApi::register(
+        &k,
+        ModuleManifest {
+            name: "extractor".into(),
+            version: "1.0.0".into(),
+            provides: vec![Capability {
+                name: "facts.extract".into(),
+                contract: "demo.v1.Extract".into(),
+                inputs: vec![port("question", "demo.v1.Question")],
+                outputs: vec![port("facts", "demo.v1.Facts")],
+            }],
+            ..Default::default()
+        },
+        &ctx,
+    );
     // retriever:  question ─▶ sources
     k.register(ModuleManifest {
         name: "retriever".into(),
@@ -130,7 +145,7 @@ fn main() {
         body: b"What makes this substrate reusable?".to_vec(),
         produced_by: "operator".into(),
         ..Default::default()
-    });
+    }).unwrap();
     println!("  {DIM}input{RESET} question = {MAGENTA}{}{RESET}  {DIM}\"What makes this substrate reusable?\"{RESET}", short(&question.id));
 
     k.start_run(RunRequest {
@@ -153,7 +168,7 @@ fn main() {
     assert!(blocked.id.is_empty(), "writer must be blocked on its unmet inputs");
     println!("  {YELLOW}⏳ writer is NOT ready{RESET} {DIM}— fan-in still waiting on facts + sources{RESET}");
 
-    run_node(&k, "extractor", "facts", "demo.v1.Facts", b"substrate is frozen once, reused forever");
+    run_node(&k, "extractor", "facts", "demo.v1.Facts", b"one canonical contract, many conforming implementations");
     run_node(&k, "retriever", "sources", "demo.v1.Sources", b"SPEC.md#the-eight-primitives");
 
     // Now all three of the writer's inputs exist; it becomes claimable and closes the run.
@@ -166,11 +181,11 @@ fn main() {
     );
     let answer = k.put_artifact(Artifact {
         r#type: "demo.v1.Answer".into(),
-        body: b"One frozen core; every project is just Modules on top.".to_vec(),
+        body: b"One versioned contract; every project is just Modules on top.".to_vec(),
         produced_by: "writer".into(),
         derived_from: write.inputs.iter().filter_map(|i| i.artifact.as_ref().map(|a| a.id.clone())).collect(),
         ..Default::default()
-    });
+    }).unwrap();
     let run = k
         .commit(Derivation {
             run_id: "run-1".into(),
@@ -214,7 +229,7 @@ fn main() {
 }
 
 /// Claim → produce → commit one single-output node, narrating the flow.
-fn run_node(k: &Kernel, module: &str, out_port: &str, contract: &str, body: &[u8]) {
+fn run_node(k: &MemoryKernel, module: &str, out_port: &str, contract: &str, body: &[u8]) {
     let work = k
         .claim_ready(ClaimRequest { run_id: "run-1".into(), module: module.into() })
         .unwrap();
@@ -226,7 +241,7 @@ fn run_node(k: &Kernel, module: &str, out_port: &str, contract: &str, body: &[u8
         produced_by: module.into(),
         derived_from: work.inputs.iter().filter_map(|i| i.artifact.as_ref().map(|a| a.id.clone())).collect(),
         ..Default::default()
-    });
+    }).unwrap();
     k.commit(Derivation {
         run_id: "run-1".into(),
         work_id: work.id,
