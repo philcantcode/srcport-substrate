@@ -545,6 +545,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
                 contract: "demo.Facts".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         }],
         ..Default::default()
     });
@@ -570,6 +571,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
                 contract: "demo.Answer".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         }],
         ..Default::default()
     });
@@ -728,6 +730,7 @@ fn cyclic_assembly_is_rejected_before_it_can_expand_forever() {
                 contract: "demo.Value".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         }],
         ..Default::default()
     });
@@ -808,6 +811,7 @@ fn run_stalls_when_no_remaining_node_can_become_ready() {
                 contract: "demo.Answer".into(),
                 ..Default::default()
             }],
+            ..Default::default()
         }],
         ..Default::default()
     });
@@ -924,6 +928,294 @@ fn convergent_run_hashes_match_every_sdk() {
     .unwrap();
     assert_eq!(k.derivations()[0].id, DERIVATION);
     assert_eq!(k.ledger().last().unwrap().hash, LEDGER);
+}
+
+// 12b. WORK-UNIT FIRING — module ONCE_PER_KEY + inject ALWAYS; include_nodes.
+#[test]
+fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
+    let k = MemoryKernel::new();
+    k.register(ModuleManifest {
+        name: "scanner".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "scan.host".into(),
+            firing: Firing::OncePerKey as i32,
+            inputs: vec![Port {
+                name: "host".into(),
+                contract: "demo.Host".into(),
+                key: true,
+                ..Default::default()
+            }],
+            outputs: vec![Port {
+                name: "report".into(),
+                contract: "demo.Report".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.register(ModuleManifest {
+        name: "extra".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "extra.noop".into(),
+            inputs: vec![Port {
+                name: "host".into(),
+                contract: "demo.Host".into(),
+                ..Default::default()
+            }],
+            outputs: vec![Port {
+                name: "side".into(),
+                contract: "demo.Side".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let host_a = k
+        .put_artifact(Artifact {
+            r#type: "demo.Host".into(),
+            body: b"10.0.0.1".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+    let host_b = k
+        .put_artifact(Artifact {
+            r#type: "demo.Host".into(),
+            body: b"10.0.0.2".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+    k.start_run(RunRequest {
+        id: "scan".into(),
+        assembly: Some(Assembly {
+            id: "scan@1".into(),
+            nodes: vec![
+                AssemblyNode {
+                    id: "scan".into(),
+                    module: "scanner".into(),
+                    module_version: "1".into(),
+                    capability: "scan.host".into(),
+                },
+                AssemblyNode {
+                    id: "extra".into(),
+                    module: "extra".into(),
+                    module_version: "1".into(),
+                    capability: "extra.noop".into(),
+                },
+            ],
+            bindings: vec![
+                Binding {
+                    to_node: "scan".into(),
+                    to_port: "host".into(),
+                    input: "host".into(),
+                    ..Default::default()
+                },
+                Binding {
+                    to_node: "extra".into(),
+                    to_port: "host".into(),
+                    input: "host".into(),
+                    ..Default::default()
+                },
+            ],
+            terminal: Some(NodeOutput {
+                node: "scan".into(),
+                port: "report".into(),
+            }),
+            ..Default::default()
+        }),
+        include_nodes: vec!["scan".into()],
+        inputs: vec![NamedArtifact {
+            name: "host".into(),
+            artifact: Some(host_a.clone()),
+        }],
+        policy: Some(ExecutionPolicy {
+            closure: Closure::Open as i32,
+            ..Default::default()
+        }),
+        limits: Some(Limits { max_steps: 10 }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let work = k
+        .claim_ready(ClaimRequest {
+            run_id: "scan".into(),
+            module: "scanner".into(),
+        })
+        .unwrap();
+    assert!(!work.id.is_empty());
+    assert!(
+        k.claim_ready(ClaimRequest {
+            run_id: "scan".into(),
+            module: "extra".into(),
+        })
+        .unwrap()
+        .id
+        .is_empty(),
+        "include_nodes dropped extra"
+    );
+    let report = k
+        .put_artifact(Artifact {
+            r#type: "demo.Report".into(),
+            body: b"a".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+    let run = k
+        .commit(Derivation {
+            run_id: "scan".into(),
+            work_id: work.id,
+            node_id: work.node_id,
+            outputs: vec![NamedArtifact {
+                name: "report".into(),
+                artifact: Some(report),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(run.state(), RunState::Running, "OPEN stays running");
+
+    // Same host again → suppressed under ONCE_PER_KEY.
+    k.inject_input(InjectInputRequest {
+        run_id: "scan".into(),
+        input: Some(NamedArtifact {
+            name: "host".into(),
+            artifact: Some(host_a),
+        }),
+    })
+    .unwrap();
+    assert!(
+        k.claim_ready(ClaimRequest {
+            run_id: "scan".into(),
+            module: "scanner".into(),
+        })
+        .unwrap()
+        .id
+        .is_empty()
+    );
+
+    // New host → new work unit.
+    k.inject_input(InjectInputRequest {
+        run_id: "scan".into(),
+        input: Some(NamedArtifact {
+            name: "host".into(),
+            artifact: Some(host_b),
+        }),
+    })
+    .unwrap();
+    let work2 = k
+        .claim_ready(ClaimRequest {
+            run_id: "scan".into(),
+            module: "scanner".into(),
+        })
+        .unwrap();
+    assert!(!work2.id.is_empty());
+}
+
+#[test]
+fn always_refires_on_reinject_of_same_artifact() {
+    let k = MemoryKernel::new();
+    k.register(ModuleManifest {
+        name: "echo".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "echo.run".into(),
+            firing: Firing::Always as i32,
+            inputs: vec![Port {
+                name: "in".into(),
+                contract: "demo.In".into(),
+                ..Default::default()
+            }],
+            outputs: vec![Port {
+                name: "out".into(),
+                contract: "demo.Out".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let value = k
+        .put_artifact(Artifact {
+            r#type: "demo.In".into(),
+            body: b"same".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+    k.start_run(RunRequest {
+        id: "always".into(),
+        assembly: Some(Assembly {
+            id: "always@1".into(),
+            nodes: vec![AssemblyNode {
+                id: "echo".into(),
+                module: "echo".into(),
+                module_version: "1".into(),
+                capability: "echo.run".into(),
+            }],
+            bindings: vec![Binding {
+                to_node: "echo".into(),
+                to_port: "in".into(),
+                input: "in".into(),
+                ..Default::default()
+            }],
+            terminal: Some(NodeOutput {
+                node: "echo".into(),
+                port: "out".into(),
+            }),
+            ..Default::default()
+        }),
+        inputs: vec![NamedArtifact {
+            name: "in".into(),
+            artifact: Some(value.clone()),
+        }],
+        policy: Some(ExecutionPolicy {
+            closure: Closure::Open as i32,
+            ..Default::default()
+        }),
+        limits: Some(Limits { max_steps: 10 }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    for i in 0..2 {
+        let work = k
+            .claim_ready(ClaimRequest {
+                run_id: "always".into(),
+                module: "echo".into(),
+            })
+            .unwrap();
+        assert!(!work.id.is_empty(), "fire {i}");
+        let out = k
+            .put_artifact(Artifact {
+                r#type: "demo.Out".into(),
+                body: format!("out-{i}").into_bytes(),
+                ..Default::default()
+            })
+            .unwrap();
+        k.commit(Derivation {
+            run_id: "always".into(),
+            work_id: work.id,
+            node_id: work.node_id,
+            outputs: vec![NamedArtifact {
+                name: "out".into(),
+                artifact: Some(out),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        k.inject_input(InjectInputRequest {
+            run_id: "always".into(),
+            input: Some(NamedArtifact {
+                name: "in".into(),
+                artifact: Some(value.clone()),
+            }),
+        })
+        .unwrap();
+    }
+    assert_eq!(k.list_derivations(&RunRef { id: "always".into() }).unwrap().derivations.len(), 2);
 }
 
 // 12. PRODUCTION ARTIFACT BOUNDARY — inline small; external verified ObjectRef.

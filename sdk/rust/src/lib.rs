@@ -1,4 +1,4 @@
-//! # srcport-substrate — Rust SDK (v1.0.0, in-process)
+//! # srcport-substrate — Rust SDK (v1.1.0, in-process)
 //!
 //! One pluggable core: **seven primitives** (Module · Artifact · Contract ·
 //! Event · Ledger · Registry · Run) and **one ABI** (the [`KernelApi`] trait).
@@ -314,8 +314,16 @@ struct ModuleSlot {
 #[derive(Clone)]
 struct RunSlot {
     run: Run,
+    /// In-flight work, keyed by `WorkItem.id`.
     claimed: HashMap<String, WorkItem>,
-    committed: HashMap<String, Derivation>,
+    /// Latest committed derivation per assembly node (for downstream resolve).
+    latest: HashMap<String, Derivation>,
+    /// Work-unit keys already claimed or committed (at most once each).
+    done_units: HashSet<String>,
+    /// Delivery generation per named run input (bumped by InjectInput).
+    input_epochs: HashMap<String, u64>,
+    /// Commit count per node (source generation for ALWAYS fingerprints).
+    node_commits: HashMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -781,6 +789,7 @@ impl MemoryKernel {
             .assembly
             .clone()
             .ok_or_else(|| KernelError::Invalid("assembly is required".into()))?;
+        let assembly = materialize_assembly(&assembly, &req.include_nodes)?;
         validate_assembly(&state, &assembly, &req.inputs)?;
         let requested_max = req.limits.as_ref().map(|l| l.max_steps).unwrap_or(0);
         let max_steps = if requested_max == 0 {
@@ -791,6 +800,10 @@ impl MemoryKernel {
         if max_steps == 0 {
             return Err(KernelError::Invalid("max_steps must be positive".into()));
         }
+        let mut input_epochs = HashMap::new();
+        for input in &req.inputs {
+            input_epochs.insert(input.name.clone(), 0);
+        }
         let run = Run {
             id: req.id.clone(),
             assembly: Some(assembly),
@@ -800,13 +813,17 @@ impl MemoryKernel {
             steps: 0,
             max_steps,
             reason: String::new(),
+            policy: req.policy,
         };
         state.runs.insert(
             run.id.clone(),
             RunSlot {
                 run: run.clone(),
                 claimed: HashMap::new(),
-                committed: HashMap::new(),
+                latest: HashMap::new(),
+                done_units: HashSet::new(),
+                input_epochs,
+                node_commits: HashMap::new(),
             },
         );
         Self::append_locked(&mut state, "run.started", &run.id, run.encode_to_vec());
@@ -819,9 +836,72 @@ impl MemoryKernel {
         Ok(run)
     }
 
-    /// Atomically claim the first ready node for a module. An empty WorkItem
-    /// means that this module has no ready node. If the whole graph has neither
-    /// ready nor in-flight work, the run closes as STALLED.
+    /// Admit or replace a named run input while RUNNING. Bumps delivery
+    /// generation so `FIRING_ALWAYS` nodes can re-fire.
+    pub fn inject_input(&self, req: InjectInputRequest) -> Result<Run> {
+        self.inject_input_ctx(req, &RequestContext::default())
+    }
+
+    /// Like [`MemoryKernel::inject_input`], honouring deadline.
+    pub fn inject_input_ctx(&self, req: InjectInputRequest, ctx: &RequestContext) -> Result<Run> {
+        check_deadline(ctx)?;
+        let mut state = self.state.lock().unwrap();
+        let input = req
+            .input
+            .clone()
+            .ok_or_else(|| KernelError::Invalid("input is required".into()))?;
+        if input.name.is_empty() {
+            return Err(KernelError::Invalid("input name is required".into()));
+        }
+        let art_id = input
+            .artifact
+            .as_ref()
+            .ok_or_else(|| KernelError::Invalid(format!("input {} has no artifact", input.name)))?
+            .id
+            .clone();
+        if !state.artifacts.contains_key(&art_id) {
+            return Err(KernelError::NotFound(art_id));
+        }
+        let slot = state
+            .runs
+            .get_mut(&req.run_id)
+            .ok_or_else(|| KernelError::NotFound(req.run_id.clone()))?;
+        if slot.run.state() != RunState::Running {
+            return Err(KernelError::RunClosed(slot.run.state()));
+        }
+        let used = slot
+            .run
+            .assembly
+            .as_ref()
+            .map(|a| a.bindings.iter().any(|b| b.input == input.name))
+            .unwrap_or(false);
+        if !used {
+            return Err(KernelError::Invalid(format!(
+                "run input {} is not bound in the assembly",
+                input.name
+            )));
+        }
+        if let Some(existing) = slot.run.inputs.iter_mut().find(|i| i.name == input.name) {
+            *existing = input.clone();
+        } else {
+            slot.run.inputs.push(input.clone());
+        }
+        let epoch = slot.input_epochs.entry(input.name.clone()).or_insert(0);
+        *epoch = epoch.saturating_add(1);
+        let run = slot.run.clone();
+        Self::append_locked(
+            &mut state,
+            "run.input_injected",
+            &run.id,
+            input.encode_to_vec(),
+        );
+        Ok(run)
+    }
+
+    /// Atomically claim the first ready work unit for a module. An empty
+    /// WorkItem means that this module has no ready unit. Under default
+    /// closure, if the whole graph has neither ready nor in-flight work, the
+    /// run closes as STALLED.
     pub fn claim_ready(&self, req: ClaimRequest) -> Result<WorkItem> {
         let mut state = self.state.lock().unwrap();
         let slot = state
@@ -833,24 +913,39 @@ impl MemoryKernel {
             return Err(KernelError::RunClosed(run_state));
         }
 
-        let assembly = slot.run.assembly.as_ref().unwrap();
+        let assembly = slot.run.assembly.as_ref().unwrap().clone();
         let mut selected = None;
         let mut any_ready = false;
         for node in &assembly.nodes {
-            if slot.committed.contains_key(&node.id) || slot.claimed.contains_key(&node.id) {
+            let Some(inputs) = resolve_inputs(slot, node) else {
+                continue;
+            };
+            let Ok(cap) = capability_for_node(&state, node) else {
+                continue;
+            };
+            let firing = effective_firing(slot, node, cap);
+            let Some(unit_key) = work_unit_key(slot, node, cap, firing, &inputs) else {
+                continue;
+            };
+            if slot.done_units.contains(&unit_key) {
                 continue;
             }
-            if let Some(inputs) = resolve_inputs(slot, node) {
-                any_ready = true;
-                if selected.is_none() && node.module == req.module {
-                    selected = Some((node.clone(), inputs));
-                }
+            any_ready = true;
+            if selected.is_none() && node.module == req.module {
+                selected = Some((node.clone(), inputs, unit_key));
             }
         }
 
-        if let Some((node, inputs)) = selected {
+        if let Some((node, inputs, unit_key)) = selected {
+            // ONCE keeps the v1.0 work id shape so known-answer ledger fixtures
+            // stay stable; multi-fire modes embed the unit key.
+            let work_id = if unit_key.starts_with("once:") {
+                format!("work:{}/{}", req.run_id, node.id)
+            } else {
+                format!("work:{}/{}", req.run_id, unit_key)
+            };
             let work = WorkItem {
-                id: format!("work:{}/{}", req.run_id, node.id),
+                id: work_id,
                 run_id: req.run_id.clone(),
                 node_id: node.id.clone(),
                 module: node.module,
@@ -858,17 +953,15 @@ impl MemoryKernel {
                 capability: node.capability,
                 inputs,
             };
-            state
-                .runs
-                .get_mut(&req.run_id)
-                .unwrap()
-                .claimed
-                .insert(node.id, work.clone());
+            let slot = state.runs.get_mut(&req.run_id).unwrap();
+            slot.done_units.insert(unit_key);
+            slot.claimed.insert(work.id.clone(), work.clone());
             Self::append_locked(&mut state, "work.claimed", &work.id, work.encode_to_vec());
             return Ok(work);
         }
 
-        if !any_ready && slot.claimed.is_empty() {
+        let open = is_open_closure(slot);
+        if !any_ready && slot.claimed.is_empty() && !open {
             let run = &mut state.runs.get_mut(&req.run_id).unwrap().run;
             run.state = RunState::Stalled as i32;
             run.reason = "no node is ready and no work is in flight".into();
@@ -885,7 +978,8 @@ impl MemoryKernel {
 
     /// Commit one claimed transformation. The kernel validates every output
     /// contract, records a separate immutable Derivation, releases downstream
-    /// work, and closes the run when its declared terminal output appears.
+    /// work, and closes the run when its declared terminal output appears
+    /// (unless `CLOSURE_OPEN`).
     pub fn commit(&self, submitted: Derivation) -> Result<Run> {
         self.commit_ctx(submitted, &RequestContext::default())
     }
@@ -907,12 +1001,12 @@ impl MemoryKernel {
         }
         let work = slot
             .claimed
-            .get(&submitted.node_id)
+            .get(&submitted.work_id)
             .cloned()
-            .ok_or_else(|| KernelError::Conflict("node was not claimed".into()))?;
-        if submitted.work_id != work.id {
+            .ok_or_else(|| KernelError::Conflict("work was not claimed".into()))?;
+        if !submitted.node_id.is_empty() && submitted.node_id != work.node_id {
             return Err(KernelError::Invalid(
-                "work_id does not match the claim".into(),
+                "node_id does not match the claim".into(),
             ));
         }
         if slot.run.steps >= slot.run.max_steps {
@@ -936,9 +1030,10 @@ impl MemoryKernel {
 
         let run_now = {
             let slot = state.runs.get_mut(&work.run_id).unwrap();
-            slot.claimed.remove(&work.node_id);
-            slot.committed
+            slot.claimed.remove(&work.id);
+            slot.latest
                 .insert(work.node_id.clone(), derivation.clone());
+            *slot.node_commits.entry(work.node_id.clone()).or_insert(0) += 1;
             slot.run.steps += 1;
             let terminal = slot
                 .run
@@ -947,7 +1042,9 @@ impl MemoryKernel {
                 .unwrap()
                 .terminal
                 .as_ref()
-                .unwrap();
+                .unwrap()
+                .clone();
+            let open = is_open_closure(slot);
             let mut closed = false;
             if terminal.node == work.node_id {
                 if let Some(answer) = derivation
@@ -957,8 +1054,10 @@ impl MemoryKernel {
                     .and_then(|o| o.artifact.clone())
                 {
                     slot.run.answer = Some(answer);
-                    slot.run.state = RunState::Completed as i32;
-                    closed = true;
+                    if !open {
+                        slot.run.state = RunState::Completed as i32;
+                        closed = true;
+                    }
                 }
             }
             if !closed && slot.run.steps >= slot.run.max_steps {
@@ -966,25 +1065,24 @@ impl MemoryKernel {
                 slot.run.reason = "max_steps exhausted before the terminal output".into();
                 closed = true;
             }
-            if !closed {
-                let any_ready = slot
-                    .run
-                    .assembly
-                    .as_ref()
-                    .unwrap()
-                    .nodes
-                    .iter()
-                    .any(|node| {
-                        !slot.committed.contains_key(&node.id)
-                            && !slot.claimed.contains_key(&node.id)
-                            && resolve_inputs(slot, node).is_some()
-                    });
-                if !any_ready && slot.claimed.is_empty() {
-                    slot.run.state = RunState::Stalled as i32;
-                    slot.run.reason = "no node is ready and no work is in flight".into();
+            let should_check_stall = !closed && !open && slot.claimed.is_empty();
+            let snap = if should_check_stall {
+                Some(slot.clone())
+            } else {
+                None
+            };
+            let run_id = work.run_id.clone();
+            let mut run_now = slot.run.clone();
+            if let Some(snap) = snap {
+                if !assembly_any_ready(&state, &snap) {
+                    run_now.state = RunState::Stalled as i32;
+                    run_now.reason = "no node is ready and no work is in flight".into();
+                    let slot = state.runs.get_mut(&run_id).unwrap();
+                    slot.run.state = run_now.state;
+                    slot.run.reason = run_now.reason.clone();
                 }
             }
-            slot.run.clone()
+            run_now
         };
         state.derivations.push(derivation.clone());
         Self::append_locked(
@@ -1094,6 +1192,7 @@ pub trait KernelApi {
     fn append(&self, req: AppendRequest, ctx: &RequestContext) -> LedgerEntry;
     fn snapshot(&self, req: SnapshotRequest, ctx: &RequestContext) -> RegistrySnapshot;
     fn start_run(&self, req: RunRequest, ctx: &RequestContext) -> Result<Run>;
+    fn inject_input(&self, req: InjectInputRequest, ctx: &RequestContext) -> Result<Run>;
     fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<WorkItem>;
     fn commit(&self, submitted: Derivation, ctx: &RequestContext) -> Result<Run>;
     fn get_run(&self, r: &RunRef, ctx: &RequestContext) -> Result<Run>;
@@ -1140,6 +1239,9 @@ impl KernelApi for MemoryKernel {
     }
     fn start_run(&self, req: RunRequest, ctx: &RequestContext) -> Result<Run> {
         MemoryKernel::start_run_ctx(self, req, ctx)
+    }
+    fn inject_input(&self, req: InjectInputRequest, ctx: &RequestContext) -> Result<Run> {
+        MemoryKernel::inject_input_ctx(self, req, ctx)
     }
     fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<WorkItem> {
         check_deadline(ctx)?;
@@ -1474,7 +1576,7 @@ fn resolve_inputs(slot: &RunSlot, node: &AssemblyNode) -> Option<Vec<NamedArtifa
                 .find(|i| i.name == b.input)
                 .and_then(|i| i.artifact.clone())
         } else {
-            slot.committed
+            slot.latest
                 .get(&b.from_node)
                 .and_then(|d| d.outputs.iter().find(|o| o.name == b.from_port))
                 .and_then(|o| o.artifact.clone())
@@ -1485,6 +1587,184 @@ fn resolve_inputs(slot: &RunSlot, node: &AssemblyNode) -> Option<Vec<NamedArtifa
         });
     }
     Some(resolved)
+}
+
+fn materialize_assembly(assembly: &Assembly, include: &[String]) -> Result<Assembly> {
+    if include.is_empty() {
+        return Ok(assembly.clone());
+    }
+    let want: HashSet<&str> = include.iter().map(String::as_str).collect();
+    if want.len() != include.len() {
+        return Err(KernelError::Invalid(
+            "include_nodes contains duplicates".into(),
+        ));
+    }
+    let known: HashSet<&str> = assembly.nodes.iter().map(|n| n.id.as_str()).collect();
+    for id in &want {
+        if !known.contains(id) {
+            return Err(KernelError::Invalid(format!(
+                "include_nodes references unknown node {id}"
+            )));
+        }
+    }
+    let terminal = assembly
+        .terminal
+        .as_ref()
+        .ok_or_else(|| KernelError::Invalid("assembly terminal is required".into()))?;
+    if !want.contains(terminal.node.as_str()) {
+        return Err(KernelError::Invalid(
+            "include_nodes must retain the terminal node".into(),
+        ));
+    }
+    let nodes: Vec<_> = assembly
+        .nodes
+        .iter()
+        .filter(|n| want.contains(n.id.as_str()))
+        .cloned()
+        .collect();
+    let bindings: Vec<_> = assembly
+        .bindings
+        .iter()
+        .filter(|b| {
+            want.contains(b.to_node.as_str())
+                && (b.input.is_empty() == false || want.contains(b.from_node.as_str()))
+        })
+        .cloned()
+        .collect();
+    Ok(Assembly {
+        id: assembly.id.clone(),
+        nodes,
+        bindings,
+        terminal: assembly.terminal.clone(),
+    })
+}
+
+fn is_open_closure(slot: &RunSlot) -> bool {
+    slot.run
+        .policy
+        .as_ref()
+        .map(|p| p.closure() == Closure::Open)
+        .unwrap_or(false)
+}
+
+fn effective_firing(slot: &RunSlot, node: &AssemblyNode, cap: &Capability) -> Firing {
+    if let Some(policy) = slot.run.policy.as_ref() {
+        if let Some(&f) = policy.by_node.get(&node.id) {
+            if f != Firing::Unspecified as i32 {
+                return Firing::try_from(f).unwrap_or(Firing::Once);
+            }
+        }
+    }
+    if cap.firing() != Firing::Unspecified {
+        return cap.firing();
+    }
+    if let Some(policy) = slot.run.policy.as_ref() {
+        if policy.default() != Firing::Unspecified {
+            return policy.default();
+        }
+    }
+    Firing::Once
+}
+
+fn work_unit_key(
+    slot: &RunSlot,
+    node: &AssemblyNode,
+    cap: &Capability,
+    firing: Firing,
+    inputs: &[NamedArtifact],
+) -> Option<String> {
+    match firing {
+        Firing::Always => {
+            let fp = delivery_fingerprint(slot, node, inputs)?;
+            Some(format!("always:{}:{}", node.id, fp))
+        }
+        Firing::OncePerKey => {
+            let key = input_key(cap, inputs);
+            Some(format!("key:{}:{}", node.id, key))
+        }
+        _ => Some(format!("once:{}", node.id)),
+    }
+}
+
+fn input_key(cap: &Capability, inputs: &[NamedArtifact]) -> String {
+    let marked: Vec<&str> = cap
+        .inputs
+        .iter()
+        .filter(|p| p.key)
+        .map(|p| p.name.as_str())
+        .collect();
+    let mut pairs: Vec<(&str, &str)> = inputs
+        .iter()
+        .filter_map(|i| {
+            let id = i.artifact.as_ref()?.id.as_str();
+            if marked.is_empty() || marked.iter().any(|n| *n == i.name) {
+                Some((i.name.as_str(), id))
+            } else {
+                None
+            }
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut h = Sha256::new();
+    for (name, id) in pairs {
+        h.update(name.as_bytes());
+        h.update([SEP]);
+        h.update(id.as_bytes());
+        h.update([SEP]);
+    }
+    hex(&h.finalize())
+}
+
+fn delivery_fingerprint(
+    slot: &RunSlot,
+    node: &AssemblyNode,
+    inputs: &[NamedArtifact],
+) -> Option<String> {
+    let assembly = slot.run.assembly.as_ref()?;
+    let mut h = Sha256::new();
+    let mut rows: Vec<(String, String, u64)> = Vec::new();
+    for b in assembly.bindings.iter().filter(|b| b.to_node == node.id) {
+        let art = inputs.iter().find(|i| i.name == b.to_port)?;
+        let id = art.artifact.as_ref()?.id.clone();
+        let epoch = if !b.input.is_empty() {
+            slot.input_epochs.get(&b.input).copied().unwrap_or(0)
+        } else {
+            slot.node_commits.get(&b.from_node).copied().unwrap_or(0)
+        };
+        rows.push((b.to_port.clone(), id, epoch));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    for (port, id, epoch) in rows {
+        h.update(port.as_bytes());
+        h.update([SEP]);
+        h.update(id.as_bytes());
+        h.update([SEP]);
+        h.update(epoch.to_be_bytes());
+        h.update([SEP]);
+    }
+    Some(hex(&h.finalize()))
+}
+
+fn assembly_any_ready(state: &State, slot: &RunSlot) -> bool {
+    let Some(assembly) = slot.run.assembly.as_ref() else {
+        return false;
+    };
+    for node in &assembly.nodes {
+        let Some(inputs) = resolve_inputs(slot, node) else {
+            continue;
+        };
+        let Ok(cap) = capability_for_node(state, node) else {
+            continue;
+        };
+        let firing = effective_firing(slot, node, cap);
+        let Some(unit_key) = work_unit_key(slot, node, cap, firing, &inputs) else {
+            continue;
+        };
+        if !slot.done_units.contains(&unit_key) {
+            return true;
+        }
+    }
+    false
 }
 
 fn validate_outputs(state: &State, cap: &Capability, outputs: &[NamedArtifact]) -> Result<()> {

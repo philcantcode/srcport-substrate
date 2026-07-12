@@ -49,15 +49,17 @@ type (
 	AssemblyNode     = pb.AssemblyNode
 	Binding          = pb.Binding
 	NodeOutput       = pb.NodeOutput
-	Limits           = pb.Limits
-	Assembly         = pb.Assembly
-	RunRequest       = pb.RunRequest
-	Run              = pb.Run
-	RunRef           = pb.RunRef
-	ClaimRequest     = pb.ClaimRequest
-	WorkItem         = pb.WorkItem
-	Derivation       = pb.Derivation
-	DerivationList   = pb.DerivationList
+	Limits            = pb.Limits
+	Assembly          = pb.Assembly
+	RunRequest        = pb.RunRequest
+	Run               = pb.Run
+	RunRef            = pb.RunRef
+	InjectInputRequest = pb.InjectInputRequest
+	ClaimRequest      = pb.ClaimRequest
+	WorkItem          = pb.WorkItem
+	Derivation        = pb.Derivation
+	DerivationList    = pb.DerivationList
+	ExecutionPolicy   = pb.ExecutionPolicy
 	RequestContext    = pb.RequestContext
 	Error             = pb.Error
 	ErrorCode         = pb.ErrorCode
@@ -67,6 +69,8 @@ type (
 
 	Lifecycle = pb.Lifecycle
 	RunState  = pb.RunState
+	Firing    = pb.Firing
+	Closure   = pb.Closure
 )
 
 // Portable ErrorCode values (same integers on every SDK and over the wire).
@@ -103,6 +107,21 @@ const (
 	LifecycleLoaded      = pb.Lifecycle_LIFECYCLE_LOADED
 	LifecycleActive      = pb.Lifecycle_LIFECYCLE_ACTIVE
 	LifecycleDeactivated = pb.Lifecycle_LIFECYCLE_DEACTIVATED
+)
+
+// Work-unit firing policies (module default + optional run override).
+const (
+	FiringUnspecified = pb.Firing_FIRING_UNSPECIFIED
+	FiringOnce        = pb.Firing_FIRING_ONCE
+	FiringAlways      = pb.Firing_FIRING_ALWAYS
+	FiringOncePerKey  = pb.Firing_FIRING_ONCE_PER_KEY
+)
+
+// Run closure policies.
+const (
+	ClosureUnspecified   = pb.Closure_CLOSURE_UNSPECIFIED
+	ClosureFirstTerminal = pb.Closure_CLOSURE_FIRST_TERMINAL
+	ClosureOpen          = pb.Closure_CLOSURE_OPEN
 )
 
 

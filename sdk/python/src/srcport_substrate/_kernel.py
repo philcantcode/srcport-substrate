@@ -17,16 +17,20 @@ from ._types import (
     AssemblyNode,
     BlobData,
     BlobRef,
+    Capability,
     ClaimRequest,
+    Closure,
     Contract,
     Derivation,
     DerivationList,
     Error,
     ErrorCode,
     Event,
+    Firing,
     GetBlobRequest,
     HasBlobRequest,
     HasBlobResponse,
+    InjectInputRequest,
     LedgerEntry,
     Lifecycle,
     ModuleManifest,
@@ -237,6 +241,9 @@ class KernelApi(Protocol):
     ) -> RegistrySnapshot: ...
     def start_run(
         self, req: RunRequest, ctx: RequestContext | None = None
+    ) -> Run: ...
+    def inject_input(
+        self, req: InjectInputRequest, ctx: RequestContext | None = None
     ) -> Run: ...
     def claim_ready(
         self, req: ClaimRequest, ctx: RequestContext | None = None
@@ -623,22 +630,29 @@ class MemoryKernel:
                 raise Conflict(f"run {req.id} already exists")
             if not req.HasField("assembly"):
                 raise Invalid("assembly is required")
-            self._validate_assembly(req.assembly, req.inputs)
+            assembly = _materialize_assembly(req.assembly, list(req.include_nodes))
+            self._validate_assembly(assembly, req.inputs)
             max_steps = req.limits.max_steps if req.HasField("limits") else 0
-            max_steps = max_steps or len(req.assembly.nodes)
+            max_steps = max_steps or len(assembly.nodes)
             if not max_steps:
                 raise Invalid("max_steps must be positive")
             run = Run(
                 id=req.id,
-                assembly=req.assembly,
+                assembly=assembly,
                 inputs=req.inputs,
                 state=RunState.RUN_STATE_RUNNING,
                 max_steps=max_steps,
             )
+            if req.HasField("policy"):
+                run.policy.CopyFrom(req.policy)
+            epochs = {item.name: 0 for item in req.inputs}
             self._runs[run.id] = {
                 "run": run,
                 "claimed": {},
-                "committed": {},
+                "latest": {},
+                "done_units": set(),
+                "input_epochs": epochs,
+                "node_commits": {},
             }
             self._append_locked("run.started", run.id, _canonical(run))
             out = copy.deepcopy(run)
@@ -646,8 +660,47 @@ class MemoryKernel:
                 self._idempotency[key] = copy.deepcopy(out)
             return out
 
+    def inject_input(
+        self, req: InjectInputRequest, ctx: RequestContext | None = None
+    ) -> Run:
+        """Admit or replace a named run input while RUNNING."""
+        _check_deadline(ctx)
+        with self._lock:
+            slot = self._runs.get(req.run_id)
+            if slot is None:
+                raise NotFound(req.run_id)
+            run = slot["run"]
+            if run.state != RunState.RUN_STATE_RUNNING:
+                raise RunClosed(run.state)
+            if not req.HasField("input") or not req.input.name:
+                raise Invalid("input is required")
+            if not req.input.HasField("artifact"):
+                raise Invalid(f"input {req.input.name} has no artifact")
+            if req.input.artifact.id not in self._artifacts:
+                raise NotFound(req.input.artifact.id)
+            used = any(b.input == req.input.name for b in run.assembly.bindings)
+            if not used:
+                raise Invalid(
+                    f"run input {req.input.name} is not bound in the assembly"
+                )
+            found = False
+            for i, item in enumerate(run.inputs):
+                if item.name == req.input.name:
+                    run.inputs[i].CopyFrom(req.input)
+                    found = True
+                    break
+            if not found:
+                run.inputs.append(req.input)
+            slot["input_epochs"][req.input.name] = (
+                slot["input_epochs"].get(req.input.name, 0) + 1
+            )
+            self._append_locked(
+                "run.input_injected", run.id, _canonical(req.input)
+            )
+            return copy.deepcopy(run)
+
     def claim_ready(self, req: ClaimRequest, ctx: RequestContext | None = None) -> WorkItem:
-        """Atomically claim one ready node for a module, or return an empty item."""
+        """Atomically claim one ready work unit for a module, or return empty."""
         _check_deadline(ctx)
         with self._lock:
             slot = self._runs.get(req.run_id)
@@ -658,18 +711,32 @@ class MemoryKernel:
                 raise RunClosed(run.state)
             selected = None
             selected_inputs = None
+            unit_key = None
             any_ready = False
             for node in run.assembly.nodes:
-                if node.id in slot["claimed"] or node.id in slot["committed"]:
-                    continue
                 inputs = self._resolve_inputs(slot, node)
-                if inputs is not None:
-                    any_ready = True
-                    if selected is None and node.module == req.module:
-                        selected, selected_inputs = node, inputs
-            if selected is not None:
+                if inputs is None:
+                    continue
+                try:
+                    cap = self._capability_for(
+                        node.module, node.module_version, node.capability
+                    )
+                except Invalid:
+                    continue
+                firing = _effective_firing(slot, node, cap)
+                key = _work_unit_key(slot, node, cap, firing, inputs)
+                if key is None or key in slot["done_units"]:
+                    continue
+                any_ready = True
+                if selected is None and node.module == req.module:
+                    selected, selected_inputs, unit_key = node, inputs, key
+            if selected is not None and unit_key is not None:
+                if unit_key.startswith("once:"):
+                    work_id = f"work:{req.run_id}/{selected.id}"
+                else:
+                    work_id = f"work:{req.run_id}/{unit_key}"
                 work = WorkItem(
-                    id=f"work:{req.run_id}/{selected.id}",
+                    id=work_id,
                     run_id=req.run_id,
                     node_id=selected.id,
                     module=selected.module,
@@ -677,17 +744,22 @@ class MemoryKernel:
                     capability=selected.capability,
                     inputs=selected_inputs,
                 )
-                slot["claimed"][selected.id] = work
+                slot["done_units"].add(unit_key)
+                slot["claimed"][work.id] = work
                 self._append_locked("work.claimed", work.id, _canonical(work))
                 return copy.deepcopy(work)
-            if not any_ready and not slot["claimed"]:
+            if (
+                not any_ready
+                and not slot["claimed"]
+                and not _is_open_closure(slot)
+            ):
                 run.state = RunState.RUN_STATE_STALLED
                 run.reason = "no node is ready and no work is in flight"
                 self._append_locked("run.stalled", run.id, _canonical(run))
             return WorkItem()
 
     def commit(self, submitted: Derivation, ctx: RequestContext | None = None) -> Run:
-        """Commit one claimed transformation and release its downstream nodes.
+        """Commit one claimed transformation and release its downstream work.
 
         Honour deadline and ``request_key`` idempotency.
         """
@@ -702,11 +774,11 @@ class MemoryKernel:
             run = slot["run"]
             if run.state != RunState.RUN_STATE_RUNNING:
                 raise RunClosed(run.state)
-            work = slot["claimed"].get(submitted.node_id)
+            work = slot["claimed"].get(submitted.work_id)
             if work is None:
-                raise Conflict("node was not claimed")
-            if submitted.work_id != work.id:
-                raise Invalid("work_id does not match the claim")
+                raise Conflict("work was not claimed")
+            if submitted.node_id and submitted.node_id != work.node_id:
+                raise Invalid("node_id does not match the claim")
             cap = self._capability_for(
                 work.module, work.module_version, work.capability
             )
@@ -722,29 +794,29 @@ class MemoryKernel:
                 outputs=submitted.outputs,
             )
             derivation.id = _derivation_id(derivation)
-            del slot["claimed"][work.node_id]
-            slot["committed"][work.node_id] = derivation
+            del slot["claimed"][work.id]
+            slot["latest"][work.node_id] = derivation
+            slot["node_commits"][work.node_id] = (
+                slot["node_commits"].get(work.node_id, 0) + 1
+            )
             run.steps += 1
             closed = False
+            open_run = _is_open_closure(slot)
             terminal = run.assembly.terminal
             if terminal.node == work.node_id:
                 for output in derivation.outputs:
                     if output.name == terminal.port:
                         run.answer.CopyFrom(output.artifact)
-                        run.state = RunState.RUN_STATE_COMPLETED
-                        closed = True
+                        if not open_run:
+                            run.state = RunState.RUN_STATE_COMPLETED
+                            closed = True
                         break
             if not closed and run.steps >= run.max_steps:
                 run.state = RunState.RUN_STATE_FAILED
                 run.reason = "max_steps exhausted before the terminal output"
                 closed = True
-            if not closed:
-                any_ready = any(
-                    node.id not in slot["claimed"]
-                    and node.id not in slot["committed"]
-                    and self._resolve_inputs(slot, node) is not None
-                    for node in run.assembly.nodes
-                )
+            if not closed and not open_run:
+                any_ready = self._assembly_any_ready(slot)
                 if not any_ready and not slot["claimed"]:
                     run.state = RunState.RUN_STATE_STALLED
                     run.reason = "no node is ready and no work is in flight"
@@ -943,39 +1015,22 @@ class MemoryKernel:
         for node in nodes:
             visit(node)
 
-    @staticmethod
-    def _resolve_inputs(slot, node: AssemblyNode):
-        resolved = []
-        for binding in slot["run"].assembly.bindings:
-            if binding.to_node != node.id:
+    def _assembly_any_ready(self, slot) -> bool:
+        for node in slot["run"].assembly.nodes:
+            inputs = self._resolve_inputs(slot, node)
+            if inputs is None:
                 continue
-            ref = None
-            if binding.input:
-                item = next(
-                    (
-                        item
-                        for item in slot["run"].inputs
-                        if item.name == binding.input
-                    ),
-                    None,
+            try:
+                cap = self._capability_for(
+                    node.module, node.module_version, node.capability
                 )
-                ref = item.artifact if item is not None else None
-            else:
-                derivation = slot["committed"].get(binding.from_node)
-                if derivation is not None:
-                    item = next(
-                        (
-                            item
-                            for item in derivation.outputs
-                            if item.name == binding.from_port
-                        ),
-                        None,
-                    )
-                    ref = item.artifact if item is not None else None
-            if ref is None:
-                return None
-            resolved.append(NamedArtifact(name=binding.to_port, artifact=ref))
-        return resolved
+            except Invalid:
+                continue
+            firing = _effective_firing(slot, node, cap)
+            key = _work_unit_key(slot, node, cap, firing, inputs)
+            if key is not None and key not in slot["done_units"]:
+                return True
+        return False
 
     def _validate_outputs(self, cap, outputs) -> None:
         for expected in cap.outputs:
@@ -996,6 +1051,137 @@ class MemoryKernel:
                     f"output {output.name} has contract {artifact.type}, "
                     f"want {expected.contract}"
                 )
+
+    @staticmethod
+    def _resolve_inputs(slot, node: AssemblyNode):
+        resolved = []
+        for binding in slot["run"].assembly.bindings:
+            if binding.to_node != node.id:
+                continue
+            ref = None
+            if binding.input:
+                item = next(
+                    (
+                        item
+                        for item in slot["run"].inputs
+                        if item.name == binding.input
+                    ),
+                    None,
+                )
+                ref = item.artifact if item is not None else None
+            else:
+                derivation = slot["latest"].get(binding.from_node)
+                if derivation is not None:
+                    item = next(
+                        (
+                            item
+                            for item in derivation.outputs
+                            if item.name == binding.from_port
+                        ),
+                        None,
+                    )
+                    ref = item.artifact if item is not None else None
+            if ref is None:
+                return None
+            resolved.append(NamedArtifact(name=binding.to_port, artifact=ref))
+        return resolved
+
+
+def _materialize_assembly(assembly: Assembly, include: list[str]) -> Assembly:
+    if not include:
+        return assembly
+    if len(set(include)) != len(include):
+        raise Invalid("include_nodes contains duplicates")
+    known = {n.id for n in assembly.nodes}
+    for node_id in include:
+        if node_id not in known:
+            raise Invalid(f"include_nodes references unknown node {node_id}")
+    if not assembly.HasField("terminal") or assembly.terminal.node not in include:
+        raise Invalid("include_nodes must retain the terminal node")
+    want = set(include)
+    out = Assembly(id=assembly.id, terminal=assembly.terminal)
+    for node in assembly.nodes:
+        if node.id in want:
+            out.nodes.append(node)
+    for binding in assembly.bindings:
+        if binding.to_node not in want:
+            continue
+        if not binding.input and binding.from_node not in want:
+            continue
+        out.bindings.append(binding)
+    return out
+
+
+def _is_open_closure(slot) -> bool:
+    run = slot["run"]
+    return run.HasField("policy") and run.policy.closure == Closure.CLOSURE_OPEN
+
+
+def _effective_firing(slot, node: AssemblyNode, cap: Capability) -> Firing:
+    run = slot["run"]
+    if run.HasField("policy") and node.id in run.policy.by_node:
+        f = run.policy.by_node[node.id]
+        if f != Firing.FIRING_UNSPECIFIED:
+            return f
+    if cap.firing != Firing.FIRING_UNSPECIFIED:
+        return cap.firing
+    if run.HasField("policy") and run.policy.default != Firing.FIRING_UNSPECIFIED:
+        return run.policy.default
+    return Firing.FIRING_ONCE
+
+
+def _work_unit_key(slot, node, cap, firing, inputs):
+    if firing == Firing.FIRING_ALWAYS:
+        fp = _delivery_fingerprint(slot, node, inputs)
+        if fp is None:
+            return None
+        return f"always:{node.id}:{fp}"
+    if firing == Firing.FIRING_ONCE_PER_KEY:
+        return f"key:{node.id}:{_input_key(cap, inputs)}"
+    return f"once:{node.id}"
+
+
+def _input_key(cap, inputs) -> str:
+    marked = [p.name for p in cap.inputs if p.key]
+    pairs = []
+    for item in inputs:
+        if not item.HasField("artifact"):
+            continue
+        if not marked or item.name in marked:
+            pairs.append((item.name, item.artifact.id))
+    pairs.sort(key=lambda p: p[0])
+    h = hashlib.sha256()
+    for name, art_id in pairs:
+        h.update(name.encode())
+        h.update(b"\x00")
+        h.update(art_id.encode())
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _delivery_fingerprint(slot, node, inputs):
+    rows = []
+    for binding in slot["run"].assembly.bindings:
+        if binding.to_node != node.id:
+            continue
+        art = next((i for i in inputs if i.name == binding.to_port), None)
+        if art is None or not art.HasField("artifact"):
+            return None
+        if binding.input:
+            epoch = slot["input_epochs"].get(binding.input, 0)
+        else:
+            epoch = slot["node_commits"].get(binding.from_node, 0)
+        rows.append((binding.to_port, art.artifact.id, epoch))
+    rows.sort(key=lambda r: r[0])
+    h = hashlib.sha256()
+    for port, art_id, epoch in rows:
+        h.update(port.encode())
+        h.update(b"\x00")
+        h.update(art_id.encode())
+        h.update(b"\x00")
+        h.update(int(epoch).to_bytes(8, "big"))
+        h.update(b"\x00")
+    return h.hexdigest()
 
 
 def _derivation_id(derivation: Derivation) -> str:

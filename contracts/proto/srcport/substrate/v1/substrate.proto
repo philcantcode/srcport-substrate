@@ -26,6 +26,16 @@ enum Lifecycle {
   LIFECYCLE_DEACTIVATED = 4;
 }
 
+// How often a capability's nodes may fire within one Run. Module-owned default
+// set at Register; a Run may override per node via ExecutionPolicy.
+// Unspecified resolves to FIRING_ONCE (v1.0 converge semantics).
+enum Firing {
+  FIRING_UNSPECIFIED  = 0;
+  FIRING_ONCE         = 1;  // at most one work unit per node per run
+  FIRING_ALWAYS       = 2;  // re-fire when input delivery generation changes
+  FIRING_ONCE_PER_KEY = 3;  // at most one work unit per (node, input_key) per run
+}
+
 // A named thing a module can do. Typed I/O is declared exclusively on ports —
 // modules couple through Port.contract refs, never through each other's code.
 message Capability {
@@ -34,6 +44,9 @@ message Capability {
   reserved "contract";
   repeated Port inputs  = 3;
   repeated Port outputs = 4;
+  // Default work-unit policy for nodes using this capability. Declared at
+  // module creation (Register). Run-level ExecutionPolicy may override.
+  Firing firing = 5;
 }
 
 // A named, typed side of a capability. Multiple bindings are permitted only
@@ -46,6 +59,10 @@ message Port {
   string contract = 2;
   bool multiple   = 3;
   bool optional   = 4;
+  // When true, this port participates in FIRING_ONCE_PER_KEY identity. The
+  // kernel hashes artifact ids on key ports (never domain bodies). If no input
+  // port is marked key, all inputs participate.
+  bool key = 5;
 }
 
 message ModuleManifest {
@@ -216,8 +233,10 @@ message RegistrySnapshot {
 // ─── 7. RUN / CONVERGENCE ──────────────────────────────────────────────────
 // An Assembly is the small, human-owned feed-forward seam. It pins module
 // versions, connects typed ports, and names exactly one terminal output. A Run
-// applies an immutable set of input artifacts to one Assembly. It can close
-// only as COMPLETED, STALLED, FAILED, or CANCELLED; closed runs never reopen.
+// applies input artifacts to one Assembly (optionally a node subset) under an
+// ExecutionPolicy. Work units (not bare nodes) claim/commit at most once.
+// Runs close only as COMPLETED, STALLED, FAILED, or CANCELLED; closed runs
+// never reopen. Assemblies remain acyclic; multi-fire is time, not a cycle edge.
 
 message NamedArtifact {
   string name         = 1;
@@ -248,8 +267,23 @@ message NodeOutput {
 
 message Limits {
   // Zero means the number of nodes. A run never commits more derivations than
-  // this value, which bounds even future explicitly-looping assembly forms.
+  // this value, which bounds multi-fire (ALWAYS / ONCE_PER_KEY) work units.
   uint64 max_steps = 1;
+}
+
+// When a RUNNING run may become COMPLETED. Unspecified = FIRST_TERMINAL.
+enum Closure {
+  CLOSURE_UNSPECIFIED    = 0;
+  CLOSURE_FIRST_TERMINAL = 1;  // terminal output → COMPLETED (v1.0 default)
+  CLOSURE_OPEN           = 2;  // stay RUNNING until cancel / max_steps; no auto-stall
+}
+
+// Operator-owned run policy. Module Capability.firing is the default; by_node
+// and default override when set (non-UNSPECIFIED).
+message ExecutionPolicy {
+  Firing default = 1;
+  map<string, Firing> by_node = 2;  // assembly node id → firing
+  Closure closure = 3;
 }
 
 message Assembly {
@@ -273,6 +307,10 @@ message RunRequest {
   Assembly assembly            = 2;
   repeated NamedArtifact inputs = 3;
   Limits limits                = 4;
+  // If non-empty, only these assembly node ids participate; others are dropped
+  // and bindings that touch them are removed. Terminal must remain.
+  repeated string include_nodes = 5;
+  ExecutionPolicy policy        = 6;
 }
 
 message Run {
@@ -284,9 +322,19 @@ message Run {
   uint64 steps                 = 6;
   uint64 max_steps             = 7;
   string reason                = 8;
+  // Frozen at StartRun (after include_nodes materialisation).
+  ExecutionPolicy policy       = 9;
 }
 
 message RunRef { string id = 1; }
+
+// Replace or set a named run input while RUNNING. Bumps that input's delivery
+// generation so FIRING_ALWAYS nodes bound to it can re-fire (including the same
+// artifact id). The name must appear as Binding.input in the frozen assembly.
+message InjectInputRequest {
+  string run_id         = 1;
+  NamedArtifact input   = 2;
+}
 
 message ClaimRequest {
   string run_id = 1;
@@ -414,6 +462,8 @@ service Kernel {
   rpc Append      (AppendRequest)   returns (LedgerEntry);
   rpc Snapshot    (SnapshotRequest) returns (RegistrySnapshot);
   rpc StartRun    (RunRequest)      returns (Run);
+  // Admit or replace a named input on a RUNNING run (open / multi-fire modes).
+  rpc InjectInput (InjectInputRequest) returns (Run);
   rpc ClaimReady  (ClaimRequest)    returns (WorkItem);
   rpc Commit      (Derivation)      returns (Run);
   rpc GetRun      (RunRef)          returns (Run);

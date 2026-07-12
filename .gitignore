@@ -19,3 +19,7 @@ buf.lock
 
 # OS noise
 .DS_Store
+
+# local Python venvs
+.venv/
+**/.venv/

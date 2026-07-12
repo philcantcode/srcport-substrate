@@ -14,6 +14,19 @@ class Lifecycle(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     LIFECYCLE_ACTIVE: _ClassVar[Lifecycle]
     LIFECYCLE_DEACTIVATED: _ClassVar[Lifecycle]
 
+class Firing(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    FIRING_UNSPECIFIED: _ClassVar[Firing]
+    FIRING_ONCE: _ClassVar[Firing]
+    FIRING_ALWAYS: _ClassVar[Firing]
+    FIRING_ONCE_PER_KEY: _ClassVar[Firing]
+
+class Closure(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    CLOSURE_UNSPECIFIED: _ClassVar[Closure]
+    CLOSURE_FIRST_TERMINAL: _ClassVar[Closure]
+    CLOSURE_OPEN: _ClassVar[Closure]
+
 class RunState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     RUN_STATE_UNSPECIFIED: _ClassVar[RunState]
@@ -37,6 +50,13 @@ LIFECYCLE_REGISTERED: Lifecycle
 LIFECYCLE_LOADED: Lifecycle
 LIFECYCLE_ACTIVE: Lifecycle
 LIFECYCLE_DEACTIVATED: Lifecycle
+FIRING_UNSPECIFIED: Firing
+FIRING_ONCE: Firing
+FIRING_ALWAYS: Firing
+FIRING_ONCE_PER_KEY: Firing
+CLOSURE_UNSPECIFIED: Closure
+CLOSURE_FIRST_TERMINAL: Closure
+CLOSURE_OPEN: Closure
 RUN_STATE_UNSPECIFIED: RunState
 RUN_STATE_RUNNING: RunState
 RUN_STATE_COMPLETED: RunState
@@ -52,26 +72,30 @@ ERROR_CODE_RESOURCE_EXHAUSTED: ErrorCode
 ERROR_CODE_BLOB_INTEGRITY: ErrorCode
 
 class Capability(_message.Message):
-    __slots__ = ("name", "inputs", "outputs")
+    __slots__ = ("name", "inputs", "outputs", "firing")
     NAME_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
     OUTPUTS_FIELD_NUMBER: _ClassVar[int]
+    FIRING_FIELD_NUMBER: _ClassVar[int]
     name: str
     inputs: _containers.RepeatedCompositeFieldContainer[Port]
     outputs: _containers.RepeatedCompositeFieldContainer[Port]
-    def __init__(self, name: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ...) -> None: ...
+    firing: Firing
+    def __init__(self, name: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ..., firing: _Optional[_Union[Firing, str]] = ...) -> None: ...
 
 class Port(_message.Message):
-    __slots__ = ("name", "contract", "multiple", "optional")
+    __slots__ = ("name", "contract", "multiple", "optional", "key")
     NAME_FIELD_NUMBER: _ClassVar[int]
     CONTRACT_FIELD_NUMBER: _ClassVar[int]
     MULTIPLE_FIELD_NUMBER: _ClassVar[int]
     OPTIONAL_FIELD_NUMBER: _ClassVar[int]
+    KEY_FIELD_NUMBER: _ClassVar[int]
     name: str
     contract: str
     multiple: bool
     optional: bool
-    def __init__(self, name: _Optional[str] = ..., contract: _Optional[str] = ..., multiple: bool = ..., optional: bool = ...) -> None: ...
+    key: bool
+    def __init__(self, name: _Optional[str] = ..., contract: _Optional[str] = ..., multiple: bool = ..., optional: bool = ..., key: bool = ...) -> None: ...
 
 class ModuleManifest(_message.Message):
     __slots__ = ("name", "version", "provides", "requires")
@@ -286,6 +310,23 @@ class Limits(_message.Message):
     max_steps: int
     def __init__(self, max_steps: _Optional[int] = ...) -> None: ...
 
+class ExecutionPolicy(_message.Message):
+    __slots__ = ("default", "by_node", "closure")
+    class ByNodeEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: Firing
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[Firing, str]] = ...) -> None: ...
+    DEFAULT_FIELD_NUMBER: _ClassVar[int]
+    BY_NODE_FIELD_NUMBER: _ClassVar[int]
+    CLOSURE_FIELD_NUMBER: _ClassVar[int]
+    default: Firing
+    by_node: _containers.ScalarMap[str, Firing]
+    closure: Closure
+    def __init__(self, default: _Optional[_Union[Firing, str]] = ..., by_node: _Optional[_Mapping[str, Firing]] = ..., closure: _Optional[_Union[Closure, str]] = ...) -> None: ...
+
 class Assembly(_message.Message):
     __slots__ = ("id", "nodes", "bindings", "terminal")
     ID_FIELD_NUMBER: _ClassVar[int]
@@ -299,19 +340,23 @@ class Assembly(_message.Message):
     def __init__(self, id: _Optional[str] = ..., nodes: _Optional[_Iterable[_Union[AssemblyNode, _Mapping]]] = ..., bindings: _Optional[_Iterable[_Union[Binding, _Mapping]]] = ..., terminal: _Optional[_Union[NodeOutput, _Mapping]] = ...) -> None: ...
 
 class RunRequest(_message.Message):
-    __slots__ = ("id", "assembly", "inputs", "limits")
+    __slots__ = ("id", "assembly", "inputs", "limits", "include_nodes", "policy")
     ID_FIELD_NUMBER: _ClassVar[int]
     ASSEMBLY_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
     LIMITS_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_NODES_FIELD_NUMBER: _ClassVar[int]
+    POLICY_FIELD_NUMBER: _ClassVar[int]
     id: str
     assembly: Assembly
     inputs: _containers.RepeatedCompositeFieldContainer[NamedArtifact]
     limits: Limits
-    def __init__(self, id: _Optional[str] = ..., assembly: _Optional[_Union[Assembly, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[NamedArtifact, _Mapping]]] = ..., limits: _Optional[_Union[Limits, _Mapping]] = ...) -> None: ...
+    include_nodes: _containers.RepeatedScalarFieldContainer[str]
+    policy: ExecutionPolicy
+    def __init__(self, id: _Optional[str] = ..., assembly: _Optional[_Union[Assembly, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[NamedArtifact, _Mapping]]] = ..., limits: _Optional[_Union[Limits, _Mapping]] = ..., include_nodes: _Optional[_Iterable[str]] = ..., policy: _Optional[_Union[ExecutionPolicy, _Mapping]] = ...) -> None: ...
 
 class Run(_message.Message):
-    __slots__ = ("id", "assembly", "inputs", "state", "answer", "steps", "max_steps", "reason")
+    __slots__ = ("id", "assembly", "inputs", "state", "answer", "steps", "max_steps", "reason", "policy")
     ID_FIELD_NUMBER: _ClassVar[int]
     ASSEMBLY_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -320,6 +365,7 @@ class Run(_message.Message):
     STEPS_FIELD_NUMBER: _ClassVar[int]
     MAX_STEPS_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
+    POLICY_FIELD_NUMBER: _ClassVar[int]
     id: str
     assembly: Assembly
     inputs: _containers.RepeatedCompositeFieldContainer[NamedArtifact]
@@ -328,13 +374,22 @@ class Run(_message.Message):
     steps: int
     max_steps: int
     reason: str
-    def __init__(self, id: _Optional[str] = ..., assembly: _Optional[_Union[Assembly, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[NamedArtifact, _Mapping]]] = ..., state: _Optional[_Union[RunState, str]] = ..., answer: _Optional[_Union[ArtifactRef, _Mapping]] = ..., steps: _Optional[int] = ..., max_steps: _Optional[int] = ..., reason: _Optional[str] = ...) -> None: ...
+    policy: ExecutionPolicy
+    def __init__(self, id: _Optional[str] = ..., assembly: _Optional[_Union[Assembly, _Mapping]] = ..., inputs: _Optional[_Iterable[_Union[NamedArtifact, _Mapping]]] = ..., state: _Optional[_Union[RunState, str]] = ..., answer: _Optional[_Union[ArtifactRef, _Mapping]] = ..., steps: _Optional[int] = ..., max_steps: _Optional[int] = ..., reason: _Optional[str] = ..., policy: _Optional[_Union[ExecutionPolicy, _Mapping]] = ...) -> None: ...
 
 class RunRef(_message.Message):
     __slots__ = ("id",)
     ID_FIELD_NUMBER: _ClassVar[int]
     id: str
     def __init__(self, id: _Optional[str] = ...) -> None: ...
+
+class InjectInputRequest(_message.Message):
+    __slots__ = ("run_id", "input")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    INPUT_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    input: NamedArtifact
+    def __init__(self, run_id: _Optional[str] = ..., input: _Optional[_Union[NamedArtifact, _Mapping]] = ...) -> None: ...
 
 class ClaimRequest(_message.Message):
     __slots__ = ("run_id", "module")

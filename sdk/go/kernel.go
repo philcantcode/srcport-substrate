@@ -2,6 +2,7 @@ package substrate
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -77,9 +78,12 @@ type moduleSlot struct {
 }
 
 type runSlot struct {
-	run       *Run
-	claimed   map[string]*WorkItem
-	committed map[string]*Derivation
+	run         *Run
+	claimed     map[string]*WorkItem // keyed by WorkItem.Id
+	latest      map[string]*Derivation
+	doneUnits   map[string]bool
+	inputEpochs map[string]uint64
+	nodeCommits map[string]uint64
 }
 
 // blobKey is the blob store address: namespace + digest. Digest is content
@@ -651,18 +655,32 @@ func (k *MemoryKernel) StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, 
 	if req.Assembly == nil {
 		return nil, fmt.Errorf("%w: assembly is required", ErrInvalid)
 	}
-	if err := k.validateAssembly(req.Assembly, req.Inputs); err != nil {
+	assembly, err := materializeAssembly(req.Assembly, req.IncludeNodes)
+	if err != nil {
 		return nil, err
 	}
-	max := uint64(len(req.Assembly.Nodes))
+	if err := k.validateAssembly(assembly, req.Inputs); err != nil {
+		return nil, err
+	}
+	max := uint64(len(assembly.Nodes))
 	if req.Limits != nil && req.Limits.MaxSteps != 0 {
 		max = req.Limits.MaxSteps
 	}
 	if max == 0 {
 		return nil, fmt.Errorf("%w: max_steps must be positive", ErrInvalid)
 	}
-	run := &Run{Id: req.Id, Assembly: req.Assembly, Inputs: req.Inputs, State: RunStateRunning, MaxSteps: max}
-	k.runs[run.Id] = &runSlot{run: run, claimed: map[string]*WorkItem{}, committed: map[string]*Derivation{}}
+	epochs := map[string]uint64{}
+	for _, in := range req.Inputs {
+		epochs[in.Name] = 0
+	}
+	run := &Run{
+		Id: req.Id, Assembly: assembly, Inputs: req.Inputs,
+		State: RunStateRunning, MaxSteps: max, Policy: req.Policy,
+	}
+	k.runs[run.Id] = &runSlot{
+		run: run, claimed: map[string]*WorkItem{}, latest: map[string]*Derivation{},
+		doneUnits: map[string]bool{}, inputEpochs: epochs, nodeCommits: map[string]uint64{},
+	}
 	k.appendLocked("run.started", run.Id, marshalCanonical(run))
 	out := clone(run)
 	if key, ok := idempotencyKey("start_run", c); ok {
@@ -673,9 +691,58 @@ func (k *MemoryKernel) StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, 
 	return out, nil
 }
 
-// ClaimReady atomically claims one ready node for module. An empty WorkItem
-// means this module has no ready node. If no work exists anywhere, the run is
-// closed as STALLED.
+// InjectInput admits or replaces a named run input while RUNNING.
+func (k *MemoryKernel) InjectInput(req *InjectInputRequest, ctx ...*RequestContext) (*Run, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
+	req = clone(req)
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	slot, ok := k.runs[req.RunId]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, req.RunId)
+	}
+	if slot.run.State != RunStateRunning {
+		return nil, &RunClosedError{State: slot.run.State}
+	}
+	if req.Input == nil || req.Input.Name == "" {
+		return nil, fmt.Errorf("%w: input is required", ErrInvalid)
+	}
+	if req.Input.Artifact == nil {
+		return nil, fmt.Errorf("%w: input %s has no artifact", ErrInvalid, req.Input.Name)
+	}
+	if k.artifacts[req.Input.Artifact.Id] == nil {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, req.Input.Artifact.Id)
+	}
+	used := false
+	for _, b := range slot.run.Assembly.Bindings {
+		if b.Input == req.Input.Name {
+			used = true
+			break
+		}
+	}
+	if !used {
+		return nil, fmt.Errorf("%w: run input %s is not bound in the assembly", ErrInvalid, req.Input.Name)
+	}
+	found := false
+	for i, in := range slot.run.Inputs {
+		if in.Name == req.Input.Name {
+			slot.run.Inputs[i] = clone(req.Input)
+			found = true
+			break
+		}
+	}
+	if !found {
+		slot.run.Inputs = append(slot.run.Inputs, clone(req.Input))
+	}
+	slot.inputEpochs[req.Input.Name] = slot.inputEpochs[req.Input.Name] + 1
+	k.appendLocked("run.input_injected", slot.run.Id, marshalCanonical(req.Input))
+	return clone(slot.run), nil
+}
+
+// ClaimReady atomically claims one ready work unit for module. An empty WorkItem
+// means this module has no ready unit. Under default closure, idle graphs stall.
 func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*WorkItem, error) {
 	if err := checkDeadline(firstCtx(ctx)); err != nil {
 		return nil, err
@@ -691,26 +758,42 @@ func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*W
 	}
 	var selected *AssemblyNode
 	var selectedInputs []*NamedArtifact
+	var unitKey string
 	anyReady := false
 	for _, node := range slot.run.Assembly.Nodes {
-		if slot.claimed[node.Id] != nil || slot.committed[node.Id] != nil {
+		inputs, ready := resolveInputs(slot, node)
+		if !ready {
 			continue
 		}
-		inputs, ready := resolveInputs(slot, node)
-		if ready {
-			anyReady = true
-			if selected == nil && node.Module == req.Module {
-				selected, selectedInputs = node, inputs
-			}
+		cap, err := k.capabilityFor(node.Module, node.ModuleVersion, node.Capability)
+		if err != nil {
+			continue
+		}
+		firing := effectiveFiring(slot, node, cap)
+		key, ok := workUnitKey(slot, node, cap, firing, inputs)
+		if !ok || slot.doneUnits[key] {
+			continue
+		}
+		anyReady = true
+		if selected == nil && node.Module == req.Module {
+			selected, selectedInputs, unitKey = node, inputs, key
 		}
 	}
 	if selected != nil {
-		work := &WorkItem{Id: "work:" + req.RunId + "/" + selected.Id, RunId: req.RunId, NodeId: selected.Id, Module: selected.Module, ModuleVersion: selected.ModuleVersion, Capability: selected.Capability, Inputs: selectedInputs}
-		slot.claimed[selected.Id] = work
+		workID := "work:" + req.RunId + "/" + selected.Id
+		if !(len(unitKey) >= 5 && unitKey[:5] == "once:") {
+			workID = "work:" + req.RunId + "/" + unitKey
+		}
+		work := &WorkItem{
+			Id: workID, RunId: req.RunId, NodeId: selected.Id, Module: selected.Module,
+			ModuleVersion: selected.ModuleVersion, Capability: selected.Capability, Inputs: selectedInputs,
+		}
+		slot.doneUnits[unitKey] = true
+		slot.claimed[work.Id] = work
 		k.appendLocked("work.claimed", work.Id, marshalCanonical(work))
 		return clone(work), nil
 	}
-	if !anyReady && len(slot.claimed) == 0 {
+	if !anyReady && len(slot.claimed) == 0 && !isOpenClosure(slot) {
 		slot.run.State = RunStateStalled
 		slot.run.Reason = "no node is ready and no work is in flight"
 		k.appendLocked("run.stalled", slot.run.Id, marshalCanonical(slot.run))
@@ -719,8 +802,8 @@ func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*W
 }
 
 // Commit validates and records one production path, then releases downstream
-// nodes or closes the run when the declared terminal artifact appears.
-// Honour RequestContext deadline and request_key idempotency.
+// work or closes the run when the declared terminal artifact appears
+// (unless CLOSURE_OPEN). Honour RequestContext deadline and request_key idempotency.
 func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*Run, error) {
 	c := firstCtx(ctx)
 	if err := checkDeadline(c); err != nil {
@@ -741,12 +824,12 @@ func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*R
 	if slot.run.State != RunStateRunning {
 		return nil, &RunClosedError{State: slot.run.State}
 	}
-	work := slot.claimed[submitted.NodeId]
+	work := slot.claimed[submitted.WorkId]
 	if work == nil {
-		return nil, fmt.Errorf("%w: node was not claimed", ErrConflict)
+		return nil, fmt.Errorf("%w: work was not claimed", ErrConflict)
 	}
-	if submitted.WorkId != work.Id {
-		return nil, fmt.Errorf("%w: work_id does not match the claim", ErrInvalid)
+	if submitted.NodeId != "" && submitted.NodeId != work.NodeId {
+		return nil, fmt.Errorf("%w: node_id does not match the claim", ErrInvalid)
 	}
 	cap, err := k.capabilityFor(work.Module, work.ModuleVersion, work.Capability)
 	if err != nil {
@@ -755,19 +838,27 @@ func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*R
 	if err := k.validateOutputs(cap, submitted.Outputs); err != nil {
 		return nil, err
 	}
-	d := &Derivation{RunId: work.RunId, WorkId: work.Id, NodeId: work.NodeId, Module: work.Module, ModuleVersion: work.ModuleVersion, Capability: work.Capability, Inputs: cloneNamed(work.Inputs), Outputs: submitted.Outputs}
+	d := &Derivation{
+		RunId: work.RunId, WorkId: work.Id, NodeId: work.NodeId, Module: work.Module,
+		ModuleVersion: work.ModuleVersion, Capability: work.Capability,
+		Inputs: cloneNamed(work.Inputs), Outputs: submitted.Outputs,
+	}
 	d.Id = derivationID(d)
-	delete(slot.claimed, work.NodeId)
-	slot.committed[work.NodeId] = d
+	delete(slot.claimed, work.Id)
+	slot.latest[work.NodeId] = d
+	slot.nodeCommits[work.NodeId]++
 	slot.run.Steps++
 	closed := false
+	open := isOpenClosure(slot)
 	terminal := slot.run.Assembly.Terminal
 	if terminal.Node == work.NodeId {
 		for _, output := range d.Outputs {
 			if output.Name == terminal.Port {
 				slot.run.Answer = clone(output.Artifact)
-				slot.run.State = RunStateCompleted
-				closed = true
+				if !open {
+					slot.run.State = RunStateCompleted
+					closed = true
+				}
 				break
 			}
 		}
@@ -777,17 +868,8 @@ func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*R
 		slot.run.Reason = "max_steps exhausted before the terminal output"
 		closed = true
 	}
-	if !closed {
-		anyReady := false
-		for _, node := range slot.run.Assembly.Nodes {
-			if slot.claimed[node.Id] == nil && slot.committed[node.Id] == nil {
-				if _, ready := resolveInputs(slot, node); ready {
-					anyReady = true
-					break
-				}
-			}
-		}
-		if !anyReady && len(slot.claimed) == 0 {
+	if !closed && !open {
+		if !k.assemblyAnyReady(slot) && len(slot.claimed) == 0 {
 			slot.run.State = RunStateStalled
 			slot.run.Reason = "no node is ready and no work is in flight"
 			closed = true
@@ -1042,6 +1124,184 @@ func (k *MemoryKernel) validateAssembly(a *Assembly, inputs []*NamedArtifact) er
 	return nil
 }
 
+func materializeAssembly(a *Assembly, include []string) (*Assembly, error) {
+	if len(include) == 0 {
+		return a, nil
+	}
+	want := map[string]bool{}
+	for _, id := range include {
+		if want[id] {
+			return nil, fmt.Errorf("%w: include_nodes contains duplicates", ErrInvalid)
+		}
+		want[id] = true
+	}
+	known := map[string]bool{}
+	for _, n := range a.Nodes {
+		known[n.Id] = true
+	}
+	for id := range want {
+		if !known[id] {
+			return nil, fmt.Errorf("%w: include_nodes references unknown node %s", ErrInvalid, id)
+		}
+	}
+	if a.Terminal == nil || !want[a.Terminal.Node] {
+		return nil, fmt.Errorf("%w: include_nodes must retain the terminal node", ErrInvalid)
+	}
+	out := &Assembly{Id: a.Id, Terminal: a.Terminal}
+	for _, n := range a.Nodes {
+		if want[n.Id] {
+			out.Nodes = append(out.Nodes, n)
+		}
+	}
+	for _, b := range a.Bindings {
+		if !want[b.ToNode] {
+			continue
+		}
+		if b.Input == "" && !want[b.FromNode] {
+			continue
+		}
+		out.Bindings = append(out.Bindings, b)
+	}
+	return out, nil
+}
+
+func isOpenClosure(slot *runSlot) bool {
+	return slot.run.Policy != nil && slot.run.Policy.Closure == ClosureOpen
+}
+
+func effectiveFiring(slot *runSlot, node *AssemblyNode, cap *Capability) Firing {
+	if slot.run.Policy != nil {
+		if f, ok := slot.run.Policy.ByNode[node.Id]; ok && f != FiringUnspecified {
+			return f
+		}
+	}
+	if cap.Firing != FiringUnspecified {
+		return cap.Firing
+	}
+	if slot.run.Policy != nil && slot.run.Policy.Default != FiringUnspecified {
+		return slot.run.Policy.Default
+	}
+	return FiringOnce
+}
+
+func workUnitKey(slot *runSlot, node *AssemblyNode, cap *Capability, firing Firing, inputs []*NamedArtifact) (string, bool) {
+	switch firing {
+	case FiringAlways:
+		fp, ok := deliveryFingerprint(slot, node, inputs)
+		if !ok {
+			return "", false
+		}
+		return "always:" + node.Id + ":" + fp, true
+	case FiringOncePerKey:
+		return "key:" + node.Id + ":" + inputKey(cap, inputs), true
+	default:
+		return "once:" + node.Id, true
+	}
+}
+
+func inputKey(cap *Capability, inputs []*NamedArtifact) string {
+	marked := map[string]bool{}
+	for _, p := range cap.Inputs {
+		if p.Key {
+			marked[p.Name] = true
+		}
+	}
+	type pair struct{ name, id string }
+	var pairs []pair
+	for _, in := range inputs {
+		if in.Artifact == nil {
+			continue
+		}
+		if len(marked) == 0 || marked[in.Name] {
+			pairs = append(pairs, pair{in.Name, in.Artifact.Id})
+		}
+	}
+	// sort by name
+	for i := 0; i < len(pairs); i++ {
+		for j := i + 1; j < len(pairs); j++ {
+			if pairs[j].name < pairs[i].name {
+				pairs[i], pairs[j] = pairs[j], pairs[i]
+			}
+		}
+	}
+	h := sha256.New()
+	for _, p := range pairs {
+		h.Write([]byte(p.name))
+		h.Write([]byte{0})
+		h.Write([]byte(p.id))
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func deliveryFingerprint(slot *runSlot, node *AssemblyNode, inputs []*NamedArtifact) (string, bool) {
+	type row struct {
+		port, id string
+		epoch    uint64
+	}
+	var rows []row
+	for _, b := range slot.run.Assembly.Bindings {
+		if b.ToNode != node.Id {
+			continue
+		}
+		var art *NamedArtifact
+		for _, in := range inputs {
+			if in.Name == b.ToPort {
+				art = in
+				break
+			}
+		}
+		if art == nil || art.Artifact == nil {
+			return "", false
+		}
+		var epoch uint64
+		if b.Input != "" {
+			epoch = slot.inputEpochs[b.Input]
+		} else {
+			epoch = slot.nodeCommits[b.FromNode]
+		}
+		rows = append(rows, row{b.ToPort, art.Artifact.Id, epoch})
+	}
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			if rows[j].port < rows[i].port {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
+		}
+	}
+	h := sha256.New()
+	for _, r := range rows {
+		h.Write([]byte(r.port))
+		h.Write([]byte{0})
+		h.Write([]byte(r.id))
+		h.Write([]byte{0})
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], r.epoch)
+		h.Write(buf[:])
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), true
+}
+
+func (k *MemoryKernel) assemblyAnyReady(slot *runSlot) bool {
+	for _, node := range slot.run.Assembly.Nodes {
+		inputs, ready := resolveInputs(slot, node)
+		if !ready {
+			continue
+		}
+		cap, err := k.capabilityFor(node.Module, node.ModuleVersion, node.Capability)
+		if err != nil {
+			continue
+		}
+		firing := effectiveFiring(slot, node, cap)
+		key, ok := workUnitKey(slot, node, cap, firing, inputs)
+		if ok && !slot.doneUnits[key] {
+			return true
+		}
+	}
+	return false
+}
+
 func resolveInputs(slot *runSlot, node *AssemblyNode) ([]*NamedArtifact, bool) {
 	var out []*NamedArtifact
 	for _, b := range slot.run.Assembly.Bindings {
@@ -1056,7 +1316,7 @@ func resolveInputs(slot *runSlot, node *AssemblyNode) ([]*NamedArtifact, bool) {
 					break
 				}
 			}
-		} else if d := slot.committed[b.FromNode]; d != nil {
+		} else if d := slot.latest[b.FromNode]; d != nil {
 			for _, output := range d.Outputs {
 				if output.Name == b.FromPort {
 					ref = output.Artifact

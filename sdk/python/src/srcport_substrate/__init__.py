@@ -1,4 +1,4 @@
-"""srcport-substrate — Python SDK (v1.0.0, in-process).
+"""srcport-substrate — Python SDK (v1.1.0, in-process).
 
 One pluggable core: seven primitives (Module · Artifact · Contract · Event ·
 Ledger · Registry · Run) and one Kernel ABI, conformant to SPEC.md.
@@ -30,15 +30,19 @@ from ._types import (
     BlobRef,
     Capability,
     ClaimRequest,
+    Closure,
     Contract,
     Derivation,
     DerivationList,
     Error,
     ErrorCode,
     Event,
+    ExecutionPolicy,
+    Firing,
     GetBlobRequest,
     HasBlobRequest,
     HasBlobResponse,
+    InjectInputRequest,
     LedgerEntry,
     Lifecycle,
     Limits,
@@ -74,7 +78,7 @@ from ._types import (
     verify_chain,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "MemoryKernel",
@@ -119,6 +123,10 @@ __all__ = [
     "RunRequest",
     "Run",
     "RunRef",
+    "InjectInputRequest",
+    "ExecutionPolicy",
+    "Firing",
+    "Closure",
     "ClaimRequest",
     "WorkItem",
     "Derivation",

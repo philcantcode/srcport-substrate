@@ -1,4 +1,4 @@
-# srcport-substrate — Specification v1.0.0
+# srcport-substrate — Specification v1.1.0
 
 One canonical contract for every future project. Domain-neutral. Small enough
 to hold in your head. This document and [`substrate.proto`](contracts/proto/srcport/substrate/v1/substrate.proto)
@@ -70,21 +70,21 @@ trusted; modules and host processes are not principals the kernel polices.
 
 | # | Primitive | Message(s) | Invariant the kernel guarantees |
 |---|-----------|------------|---------------------------------|
-| 1 | **Module** | `ModuleManifest`, `Capability`, `Port`, `Lifecycle`, `TransitionRequest` | A module is a self-contained vertical slice. Capabilities declare typed input/output **ports** (the only I/O typing). `requires` is a boot/load **availability hint only** — never run dataflow; the kernel does not gate `LOADED` or `ClaimReady` on it. Lifecycle moves through `REGISTERED → LOADED → ACTIVE → DEACTIVATED` via `Transition` (one forward step at a time) and the module never imports another module. |
+| 1 | **Module** | `ModuleManifest`, `Capability`, `Port`, `Lifecycle`, `TransitionRequest` | A module is a self-contained vertical slice. Capabilities declare typed input/output **ports** (the only I/O typing) and a default **`Firing`** policy (`ONCE` / `ALWAYS` / `ONCE_PER_KEY`). Ports may mark `key` for uniqueness identity (artifact ids only). `requires` is a boot/load **availability hint only** — never run dataflow; the kernel does not gate `LOADED` or `ClaimReady` on it. Lifecycle moves through `REGISTERED → LOADED → ACTIVE → DEACTIVATED` via `Transition` (one forward step at a time) and the module never imports another module. |
 | 2 | **Artifact** | `Artifact`, `ArtifactRef`, `ObjectRef`, `BlobRef` | Typed, content-addressed, **immutable**. Value identity and blob identity are distinct. **Inline (small):** `id = H(type ‖ 0x00 ‖ body)`. **External (large):** `id = H(type ‖ 0x00 ‖ object_ref_bytes(object))` where `object_ref_bytes = digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace`. **Blob identity** is pure content: `digest = "sha256:" + hex(sha256(data))`. Same value ⇒ same artifact id; any change ⇒ a new id. Large blobs live in the content-addressed blob store; artifacts hold a verified `ObjectRef` without copying bytes. Production provenance lives **only** in separate `Derivation` records — not on the Artifact. |
 | 3 | **Contract** | `Contract`, `Port.contract`, `Artifact.type`, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to a contract **identity** (`ref` pinned to a content `digest`), never to each other's code. Ports (and artifact/event types) name the ref. Registration is **immutable**: same ref + different content ⇒ conflict. |
 | 4 | **Event** | `Event`, `Subscription` | Modules publish to topics and subscribe to topics; they never call each other directly. Every event gets a monotonic `seq` — a **total order** within the kernel. **Artifact refs are the data plane** (`Event.artifacts`); the bus never carries domain value bytes. |
 | 5 | **Ledger** | `LedgerEntry` | Append-only and **hash-chained**. Each entry commits to the previous entry's hash, so the whole history is tamper-evident and fully agent-observable. Every meaningful kernel action writes one entry. |
 | 6 | **Registry** | `RegistrySnapshot` | Discovery. At any moment you can ask the kernel what modules, capabilities, and contracts exist. This is the "what systems are here?" answer, always available. |
-| 7 | **Run** | `Assembly`, `Run`, `WorkItem`, `Derivation` | Convergence. A finite, acyclic, version-pinned assembly connects typed capability ports and names exactly one terminal output. A run executes each node at most once and terminates as `COMPLETED`, `STALLED`, `FAILED`, or `CANCELLED`. |
+| 7 | **Run** | `Assembly`, `Run`, `WorkItem`, `Derivation`, `ExecutionPolicy`, `InjectInputRequest` | Convergence / bounded multi-fire. A finite, acyclic, version-pinned assembly connects typed capability ports and names exactly one terminal output. A run may restrict nodes (`include_nodes`), freeze an `ExecutionPolicy`, and admit further inputs via `InjectInput`. Each **work unit** is claimed and committed at most once; firing policy is module-default with optional run override. Terminates as `COMPLETED`, `STALLED`, `FAILED`, or `CANCELLED`. |
 
 ### The Kernel ABI
 
 `substrate.proto` also defines one `service Kernel` — the seam every SDK
 implements. It is the union of the operations above (`Register`, `Transition`,
 `PutArtifact`, `GetArtifact`, `PutBlob`, `GetBlob`, `HasBlob`, `PutContract`,
-`Publish`, `Subscribe`, `Append`, `Snapshot`, `StartRun`, `ClaimReady`,
-`Commit`, `GetRun`, `CancelRun`, `ListDerivations`). An SDK MAY realise it
+`Publish`, `Subscribe`, `Append`, `Snapshot`, `StartRun`, `InjectInput`,
+`ClaimReady`, `Commit`, `GetRun`, `CancelRun`, `ListDerivations`). An SDK MAY realise it
 in-process (methods mirroring these RPCs) or over the wire (gRPC) — the
 *invariants* are identical either way. Modules see only the kernel; they never
 see each other.
@@ -208,6 +208,7 @@ because `detail` is folded into the entry hash.
 | `blob.put` | `BlobRef` (no data bytes) |
 | `event.published` | `Event` (artifact refs are the data plane; no domain value body) |
 | `run.started`, `run.{progressed,completed,stalled,failed,cancelled}` | `Run` |
+| `run.input_injected` | `NamedArtifact` |
 | `work.claimed` | `WorkItem` |
 | `derivation.committed` | `Derivation` |
 | module `Append` | opaque, module-owned bytes (the kernel never interprets them) |
@@ -249,17 +250,42 @@ change to chain verification.
 - Every required input port has a binding. Multiple bindings require a port
   explicitly marked `multiple`; unbound ports must be explicitly `optional`.
 - Bindings must preserve contract refs. The kernel never parses domain bodies.
-- Assemblies are acyclic. Iteration requires a future bounded primitive with an
-  explicit fixed-point rule, never an accidental event loop.
-- A node is claimed and committed at most once per run. A commit records exact
-  input and output artifact refs in a separate immutable `Derivation`.
+- Assemblies are acyclic. Multi-fire is a **work-unit** schedule over time, never
+  a cycle edge in the assembly graph.
+- **Work units, not bare nodes.** A work unit is claimed and committed at most
+  once per run. Identity depends on effective `Firing`:
+  - `ONCE` (default): one unit per node.
+  - `ONCE_PER_KEY`: one unit per `(node, input_key)` where
+    `input_key = H(port_name ‖ artifact_id…)` over input ports with `key=true`
+    (or all inputs if none are marked).
+  - `ALWAYS`: one unit per `(node, delivery_fingerprint)` where the fingerprint
+    folds input artifact ids and source delivery generations (run-input inject
+    epoch or upstream commit count). Re-injecting the same artifact id still
+    bumps generation and may re-fire; after commit, stable inputs do not busy-loop.
+- Effective firing for a node: `ExecutionPolicy.by_node[node]` if set, else the
+  capability's `firing` from `Register`, else `ExecutionPolicy.default`, else
+  `ONCE`.
+- `include_nodes` (optional on `RunRequest`): if non-empty, only those nodes and
+  bindings wholly within them remain; the terminal must remain. Validated as a
+  normal assembly after filtering.
+- `InjectInput` replaces/sets a named run input while `RUNNING`. The name must
+  appear as a `Binding.input` in the frozen assembly. Each inject bumps that
+  input's delivery generation (ledger kind `run.input_injected`).
+- A commit records exact input and output artifact refs in a separate immutable
+  `Derivation`. Downstream readiness uses the **latest** committed derivation
+  per upstream node.
 - Artifact identity remains the typed value: `(type, body)` when inline, or
   `(type, object_ref_bytes(object))` when external. Equal values share one
   address while distinct derivations remain separately observable. Blob identity
   (`digest` of raw bytes) is separate and lives in the blob store.
-- The terminal output yields `COMPLETED`; no ready or in-flight node yields
-  `STALLED`; exhausting `max_steps` yields `FAILED`. Terminal runs accept no
-  further claims or commits.
+- **Closure** (`ExecutionPolicy.closure`):
+  - `FIRST_TERMINAL` (default / unspecified): terminal output → `COMPLETED`;
+    no ready or in-flight work unit → `STALLED`; `max_steps` exhausted →
+    `FAILED`.
+  - `OPEN`: terminal output records `answer` but the run stays `RUNNING`; no
+    auto-stall when idle (wait for inject/cancel); `max_steps` → `FAILED`;
+    `CancelRun` → `CANCELLED`.
+- Terminal runs accept no further claims, commits, or injects.
 
 ---
 
@@ -291,11 +317,15 @@ Within a major version, evolution is by **addition**, never by mutation:
 ### Versioning
 
 - `v0.x` — pre-stable drafts (`v0.1.0` Rust-only; `v0.1.1` three SDKs + runs).
-- **`v1.0.0`** — the first **stable** line (this document). The seven primitives,
-  blob store, immutable contract identity, `RequestContext` / portable `Error`,
-  and the `KernelApi` / `MemoryKernel` split. From this tag on, the evolution
-  rules above and the breaking-change check are law. Projects pin an exact
-  version and upgrade deliberately.
+- **`v1.0.0`** — the first **stable** line. The seven primitives, blob store,
+  immutable contract identity, `RequestContext` / portable `Error`, and the
+  `KernelApi` / `MemoryKernel` split. From this tag on, the evolution rules
+  above and the breaking-change check are law. Projects pin an exact version
+  and upgrade deliberately.
+- **`v1.1.0`** — additive run-mode surface: `Firing` / `Port.key` on modules,
+  `ExecutionPolicy` + `include_nodes` on runs, `InjectInput`, work-unit claim
+  identity (`ONCE` / `ALWAYS` / `ONCE_PER_KEY`), and `Closure` (`FIRST_TERMINAL`
+  vs `OPEN`). Default paths preserve v1.0 converge semantics.
 
 ---
 
@@ -331,10 +361,17 @@ The minimal conformance suite (each SDK ships it) is:
    the mirror of #1 — a change that preserves the typed value must preserve the
    address.) Provenance is a `Derivation`, never part of artifact identity.
 8. **Feed-forward convergence** — downstream work is unavailable until every
-   typed binding resolves; fan-in supplies the complete input set; the declared
-   terminal artifact closes the run and a closed run cannot reopen.
+   typed binding resolves; fan-in supplies the complete input set; under default
+   `FIRST_TERMINAL` closure the declared terminal artifact closes the run and a
+   closed run cannot reopen.
 9. **Structural termination** — cycles and invalid bindings are rejected;
-    exhausted work becomes `STALLED`, and `max_steps` bounds committed work.
+    exhausted work becomes `STALLED` (unless `CLOSURE_OPEN`), and `max_steps`
+    bounds committed work units.
+12. **Work-unit firing** — default `ONCE` matches v1.0 (one claim/commit per
+    node). `ONCE_PER_KEY` suppresses duplicate keys within a run. `ALWAYS`
+    re-fires when delivery generation changes (including re-inject of the same
+    artifact). Module `Capability.firing` + `Port.key` are honoured; run policy
+    may override. `include_nodes` materialises a valid subset assembly.
 10. **Derivation preservation** — value-equal artifacts share an address while
     distinct production paths remain separately committed and observable.
 11. **Production artifact boundary** — small values inline in `Artifact.body`;

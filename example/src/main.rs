@@ -75,7 +75,8 @@ fn main() {
                 name: "facts.extract".into(),
                 inputs: vec![port("question", "demo.v1.Question")],
                 outputs: vec![port("facts", "demo.v1.Facts")],
-            }],
+            ..Default::default()
+        }],
             ..Default::default()
         },
         &ctx,
@@ -88,6 +89,7 @@ fn main() {
             name: "sources.retrieve".into(),
             inputs: vec![port("question", "demo.v1.Question")],
             outputs: vec![port("sources", "demo.v1.Sources")],
+            ..Default::default()
         }],
         ..Default::default()
     });
@@ -103,6 +105,7 @@ fn main() {
                 port("sources", "demo.v1.Sources"),
             ],
             outputs: vec![port("answer", "demo.v1.Answer")],
+            ..Default::default()
         }],
         ..Default::default()
     });
