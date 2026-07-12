@@ -75,10 +75,22 @@ never blocks). Values handed in and out are cloned, so a caller can never mutate
 stored state through a shared pointer. The `Kernel` is safe for concurrent use
 across goroutines.
 
+## Convergent runs
+
+A human-owned `Assembly` pins module versions, binds typed capability ports, and
+names exactly one terminal output; `StartRun` freezes it over immutable input
+artifacts. Workers `ClaimReady` their exact typed inputs and `Commit` a
+`Derivation` per node; the declared terminal artifact closes the run, and
+`ListDerivations` reads back every distinct production path. For a complete,
+tested walkthrough see `TestRunFeedsForwardAndClosesOnTerminalAnswer` in
+[`conformance_test.go`](conformance_test.go).
+
 ## Conformance
 
-The six invariants from `SPEC.md` §Conformance are proven in
-[`conformance_test.go`](conformance_test.go):
+All eleven invariants from `SPEC.md` §Conformance are proven in
+[`conformance_test.go`](conformance_test.go) — including feed-forward
+convergence, structural termination, and derivation preservation, plus canonical
+ledger reconstruction cross-verified against the shared known-answer chain hash:
 
 ```sh
 go test ./...

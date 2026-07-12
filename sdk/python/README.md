@@ -64,10 +64,23 @@ The `Kernel` methods mirror the `service Kernel` RPCs one-for-one.
 `subscribe()` returns a `queue.Queue[Event]` as the in-process "stream"; events
 arrive in kernel `seq` order. The `Kernel` is thread-safe.
 
+## Convergent runs
+
+A human-owned `Assembly` pins module versions, binds typed capability ports, and
+names exactly one terminal output; `start_run` freezes it over immutable input
+artifacts. Workers `claim_ready` their exact typed inputs and `commit` a
+`Derivation` per node; the declared terminal artifact closes the run, and
+`list_derivations` reads back every distinct production path. For a complete,
+tested walkthrough see `test_run_feeds_forward_and_closes_on_terminal_answer` in
+[`tests/test_conformance.py`](tests/test_conformance.py).
+
 ## Conformance
 
-The six invariants from `SPEC.md` §Conformance are proven in
-[`tests/test_conformance.py`](tests/test_conformance.py), using only the stdlib:
+All eleven invariants from `SPEC.md` §Conformance are proven in
+[`tests/test_conformance.py`](tests/test_conformance.py), using only the stdlib
+— including feed-forward convergence, structural termination, and derivation
+preservation, plus canonical ledger reconstruction cross-verified against the
+shared known-answer chain hash:
 
 ```sh
 PYTHONPATH=src python -m unittest discover -s tests -v

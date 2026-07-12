@@ -24,6 +24,7 @@ kernel.register(ModuleManifest {
     provides: vec![Capability {
         name: "recon.scan".into(),
         contract: "acme.recon.v1.Host".into(),
+        ..Default::default()
     }],
     requires: vec![],
 });
@@ -59,23 +60,28 @@ let snapshot = kernel.snapshot();
 
 The `Kernel` methods mirror the `service Kernel` RPCs one-for-one
 (`register`, `put_artifact`, `get_artifact`, `publish`, `subscribe`, `append`,
-`request_gate`, `decide_gate`, `await_gate`, `snapshot`). `subscribe` returns an
-mpsc `Receiver<Event>` as the in-process "stream". The `Kernel` is `Send + Sync`
-— share it across module threads behind an `Arc`.
+`request_gate`, `decide_gate`, `await_gate`, `snapshot`, and the convergent-run
+methods `start_run`, `claim_ready`, `commit`, `get_run`, `cancel_run`,
+`list_derivations`). `subscribe` returns an mpsc `Receiver<Event>` as the
+in-process "stream". The `Kernel` is `Send + Sync` — share it across module
+threads behind an `Arc`.
+
+## Convergent runs
+
+A human-owned `Assembly` pins module versions, binds typed capability ports, and
+names exactly one terminal output; `start_run` freezes it over immutable input
+artifacts. Workers `claim_ready` their exact typed inputs and `commit` a
+`Derivation` per node; the declared terminal artifact closes the run, and
+`list_derivations` reads back every distinct production path. For a complete,
+tested walkthrough see `run_feeds_forward_and_closes_on_its_terminal_answer` in
+[`tests/conformance.rs`](tests/conformance.rs).
 
 ## Conformance
 
-The six invariants from `SPEC.md` §Conformance are proven in
-[`tests/conformance.rs`](tests/conformance.rs):
-
-| # | Invariant | Test |
-|---|-----------|------|
-| 1 | Addressing is content-derived & metamorphic | `addressing_is_content_derived_and_metamorphic` |
-| 2 | Artifacts are immutable | `artifacts_are_immutable` |
-| 3 | Events are ordered & isolated | `events_are_ordered_and_isolated` |
-| 4 | Ledger is tamper-evident | `ledger_is_tamper_evident` |
-| 5 | Gates are non-bypassable | `gates_are_non_bypassable` (+ `await_gate_blocks_until_decided`) |
-| 6 | Registry reports everything | `registry_reports_everything` |
+All eleven invariants from `SPEC.md` §Conformance are proven in
+[`tests/conformance.rs`](tests/conformance.rs) — including feed-forward
+convergence, structural termination, and derivation preservation, plus canonical
+ledger reconstruction cross-verified against the shared known-answer chain hash:
 
 ```sh
 cargo test        # runs the conformance suite
