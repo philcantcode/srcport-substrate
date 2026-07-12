@@ -1,4 +1,6 @@
-# Rust SDK build output (added once sdk/rust exists)
+# Rust build output. With the root workspace, target/ lives at the repo root;
+# the sdk/* entry covers standalone builds inside a crate dir.
+/target/
 /sdk/*/target/
 
 # buf
