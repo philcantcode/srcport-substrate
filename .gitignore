@@ -1,6 +1,11 @@
 # Rust build output. Each SDK crate under sdk/* builds standalone.
 /sdk/*/target/
 
+# Python build/test noise
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
 # buf
 buf.lock
 

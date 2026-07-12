@@ -37,8 +37,15 @@ srcport-substrate/
   buf.yaml                                 # lint + breaking-change CI
   contracts/proto/srcport/substrate/v1/
     substrate.proto                        # THE contract
-  sdk/                                     # (later) rust/, then others — each conforms to SPEC.md
+  sdk/                                     # each conforms to SPEC.md
+    rust/                                  # in-process Rust SDK (types generated from the proto)
+    go/                                    # in-process Go SDK (stdlib only)
+    python/                                # in-process Python SDK (stdlib only)
 ```
+
+Every SDK realises the same `Kernel` ABI in-process and ships the same
+six-test conformance suite. As a cross-check, all three produce byte-identical
+artifact addresses for the same `(type, body)` — the spec's addressing rule.
 
 ## License
 
