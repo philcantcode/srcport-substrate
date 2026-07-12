@@ -81,7 +81,10 @@ fn artifacts_are_immutable() {
 
     let after = k.get_artifact(&r).unwrap();
     assert_eq!(after.meta.get("first").map(String::as_str), Some("true"));
-    assert!(!after.meta.contains_key("sneaky"), "stored value was not mutated");
+    assert!(
+        !after.meta.contains_key("sneaky"),
+        "stored value was not mutated"
+    );
 }
 
 // 3. ORDERING & ISOLATION — events reach exactly their subscribers, in seq
@@ -135,7 +138,10 @@ fn events_are_ordered_and_isolated() {
     // ...and subscriber B got exactly the one port event.
     let p = ports.try_recv().unwrap();
     assert_eq!(p.seq, s3);
-    assert!(ports.try_recv().is_err(), "B never received the host events");
+    assert!(
+        ports.try_recv().is_err(),
+        "B never received the host events"
+    );
 }
 
 // 4. LEDGER INTEGRITY — the chain verifies; tampering breaks verification.
@@ -171,7 +177,10 @@ fn ledger_is_tamper_evident() {
     // Even splicing an entry out is detected (seq / prev_hash linkage).
     let mut spliced = chain.clone();
     spliced.remove(1);
-    assert!(!verify_chain(&spliced), "removing an entry breaks the chain");
+    assert!(
+        !verify_chain(&spliced),
+        "removing an entry breaks the chain"
+    );
 }
 
 // 5. GATE NON-BYPASS — blocked while PENDING/REJECTED; permitted only APPROVED.
@@ -296,12 +305,18 @@ fn gate_request_and_decision_are_in_the_chain() {
     assert_eq!(dec.decided_by, "phil");
     assert_eq!(dec.reason, "reviewed the evidence");
 
-    assert!(k.verify_ledger(), "the chain with fat detail still verifies");
+    assert!(
+        k.verify_ledger(),
+        "the chain with fat detail still verifies"
+    );
 
     // The approval record is now hash-committed: forging who approved it (by
     // re-encoding a different decider into `detail`) breaks verification.
     let mut forged = chain.clone();
-    let idx = forged.iter().position(|e| e.kind == "gate.decided").unwrap();
+    let idx = forged
+        .iter()
+        .position(|e| e.kind == "gate.decided")
+        .unwrap();
     forged[idx].detail = GateDecision {
         request_id: t.request_id.clone(),
         decision: Decision::Approved as i32,
@@ -341,6 +356,7 @@ fn artifact_and_module_reconstruct_from_the_chain() {
         provides: vec![Capability {
             name: "recon.scan".into(),
             contract: "acme.recon.v1.ScanRequest".into(),
+            ..Default::default()
         }],
         requires: vec!["report.render".into()],
     });
@@ -360,10 +376,16 @@ fn artifact_and_module_reconstruct_from_the_chain() {
         vec!["sha256:parent-a".to_string(), "sha256:parent-b".to_string()],
         "derived_from lineage round-trips through the ledger"
     );
-    assert!(a.body.is_empty(), "body is cleared — the id already addresses it");
+    assert!(
+        a.body.is_empty(),
+        "body is cleared — the id already addresses it"
+    );
 
     // module.registered reconstructs the whole manifest.
-    let m_entry = chain.iter().find(|e| e.kind == "module.registered").unwrap();
+    let m_entry = chain
+        .iter()
+        .find(|e| e.kind == "module.registered")
+        .unwrap();
     let m = ModuleManifest::decode(&m_entry.detail[..]).unwrap();
     assert_eq!(m.name, "recon");
     assert_eq!(m.version, "0.1.0");
@@ -444,6 +466,7 @@ fn ledger_hash_known_answer_cross_sdk() {
         provides: vec![Capability {
             name: "recon.scan".into(),
             contract: "acme.recon.v1.ScanRequest".into(),
+            ..Default::default()
         }],
         requires: vec!["report.render".into()],
     });
@@ -491,6 +514,7 @@ fn registry_reports_everything() {
         provides: vec![Capability {
             name: "recon.scan".into(),
             contract: "acme.recon.v1.ScanRequest".into(),
+            ..Default::default()
         }],
         requires: vec![],
     });
@@ -500,6 +524,7 @@ fn registry_reports_everything() {
         provides: vec![Capability {
             name: "report.render".into(),
             contract: "acme.report.v1.Report".into(),
+            ..Default::default()
         }],
         requires: vec!["recon.scan".into()],
     });
@@ -515,4 +540,410 @@ fn registry_reports_everything() {
     let contracts: Vec<_> = snap.contracts.iter().map(|c| c.r#ref.as_str()).collect();
     assert!(contracts.contains(&"acme.recon.v1.ScanRequest"));
     assert!(contracts.contains(&"acme.report.v1.Report"));
+}
+
+// 9. CONVERGENCE — typed artifacts flow through a pinned finite assembly;
+// fan-in waits for all inputs, the terminal artifact closes the run, and a
+// closed run cannot be reopened.
+#[test]
+fn run_feeds_forward_and_closes_on_its_terminal_answer() {
+    let k = Kernel::new();
+    k.register(ModuleManifest {
+        name: "extractor".into(),
+        version: "1.0.0".into(),
+        provides: vec![Capability {
+            name: "facts.extract".into(),
+            inputs: vec![Port {
+                name: "question".into(),
+                contract: "demo.Question".into(),
+                ..Default::default()
+            }],
+            outputs: vec![Port {
+                name: "facts".into(),
+                contract: "demo.Facts".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.register(ModuleManifest {
+        name: "writer".into(),
+        version: "2.0.0".into(),
+        provides: vec![Capability {
+            name: "answer.write".into(),
+            inputs: vec![
+                Port {
+                    name: "question".into(),
+                    contract: "demo.Question".into(),
+                    ..Default::default()
+                },
+                Port {
+                    name: "facts".into(),
+                    contract: "demo.Facts".into(),
+                    ..Default::default()
+                },
+            ],
+            outputs: vec![Port {
+                name: "answer".into(),
+                contract: "demo.Answer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let question = k.put_artifact(Artifact {
+        r#type: "demo.Question".into(),
+        body: b"What follows?".to_vec(),
+        ..Default::default()
+    });
+    let assembly = Assembly {
+        id: "answer-pipeline@1".into(),
+        nodes: vec![
+            AssemblyNode {
+                id: "extract".into(),
+                module: "extractor".into(),
+                module_version: "1.0.0".into(),
+                capability: "facts.extract".into(),
+            },
+            AssemblyNode {
+                id: "write".into(),
+                module: "writer".into(),
+                module_version: "2.0.0".into(),
+                capability: "answer.write".into(),
+            },
+        ],
+        bindings: vec![
+            Binding {
+                to_node: "extract".into(),
+                to_port: "question".into(),
+                input: "question".into(),
+                ..Default::default()
+            },
+            Binding {
+                to_node: "write".into(),
+                to_port: "question".into(),
+                input: "question".into(),
+                ..Default::default()
+            },
+            Binding {
+                to_node: "write".into(),
+                to_port: "facts".into(),
+                from_node: "extract".into(),
+                from_port: "facts".into(),
+                ..Default::default()
+            },
+        ],
+        terminal: Some(NodeOutput {
+            node: "write".into(),
+            port: "answer".into(),
+        }),
+    };
+    let started = k
+        .start_run(RunRequest {
+            id: "run-1".into(),
+            assembly: Some(assembly),
+            inputs: vec![NamedArtifact {
+                name: "question".into(),
+                artifact: Some(question),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(started.state(), RunState::Running);
+
+    // Writer is not ready: its facts input has not been produced.
+    assert!(k
+        .claim_ready(ClaimRequest {
+            run_id: "run-1".into(),
+            module: "writer".into(),
+        })
+        .unwrap()
+        .id
+        .is_empty());
+    let extract = k
+        .claim_ready(ClaimRequest {
+            run_id: "run-1".into(),
+            module: "extractor".into(),
+        })
+        .unwrap();
+    let facts = k.put_artifact(Artifact {
+        r#type: "demo.Facts".into(),
+        body: b"typed flow".to_vec(),
+        ..Default::default()
+    });
+    let progressed = k
+        .commit(Derivation {
+            run_id: "run-1".into(),
+            work_id: extract.id,
+            node_id: extract.node_id,
+            outputs: vec![NamedArtifact {
+                name: "facts".into(),
+                artifact: Some(facts),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(progressed.state(), RunState::Running);
+
+    let write = k
+        .claim_ready(ClaimRequest {
+            run_id: "run-1".into(),
+            module: "writer".into(),
+        })
+        .unwrap();
+    assert_eq!(write.inputs.len(), 2, "fan-in supplies both typed inputs");
+    let answer = k.put_artifact(Artifact {
+        r#type: "demo.Answer".into(),
+        body: b"Modules converge.".to_vec(),
+        ..Default::default()
+    });
+    let completed = k
+        .commit(Derivation {
+            run_id: "run-1".into(),
+            work_id: write.id,
+            node_id: write.node_id,
+            outputs: vec![NamedArtifact {
+                name: "answer".into(),
+                artifact: Some(answer.clone()),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(completed.state(), RunState::Completed);
+    assert_eq!(completed.answer.unwrap().id, answer.id);
+    assert_eq!(
+        k.list_derivations(&RunRef { id: "run-1".into() })
+            .unwrap()
+            .derivations
+            .len(),
+        2
+    );
+    assert!(matches!(
+        k.claim_ready(ClaimRequest {
+            run_id: "run-1".into(),
+            module: "writer".into(),
+        }),
+        Err(KernelError::RunClosed(RunState::Completed))
+    ));
+}
+
+#[test]
+fn cyclic_assembly_is_rejected_before_it_can_expand_forever() {
+    let k = Kernel::new();
+    k.register(ModuleManifest {
+        name: "loop".into(),
+        version: "1.0.0".into(),
+        provides: vec![Capability {
+            name: "loop.step".into(),
+            inputs: vec![Port {
+                name: "in".into(),
+                contract: "demo.Value".into(),
+                optional: true,
+                ..Default::default()
+            }],
+            outputs: vec![Port {
+                name: "out".into(),
+                contract: "demo.Value".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let result = k.start_run(RunRequest {
+        id: "cycle".into(),
+        assembly: Some(Assembly {
+            id: "cycle@1".into(),
+            nodes: vec![
+                AssemblyNode {
+                    id: "a".into(),
+                    module: "loop".into(),
+                    module_version: "1.0.0".into(),
+                    capability: "loop.step".into(),
+                },
+                AssemblyNode {
+                    id: "b".into(),
+                    module: "loop".into(),
+                    module_version: "1.0.0".into(),
+                    capability: "loop.step".into(),
+                },
+            ],
+            bindings: vec![
+                Binding {
+                    to_node: "a".into(),
+                    to_port: "in".into(),
+                    from_node: "b".into(),
+                    from_port: "out".into(),
+                    ..Default::default()
+                },
+                Binding {
+                    to_node: "b".into(),
+                    to_port: "in".into(),
+                    from_node: "a".into(),
+                    from_port: "out".into(),
+                    ..Default::default()
+                },
+            ],
+            terminal: Some(NodeOutput {
+                node: "b".into(),
+                port: "out".into(),
+            }),
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(result, Err(KernelError::Invalid(reason)) if reason.contains("cycle")));
+}
+
+#[test]
+fn run_stalls_when_no_remaining_node_can_become_ready() {
+    let k = Kernel::new();
+    k.register(ModuleManifest {
+        name: "source".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "source.maybe".into(),
+            outputs: vec![Port {
+                name: "value".into(),
+                contract: "demo.Value".into(),
+                optional: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.register(ModuleManifest {
+        name: "sink".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "sink.answer".into(),
+            inputs: vec![Port {
+                name: "value".into(),
+                contract: "demo.Value".into(),
+                ..Default::default()
+            }],
+            outputs: vec![Port {
+                name: "answer".into(),
+                contract: "demo.Answer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.start_run(RunRequest {
+        id: "stall".into(),
+        assembly: Some(Assembly {
+            id: "stall@1".into(),
+            nodes: vec![
+                AssemblyNode {
+                    id: "source".into(),
+                    module: "source".into(),
+                    module_version: "1".into(),
+                    capability: "source.maybe".into(),
+                },
+                AssemblyNode {
+                    id: "sink".into(),
+                    module: "sink".into(),
+                    module_version: "1".into(),
+                    capability: "sink.answer".into(),
+                },
+            ],
+            bindings: vec![Binding {
+                to_node: "sink".into(),
+                to_port: "value".into(),
+                from_node: "source".into(),
+                from_port: "value".into(),
+                ..Default::default()
+            }],
+            terminal: Some(NodeOutput {
+                node: "sink".into(),
+                port: "answer".into(),
+            }),
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    let work = k
+        .claim_ready(ClaimRequest {
+            run_id: "stall".into(),
+            module: "source".into(),
+        })
+        .unwrap();
+    let stalled = k
+        .commit(Derivation {
+            run_id: "stall".into(),
+            work_id: work.id,
+            node_id: work.node_id,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(stalled.state(), RunState::Stalled);
+}
+
+#[test]
+fn convergent_run_hashes_match_every_sdk() {
+    const DERIVATION: &str =
+        "sha256:0e3e167112e6bb8f19d736de4592b72a2856cb494cc4dcb00fbcd5682d595cf6";
+    const LEDGER: &str = "faad7e3ce2d2e030cf37ff6001fe18f7dec0430ce14642f9ae878d66875bc28f";
+    let k = Kernel::new();
+    k.register(ModuleManifest {
+        name: "answerer".into(),
+        version: "1.0.0".into(),
+        provides: vec![Capability {
+            name: "answer.write".into(),
+            outputs: vec![Port {
+                name: "answer".into(),
+                contract: "demo.Answer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.start_run(RunRequest {
+        id: "parity".into(),
+        assembly: Some(Assembly {
+            id: "single@1".into(),
+            nodes: vec![AssemblyNode {
+                id: "answer".into(),
+                module: "answerer".into(),
+                module_version: "1.0.0".into(),
+                capability: "answer.write".into(),
+            }],
+            terminal: Some(NodeOutput {
+                node: "answer".into(),
+                port: "answer".into(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    let work = k
+        .claim_ready(ClaimRequest {
+            run_id: "parity".into(),
+            module: "answerer".into(),
+        })
+        .unwrap();
+    let answer = k.put_artifact(Artifact {
+        r#type: "demo.Answer".into(),
+        body: b"yes".to_vec(),
+        ..Default::default()
+    });
+    k.commit(Derivation {
+        run_id: "parity".into(),
+        work_id: work.id,
+        node_id: work.node_id,
+        outputs: vec![NamedArtifact {
+            name: "answer".into(),
+            artifact: Some(answer),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(k.derivations()[0].id, DERIVATION);
+    assert_eq!(k.ledger().last().unwrap().hash, LEDGER);
 }

@@ -1,6 +1,6 @@
 // Package substrate is the in-process Go SDK for the srcport-substrate
-// microkernel: seven primitives (Module · Artifact · Contract · Event ·
-// Ledger · Gate · Registry) and one Kernel ABI, conformant to SPEC.md.
+// microkernel: eight primitives (Module · Artifact · Contract · Event ·
+// Ledger · Gate · Registry · Run) and one Kernel ABI, conformant to SPEC.md.
 //
 // The message types are GENERATED from the canonical contract in
 // contracts/proto/srcport/substrate/v1/substrate.proto (see buf.gen.yaml and
@@ -17,7 +17,7 @@ import (
 	pb "github.com/philcantcode/srcport-substrate/sdk/go/internal/genpb/srcport/substrate/v1"
 )
 
-// ─── the seven primitives + ABI acks, aliased to the generated types ─────────
+// ─── the eight primitives + ABI acks, aliased to the generated types ────────
 // These ARE the protobuf messages; construct with a pointer, e.g.
 // &substrate.Artifact{Type: "…", Body: …}.
 
@@ -37,9 +37,34 @@ type (
 	RegisterAck      = pb.RegisterAck
 	PublishAck       = pb.PublishAck
 	AppendRequest    = pb.AppendRequest
+	Port             = pb.Port
+	NamedArtifact    = pb.NamedArtifact
+	AssemblyNode     = pb.AssemblyNode
+	Binding          = pb.Binding
+	NodeOutput       = pb.NodeOutput
+	Limits           = pb.Limits
+	Assembly         = pb.Assembly
+	RunRequest       = pb.RunRequest
+	Run              = pb.Run
+	RunRef           = pb.RunRef
+	ClaimRequest     = pb.ClaimRequest
+	WorkItem         = pb.WorkItem
+	Derivation       = pb.Derivation
+	DerivationList   = pb.DerivationList
 
 	Lifecycle = pb.Lifecycle
 	Decision  = pb.Decision
+	RunState  = pb.RunState
+)
+
+// Bounded run states.
+const (
+	RunStateUnspecified = pb.RunState_RUN_STATE_UNSPECIFIED
+	RunStateRunning     = pb.RunState_RUN_STATE_RUNNING
+	RunStateCompleted   = pb.RunState_RUN_STATE_COMPLETED
+	RunStateStalled     = pb.RunState_RUN_STATE_STALLED
+	RunStateFailed      = pb.RunState_RUN_STATE_FAILED
+	RunStateCancelled   = pb.RunState_RUN_STATE_CANCELLED
 )
 
 // Lifecycle values (REGISTERED → LOADED → ACTIVE → DEACTIVATED).

@@ -1,5 +1,5 @@
 // The minimal conformance suite from SPEC.md §Conformance. An SDK is
-// conformant iff all six pass. Each test names the invariant it pins down.
+// conformant iff all invariants pass. Each test names the invariant it pins down.
 package substrate
 
 import (
@@ -78,8 +78,8 @@ func TestArtifactsAreImmutable(t *testing.T) {
 	}
 }
 
-// 3. ORDERING & ISOLATION — events reach exactly their subscribers, in Seq
-//    order, and never reach non-subscribers.
+//  3. ORDERING & ISOLATION — events reach exactly their subscribers, in Seq
+//     order, and never reach non-subscribers.
 func TestEventsAreOrderedAndIsolated(t *testing.T) {
 	k := NewKernel()
 	hosts := k.Subscribe(&Subscription{Module: "a", Topics: []string{"recon.host.found"}})
@@ -244,6 +244,104 @@ func hasContract(cs []*Contract, ref string) bool {
 	return false
 }
 
+func TestRunFeedsForwardAndClosesOnTerminalAnswer(t *testing.T) {
+	k := NewKernel()
+	k.Register(&ModuleManifest{Name: "extractor", Version: "1.0.0", Provides: []*Capability{{Name: "facts.extract", Inputs: []*Port{{Name: "question", Contract: "demo.Question"}}, Outputs: []*Port{{Name: "facts", Contract: "demo.Facts"}}}}})
+	k.Register(&ModuleManifest{Name: "writer", Version: "2.0.0", Provides: []*Capability{{Name: "answer.write", Inputs: []*Port{{Name: "question", Contract: "demo.Question"}, {Name: "facts", Contract: "demo.Facts"}}, Outputs: []*Port{{Name: "answer", Contract: "demo.Answer"}}}}})
+	question := k.PutArtifact(&Artifact{Type: "demo.Question", Body: []byte("What follows?")})
+	assembly := &Assembly{
+		Id:       "answer-pipeline@1",
+		Nodes:    []*AssemblyNode{{Id: "extract", Module: "extractor", ModuleVersion: "1.0.0", Capability: "facts.extract"}, {Id: "write", Module: "writer", ModuleVersion: "2.0.0", Capability: "answer.write"}},
+		Bindings: []*Binding{{ToNode: "extract", ToPort: "question", Input: "question"}, {ToNode: "write", ToPort: "question", Input: "question"}, {ToNode: "write", ToPort: "facts", FromNode: "extract", FromPort: "facts"}},
+		Terminal: &NodeOutput{Node: "write", Port: "answer"},
+	}
+	run, err := k.StartRun(&RunRequest{Id: "run-1", Assembly: assembly, Inputs: []*NamedArtifact{{Name: "question", Artifact: question}}})
+	if err != nil || run.State != RunStateRunning {
+		t.Fatalf("start: run=%v err=%v", run, err)
+	}
+	if work, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "writer"}); err != nil || work.Id != "" {
+		t.Fatalf("writer must wait for fan-in: work=%v err=%v", work, err)
+	}
+	extract, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "extractor"})
+	if err != nil || extract.Id == "" {
+		t.Fatalf("extract claim: %v %v", extract, err)
+	}
+	facts := k.PutArtifact(&Artifact{Type: "demo.Facts", Body: []byte("typed flow")})
+	if _, err := k.Commit(&Derivation{RunId: "run-1", WorkId: extract.Id, NodeId: extract.NodeId, Outputs: []*NamedArtifact{{Name: "facts", Artifact: facts}}}); err != nil {
+		t.Fatal(err)
+	}
+	write, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "writer"})
+	if err != nil || len(write.Inputs) != 2 {
+		t.Fatalf("fan-in: work=%v err=%v", write, err)
+	}
+	answer := k.PutArtifact(&Artifact{Type: "demo.Answer", Body: []byte("Modules converge.")})
+	completed, err := k.Commit(&Derivation{RunId: "run-1", WorkId: write.Id, NodeId: write.NodeId, Outputs: []*NamedArtifact{{Name: "answer", Artifact: answer}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State != RunStateCompleted || completed.Answer.Id != answer.Id {
+		t.Fatalf("run did not converge: %v", completed)
+	}
+	paths, err := k.ListDerivations(&RunRef{Id: "run-1"})
+	if err != nil || len(paths.Derivations) != 2 {
+		t.Fatal("each production path must remain observable")
+	}
+	if _, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "writer"}); err == nil {
+		t.Fatal("completed run was reopened")
+	}
+}
+
+func TestCyclicAssemblyIsRejected(t *testing.T) {
+	k := NewKernel()
+	k.Register(&ModuleManifest{Name: "loop", Version: "1.0.0", Provides: []*Capability{{Name: "loop.step", Inputs: []*Port{{Name: "in", Contract: "demo.Value", Optional: true}}, Outputs: []*Port{{Name: "out", Contract: "demo.Value"}}}}})
+	_, err := k.StartRun(&RunRequest{Id: "cycle", Assembly: &Assembly{
+		Id:       "cycle@1",
+		Nodes:    []*AssemblyNode{{Id: "a", Module: "loop", ModuleVersion: "1.0.0", Capability: "loop.step"}, {Id: "b", Module: "loop", ModuleVersion: "1.0.0", Capability: "loop.step"}},
+		Bindings: []*Binding{{ToNode: "a", ToPort: "in", FromNode: "b", FromPort: "out"}, {ToNode: "b", ToPort: "in", FromNode: "a", FromPort: "out"}}, Terminal: &NodeOutput{Node: "b", Port: "out"},
+	}})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cycle must be invalid, got %v", err)
+	}
+}
+
+func TestRunStallsWhenNoNodeCanBecomeReady(t *testing.T) {
+	k := NewKernel()
+	k.Register(&ModuleManifest{Name: "source", Version: "1", Provides: []*Capability{{Name: "source.maybe", Outputs: []*Port{{Name: "value", Contract: "demo.Value", Optional: true}}}}})
+	k.Register(&ModuleManifest{Name: "sink", Version: "1", Provides: []*Capability{{Name: "sink.answer", Inputs: []*Port{{Name: "value", Contract: "demo.Value"}}, Outputs: []*Port{{Name: "answer", Contract: "demo.Answer"}}}}})
+	_, err := k.StartRun(&RunRequest{Id: "stall", Assembly: &Assembly{Id: "stall@1", Nodes: []*AssemblyNode{{Id: "source", Module: "source", ModuleVersion: "1", Capability: "source.maybe"}, {Id: "sink", Module: "sink", ModuleVersion: "1", Capability: "sink.answer"}}, Bindings: []*Binding{{ToNode: "sink", ToPort: "value", FromNode: "source", FromPort: "value"}}, Terminal: &NodeOutput{Node: "sink", Port: "answer"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, err := k.ClaimReady(&ClaimRequest{RunId: "stall", Module: "source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := k.Commit(&Derivation{RunId: "stall", WorkId: work.Id, NodeId: work.NodeId})
+	if err != nil || run.State != RunStateStalled {
+		t.Fatalf("run must stall: run=%v err=%v", run, err)
+	}
+}
+
+func TestConvergentRunHashesMatchEverySDK(t *testing.T) {
+	k := NewKernel()
+	k.Register(&ModuleManifest{Name: "answerer", Version: "1.0.0", Provides: []*Capability{{Name: "answer.write", Outputs: []*Port{{Name: "answer", Contract: "demo.Answer"}}}}})
+	_, err := k.StartRun(&RunRequest{Id: "parity", Assembly: &Assembly{Id: "single@1", Nodes: []*AssemblyNode{{Id: "answer", Module: "answerer", ModuleVersion: "1.0.0", Capability: "answer.write"}}, Terminal: &NodeOutput{Node: "answer", Port: "answer"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	work, _ := k.ClaimReady(&ClaimRequest{RunId: "parity", Module: "answerer"})
+	answer := k.PutArtifact(&Artifact{Type: "demo.Answer", Body: []byte("yes")})
+	if _, err := k.Commit(&Derivation{RunId: "parity", WorkId: work.Id, NodeId: work.NodeId, Outputs: []*NamedArtifact{{Name: "answer", Artifact: answer}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := k.Derivations()[0].Id; got != "sha256:0e3e167112e6bb8f19d736de4592b72a2856cb494cc4dcb00fbcd5682d595cf6" {
+		t.Fatalf("derivation parity: %s", got)
+	}
+	if got := k.Ledger()[len(k.Ledger())-1].Hash; got != "faad7e3ce2d2e030cf37ff6001fe18f7dec0430ce14642f9ae878d66875bc28f" {
+		t.Fatalf("ledger parity: %s", got)
+	}
+}
+
 func findKind(chain []*LedgerEntry, kind string) *LedgerEntry {
 	for _, e := range chain {
 		if e.Kind == kind {
@@ -262,11 +360,11 @@ func indexKind(chain []*LedgerEntry, kind string) int {
 	return -1
 }
 
-// 7. LEDGER RECONSTRUCTION & CANONICAL DETAIL — a state-bearing entry's Detail
-//    decodes to the message named for its Kind and reproduces the original
-//    value, so the registry, the artifact store, and the approval record all
-//    round-trip from the tamper-evident chain alone. Detail is folded into the
-//    entry hash, so forging it breaks verification.
+//  7. LEDGER RECONSTRUCTION & CANONICAL DETAIL — a state-bearing entry's Detail
+//     decodes to the message named for its Kind and reproduces the original
+//     value, so the registry, the artifact store, and the approval record all
+//     round-trip from the tamper-evident chain alone. Detail is folded into the
+//     entry hash, so forging it breaks verification.
 func TestLedgerReconstructsStateFromDetail(t *testing.T) {
 	k := NewKernel()
 
@@ -354,9 +452,10 @@ func TestLedgerReconstructsStateFromDetail(t *testing.T) {
 }
 
 // 7c. CANONICAL DETAIL — the same logical value encodes to identical bytes every
-//     time, so ledger detail hashes reproducibly across runs and SDKs. Go map
-//     iteration is randomized; this pins that the kernel's canonical marshal
-//     (Deterministic: sorted keys) defeats it.
+//
+//	time, so ledger detail hashes reproducibly across runs and SDKs. Go map
+//	iteration is randomized; this pins that the kernel's canonical marshal
+//	(Deterministic: sorted keys) defeats it.
 func TestLedgerDetailEncodesCanonically(t *testing.T) {
 	build := func() []byte {
 		return marshalCanonical(&Artifact{

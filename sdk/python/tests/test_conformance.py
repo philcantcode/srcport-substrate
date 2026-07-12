@@ -1,5 +1,5 @@
 """The minimal conformance suite from SPEC.md §Conformance. An SDK is
-conformant iff all six pass. Runs with the stdlib: ``python -m unittest``.
+conformant iff all invariants pass. Runs with the stdlib: ``python -m unittest``.
 """
 
 import queue
@@ -9,14 +9,25 @@ import unittest
 from srcport_substrate import (
     AppendRequest,
     Artifact,
+    Assembly,
+    AssemblyNode,
+    Binding,
     Capability,
+    ClaimRequest,
     Decision,
+    Derivation,
     Event,
     GateBlocked,
     GateDecision,
     GateRequest,
     Kernel,
     ModuleManifest,
+    NamedArtifact,
+    NodeOutput,
+    Port,
+    RunRequest,
+    RunRef,
+    RunState,
     NotADecision,
     Subscription,
     artifact_id,
@@ -351,6 +362,180 @@ class Conformance(unittest.TestCase):
         chain = k.ledger()
         self.assertTrue(k.verify_ledger(), "the chain must verify")
         self.assertEqual(chain[-1].hash, want, "cross-SDK ledger hash drift")
+
+    def test_run_feeds_forward_and_closes_on_terminal_answer(self):
+        k = Kernel()
+        k.register(
+            ModuleManifest(
+                name="extractor",
+                version="1.0.0",
+                provides=[
+                    Capability(
+                        name="facts.extract",
+                        inputs=[Port(name="question", contract="demo.Question")],
+                        outputs=[Port(name="facts", contract="demo.Facts")],
+                    )
+                ],
+            )
+        )
+        k.register(
+            ModuleManifest(
+                name="writer",
+                version="2.0.0",
+                provides=[
+                    Capability(
+                        name="answer.write",
+                        inputs=[
+                            Port(name="question", contract="demo.Question"),
+                            Port(name="facts", contract="demo.Facts"),
+                        ],
+                        outputs=[Port(name="answer", contract="demo.Answer")],
+                    )
+                ],
+            )
+        )
+        question = k.put_artifact(
+            Artifact(type="demo.Question", body=b"What follows?")
+        )
+        assembly = Assembly(
+            id="answer-pipeline@1",
+            nodes=[
+                AssemblyNode(
+                    id="extract",
+                    module="extractor",
+                    module_version="1.0.0",
+                    capability="facts.extract",
+                ),
+                AssemblyNode(
+                    id="write",
+                    module="writer",
+                    module_version="2.0.0",
+                    capability="answer.write",
+                ),
+            ],
+            bindings=[
+                Binding(to_node="extract", to_port="question", input="question"),
+                Binding(to_node="write", to_port="question", input="question"),
+                Binding(
+                    to_node="write",
+                    to_port="facts",
+                    from_node="extract",
+                    from_port="facts",
+                ),
+            ],
+            terminal=NodeOutput(node="write", port="answer"),
+        )
+        run = k.start_run(
+            RunRequest(
+                id="run-1",
+                assembly=assembly,
+                inputs=[NamedArtifact(name="question", artifact=question)],
+            )
+        )
+        self.assertEqual(run.state, RunState.RUN_STATE_RUNNING)
+        self.assertFalse(
+            k.claim_ready(ClaimRequest(run_id="run-1", module="writer")).id
+        )
+        extract = k.claim_ready(
+            ClaimRequest(run_id="run-1", module="extractor")
+        )
+        facts = k.put_artifact(Artifact(type="demo.Facts", body=b"typed flow"))
+        k.commit(
+            Derivation(
+                run_id="run-1",
+                work_id=extract.id,
+                node_id=extract.node_id,
+                outputs=[NamedArtifact(name="facts", artifact=facts)],
+            )
+        )
+        write = k.claim_ready(ClaimRequest(run_id="run-1", module="writer"))
+        self.assertEqual(len(write.inputs), 2, "fan-in supplies both inputs")
+        answer = k.put_artifact(
+            Artifact(type="demo.Answer", body=b"Modules converge.")
+        )
+        completed = k.commit(
+            Derivation(
+                run_id="run-1",
+                work_id=write.id,
+                node_id=write.node_id,
+                outputs=[NamedArtifact(name="answer", artifact=answer)],
+            )
+        )
+        self.assertEqual(completed.state, RunState.RUN_STATE_COMPLETED)
+        self.assertEqual(completed.answer.id, answer.id)
+        self.assertEqual(
+            len(k.list_derivations(RunRef(id="run-1")).derivations), 2
+        )
+
+    def test_cyclic_assembly_is_rejected(self):
+        from srcport_substrate import Invalid
+
+        k = Kernel()
+        k.register(
+            ModuleManifest(
+                name="loop",
+                version="1.0.0",
+                provides=[
+                    Capability(
+                        name="loop.step",
+                        inputs=[
+                            Port(
+                                name="in", contract="demo.Value", optional=True
+                            )
+                        ],
+                        outputs=[Port(name="out", contract="demo.Value")],
+                    )
+                ],
+            )
+        )
+        assembly = Assembly(
+            id="cycle@1",
+            nodes=[
+                AssemblyNode(
+                    id="a",
+                    module="loop",
+                    module_version="1.0.0",
+                    capability="loop.step",
+                ),
+                AssemblyNode(
+                    id="b",
+                    module="loop",
+                    module_version="1.0.0",
+                    capability="loop.step",
+                ),
+            ],
+            bindings=[
+                Binding(
+                    to_node="a", to_port="in", from_node="b", from_port="out"
+                ),
+                Binding(
+                    to_node="b", to_port="in", from_node="a", from_port="out"
+                ),
+            ],
+            terminal=NodeOutput(node="b", port="out"),
+        )
+        with self.assertRaises(Invalid):
+            k.start_run(RunRequest(id="cycle", assembly=assembly))
+
+    def test_run_stalls_when_no_node_can_become_ready(self):
+        k = Kernel()
+        k.register(ModuleManifest(name="source", version="1", provides=[Capability(name="source.maybe", outputs=[Port(name="value", contract="demo.Value", optional=True)])]))
+        k.register(ModuleManifest(name="sink", version="1", provides=[Capability(name="sink.answer", inputs=[Port(name="value", contract="demo.Value")], outputs=[Port(name="answer", contract="demo.Answer")])]))
+        assembly = Assembly(id="stall@1", nodes=[AssemblyNode(id="source", module="source", module_version="1", capability="source.maybe"), AssemblyNode(id="sink", module="sink", module_version="1", capability="sink.answer")], bindings=[Binding(to_node="sink", to_port="value", from_node="source", from_port="value")], terminal=NodeOutput(node="sink", port="answer"))
+        k.start_run(RunRequest(id="stall", assembly=assembly))
+        work = k.claim_ready(ClaimRequest(run_id="stall", module="source"))
+        run = k.commit(Derivation(run_id="stall", work_id=work.id, node_id=work.node_id))
+        self.assertEqual(run.state, RunState.RUN_STATE_STALLED)
+
+    def test_convergent_run_hashes_match_every_sdk(self):
+        k = Kernel()
+        k.register(ModuleManifest(name="answerer", version="1.0.0", provides=[Capability(name="answer.write", outputs=[Port(name="answer", contract="demo.Answer")])]))
+        k.start_run(RunRequest(id="parity", assembly=Assembly(id="single@1", nodes=[AssemblyNode(id="answer", module="answerer", module_version="1.0.0", capability="answer.write")], terminal=NodeOutput(node="answer", port="answer"))))
+        work = k.claim_ready(ClaimRequest(run_id="parity", module="answerer"))
+        answer = k.put_artifact(Artifact(type="demo.Answer", body=b"yes"))
+        k.commit(Derivation(run_id="parity", work_id=work.id, node_id=work.node_id, outputs=[NamedArtifact(name="answer", artifact=answer)]))
+        self.assertEqual(k.derivations()[0].id, "sha256:0e3e167112e6bb8f19d736de4592b72a2856cb494cc4dcb00fbcd5682d595cf6")
+        self.assertEqual(k.ledger()[-1].hash, "faad7e3ce2d2e030cf37ff6001fe18f7dec0430ce14642f9ae878d66875bc28f")
 
 
 if __name__ == "__main__":

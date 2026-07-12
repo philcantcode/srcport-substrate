@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 license = "LicenseRef-srcport-all-rights-reserved"
-description = "In-process Rust SDK for the srcport-substrate microkernel: seven primitives and one Kernel ABI, conformant to SPEC.md (v0.1)."
+description = "In-process Rust SDK for the srcport-substrate microkernel: eight primitives and one Kernel ABI, conformant to SPEC.md (v0.1)."
 repository = "https://github.com/philcantcode/srcport-substrate"
 publish = false
 

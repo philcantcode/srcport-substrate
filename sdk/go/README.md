@@ -2,7 +2,7 @@
 
 The in-process Go realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
-It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI.
+It conforms to [`SPEC.md`](../../SPEC.md) — the eight primitives and the one ABI.
 
 > The message types are **generated** from `substrate.proto` (via
 > `buf generate`, committed under [`internal/genpb/`](internal/genpb/)) and

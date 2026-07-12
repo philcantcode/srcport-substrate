@@ -38,6 +38,7 @@ flowchart TB
         P5["⑤ Ledger"]
         P6["⑥ Gate"]
         P7["⑦ Registry"]
+        P8["⑧ Run"]
     end
 
     subgraph SDKs["SDKs — same ABI, same conformance suite, per language"]
@@ -54,7 +55,7 @@ flowchart TB
     classDef ker fill:#ecfdf5,stroke:#10b981,stroke-width:1px,color:#064e3b;
     classDef sdk fill:#fff7ed,stroke:#f59e0b,stroke-width:1px,color:#7c2d12;
     class M1,M2,M3,M4 dom;
-    class P1,P2,P3,P4,P5,P6,P7 ker;
+    class P1,P2,P3,P4,P5,P6,P7,P8 ker;
     class S1,S2,S3 sdk;
 ```
 
@@ -63,52 +64,52 @@ thing that finally becomes boring, trusted, and legible.
 
 ---
 
-## The seven primitives
+## The eight primitives
 
-Seven primitives plus one `Kernel` ABI. Small enough to hold in your head.
+Eight primitives plus one `Kernel` ABI. Small enough to hold in your head.
 
 | # | Primitive | Guarantees |
 |---|-----------|------------|
-| ① | **Module** | A self-contained vertical slice. Declares `provides`/`requires`; never imports another module. |
+| ① | **Module** | A vertical slice with typed capability ports; never imports another module. |
 | ② | **Artifact** | Typed, content-addressed, **immutable**. Same content ⇒ same id. |
 | ③ | **Contract** | The declarative schema — the **sole** coupling point between modules. |
 | ④ | **Event** | Publish/subscribe topics with a kernel-assigned **total order** (`seq`). |
 | ⑤ | **Ledger** | Append-only, **hash-chained**, tamper-evident record of every action. |
 | ⑥ | **Gate** | A **human-held** checkpoint before anything irreversible. Non-bypassable. |
 | ⑦ | **Registry** | Discovery — "what modules, capabilities, and contracts exist right now?" |
+| ⑧ | **Run** | A finite typed assembly that must close as completed, stalled, failed, or cancelled. |
 
 ---
 
-## How the primitives compose (the whole loop)
+## How the primitives converge (the bounded run)
 
-A module wakes on an event, produces an immutable artifact, publishes the next
-event, and pauses at a human gate before anything irreversible — every step
-landing in the ledger.
+The human-owned assembly pins module versions and binds typed ports. The kernel
+only releases a node after every bound input artifact exists; each commit records
+a separate derivation and releases downstream work. Producing the declared
+terminal artifact closes the run. Events may wake workers, but artifact refs are
+the data plane.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant H as Human
-    participant Mod as Module
+    participant H as Human / assembly owner
+    participant A as Upstream module
+    participant B as Downstream module
     participant K as Kernel
     participant L as ⑤ Ledger
 
-    Mod->>K: Register (provides / requires)
-    K-->>L: append "module.activated"
-    Note over Mod,K: ⑦ Registry now answers "what exists"
-
-    K-->>Mod: ④ Event (subscribed topic, in seq order)
-    Mod->>K: PutArtifact (② immutable, content-addressed)
-    K-->>L: append "artifact.put"
-    Mod->>K: Publish next ④ Event (coupled only via ③ contract ref)
-    K-->>L: append "event.published"
-
-    Mod->>K: RequestGate (irreversible act)
-    K-->>L: append "gate.requested"
-    Note over Mod,H: ⑥ blocked while PENDING / REJECTED
-    H->>K: DecideGate → APPROVED
-    K-->>L: append "gate.decided"
-    K-->>Mod: proceed
+    H->>K: StartRun(assembly + input artifact refs)
+    K-->>L: run.started
+    A->>K: ClaimReady
+    K-->>A: exact typed inputs
+    A->>K: PutArtifact + Commit(Derivation)
+    K-->>L: derivation.committed
+    Note over B,K: downstream is now ready
+    B->>K: ClaimReady
+    K-->>B: complete fan-in input set
+    B->>K: Put terminal Artifact + Commit
+    K-->>L: run.completed
+    K-->>H: Answer ArtifactRef
 ```
 
 ---
@@ -214,7 +215,7 @@ Every SDK's message types are **generated from `substrate.proto`** — Rust at
 build time (`build.rs`), Go and Python via `buf generate` (committed). None
 hand-writes the contract, so none can drift from it; CI fails if the committed
 codegen falls out of sync. Every SDK realises the same `Kernel` ABI in-process
-and ships the same **six-test conformance suite**:
+and ships the same convergence-aware conformance suite:
 
 | # | Test | Proves |
 |---|------|--------|
@@ -224,17 +225,22 @@ and ships the same **six-test conformance suite**:
 | 4 | **Ledger integrity** | the chain verifies; tampering breaks it |
 | 5 | **Gate non-bypass** | irreversible action blocked until `APPROVED` |
 | 6 | **Discovery** | the registry reports every module, capability, and contract |
+| 7 | **Canonical reconstruction** | state-bearing ledger entries round-trip identically across SDKs |
+| 8 | **Address invariance** | metadata and provenance do not change value identity |
+| 9 | **Feed-forward convergence** | fan-in waits, terminal output closes, closed runs stay closed |
+| 10 | **Structural termination** | cycles are rejected and work is bounded |
+| 11 | **Derivation preservation** | equal values converge without erasing distinct production paths |
 
 As a cross-check, all three SDKs produce **byte-identical artifact addresses**
-for the same `(type, body)` — the spec's addressing rule, proven across
-languages.
+for the same `(type, body)`, and the same convergent run produces an identical
+derivation id and final ledger hash in every language.
 
 ---
 
 ## Status
 
-`v0.1` draft — **unfrozen, pending review**. The Rust SDK and the `v1.0.0`
-freeze come after the schema is approved. Nothing depends on it yet.
+`v0.1` draft — **unfrozen, pending review**. Rust, Go, and Python implement the
+same ABI; the `v1.0.0` freeze comes after the schema is approved.
 
 ```mermaid
 flowchart LR

@@ -2,7 +2,7 @@
 // srcport-substrate — the frozen, domain-neutral microkernel contract.
 //
 // THIS FILE IS THE CONTRACT. It is the one artifact a human owns and reads.
-// Every SDK conforms to it. It defines SEVEN primitives and one ABI, and it
+// Every SDK conforms to it. It defines EIGHT primitives and one ABI, and it
 // knows nothing about any domain — no targets, trials, findings, entities,
 // terrain, or content. All of that is a Module built ON TOP of this.
 //
@@ -29,14 +29,28 @@ enum Lifecycle {
 // A named thing a module can do, bound to the contract it speaks.
 message Capability {
   string name     = 1;  // e.g. "recon.scan"
-  string contract = 2;  // contract ref, e.g. "acme.recon.v1.ScanRequest"
+  string contract = 2;  // legacy primary contract; prefer typed ports below
+  repeated Port inputs  = 3;
+  repeated Port outputs = 4;
+}
+
+// A named, typed side of a capability. Multiple bindings are permitted only
+// when `multiple` is true; an unbound input is permitted only when `optional`
+// is true. These rules let the kernel determine readiness without parsing data.
+message Port {
+  string name     = 1;
+  string contract = 2;
+  bool multiple   = 3;
+  bool optional   = 4;
 }
 
 message ModuleManifest {
   string name              = 1;  // unique module id, kebab-case
   string version           = 2;  // semver
   repeated Capability provides = 3;
-  repeated string requires     = 4;  // capability names that must be present
+  // Availability dependencies only. Run dataflow is expressed exclusively by
+  // typed capability ports and Assembly bindings, never by this list.
+  repeated string requires     = 4;
 }
 
 // ─── 2. ARTIFACT ───────────────────────────────────────────────────────────
@@ -50,11 +64,9 @@ message Artifact {
   bytes  body                = 3;  // opaque encoded value
   map<string, string> meta   = 4;
   string produced_by         = 5;  // module name
-  // Provenance: ids of the artifacts this one was derived from, turning the
-  // immutable-artifact chain into a traversable lineage graph. Like `meta` and
-  // `produced_by`, it is NOT part of the address — same (type, body) is the
-  // same artifact however it was derived. The kernel stores and echoes it and
-  // never interprets it (a ref need not resolve to a stored artifact).
+  // Legacy/advisory provenance. It is NOT part of the address and first-write
+  // value storage cannot preserve competing paths. Run Derivation records are
+  // the authoritative provenance: they preserve every distinct production.
   repeated string derived_from = 6;
 }
 
@@ -81,6 +93,10 @@ message Event {
   bytes  payload = 4;
   string source  = 5;  // module name
   uint64 seq     = 6;  // kernel-assigned, monotonic
+  string run_id  = 7;  // empty for events outside a bounded run
+  // Artifact refs are the data plane. `payload` remains for v0 compatibility;
+  // convergent assemblies pass values only through these immutable refs.
+  repeated ArtifactRef artifacts = 8;
 }
 
 // ─── 5. LEDGER ─────────────────────────────────────────────────────────────
@@ -132,6 +148,112 @@ message RegistrySnapshot {
   repeated Contract        contracts    = 3;
 }
 
+// ─── 8. RUN / CONVERGENCE ──────────────────────────────────────────────────
+// An Assembly is the small, human-owned feed-forward seam. It pins module
+// versions, connects typed ports, and names exactly one terminal output. A Run
+// applies an immutable set of input artifacts to one Assembly. It can close
+// only as COMPLETED, STALLED, FAILED, or CANCELLED; closed runs never reopen.
+
+message NamedArtifact {
+  string name         = 1;
+  ArtifactRef artifact = 2;
+}
+
+message AssemblyNode {
+  string id             = 1;
+  string module         = 2;
+  string module_version = 3;
+  string capability     = 4;
+}
+
+// Exactly one source is set: (`from_node`, `from_port`) for an upstream output,
+// or `input` for a named RunRequest input.
+message Binding {
+  string to_node   = 1;
+  string to_port   = 2;
+  string from_node = 3;
+  string from_port = 4;
+  string input     = 5;
+}
+
+message NodeOutput {
+  string node = 1;
+  string port = 2;
+}
+
+message Limits {
+  // Zero means the number of nodes. A run never commits more derivations than
+  // this value, which bounds even future explicitly-looping assembly forms.
+  uint64 max_steps = 1;
+}
+
+message Assembly {
+  string id                  = 1;
+  repeated AssemblyNode nodes = 2;
+  repeated Binding bindings   = 3;
+  NodeOutput terminal         = 4;
+}
+
+enum RunState {
+  RUN_STATE_UNSPECIFIED = 0;
+  RUN_STATE_RUNNING     = 1;
+  RUN_STATE_COMPLETED   = 2;
+  RUN_STATE_STALLED     = 3;
+  RUN_STATE_FAILED      = 4;
+  RUN_STATE_CANCELLED   = 5;
+}
+
+message RunRequest {
+  string id                    = 1;
+  Assembly assembly            = 2;
+  repeated NamedArtifact inputs = 3;
+  Limits limits                = 4;
+}
+
+message Run {
+  string id                    = 1;
+  Assembly assembly            = 2;
+  repeated NamedArtifact inputs = 3;
+  RunState state               = 4;
+  ArtifactRef answer           = 5;
+  uint64 steps                 = 6;
+  uint64 max_steps             = 7;
+  string reason                = 8;
+}
+
+message RunRef { string id = 1; }
+
+message ClaimRequest {
+  string run_id = 1;
+  string module = 2;
+}
+
+message WorkItem {
+  string id                    = 1;
+  string run_id                = 2;
+  string node_id               = 3;
+  string module                = 4;
+  string module_version        = 5;
+  string capability            = 6;
+  repeated NamedArtifact inputs = 7;
+}
+
+// Provenance is separate from Artifact identity: equal values converge to one
+// Artifact while every distinct production path remains observable.
+message Derivation {
+  string id                     = 1;
+  string run_id                 = 2;
+  string work_id                = 3;
+  string node_id                = 4;
+  string module                 = 5;
+  string module_version         = 6;
+  string capability             = 7;
+  repeated NamedArtifact inputs  = 8;
+  repeated NamedArtifact outputs = 9;
+}
+
+message DerivationList { repeated Derivation derivations = 1; }
+
 // ─── KERNEL ABI ─────────────────────────────────────────────────────────────
 // The seam every SDK implements. The v0.1 Rust SDK realises this IN-PROCESS
 // (Rust methods mirroring these RPCs). This service definition is the canonical
@@ -155,4 +277,10 @@ service Kernel {
   rpc DecideGate  (GateDecision)    returns (GateDecision);
   rpc AwaitGate   (GateTicket)      returns (GateDecision);
   rpc Snapshot    (SnapshotRequest) returns (RegistrySnapshot);
+  rpc StartRun    (RunRequest)      returns (Run);
+  rpc ClaimReady  (ClaimRequest)    returns (WorkItem);
+  rpc Commit      (Derivation)      returns (Run);
+  rpc GetRun      (RunRef)          returns (Run);
+  rpc CancelRun   (RunRef)          returns (Run);
+  rpc ListDerivations (RunRef)      returns (DerivationList);
 }

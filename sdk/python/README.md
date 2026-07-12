@@ -2,7 +2,7 @@
 
 The in-process Python realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
-It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI.
+It conforms to [`SPEC.md`](../../SPEC.md) — the eight primitives and the one ABI.
 One runtime dependency: the `protobuf` runtime.
 
 > The message types are **generated** from `substrate.proto` (via

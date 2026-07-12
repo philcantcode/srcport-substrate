@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import queue
 import threading
 
@@ -10,8 +11,13 @@ from ._types import (
     AppendRequest,
     Artifact,
     ArtifactRef,
+    Assembly,
+    AssemblyNode,
+    ClaimRequest,
     Contract,
     Decision,
+    Derivation,
+    DerivationList,
     Event,
     GateDecision,
     GateRequest,
@@ -19,10 +25,16 @@ from ._types import (
     LedgerEntry,
     Lifecycle,
     ModuleManifest,
+    NamedArtifact,
     PublishAck,
     RegisterAck,
     RegistrySnapshot,
+    Run,
+    RunRef,
+    RunRequest,
+    RunState,
     Subscription,
+    WorkItem,
     _ledger_hash,
     artifact_id,
     verify_chain,
@@ -50,6 +62,22 @@ class GateBlocked(KernelError):
         self.decision = decision
         name = Decision.Name(decision)
         super().__init__(f"gate blocked: decision is {name}, not APPROVED")
+
+
+class Invalid(KernelError):
+    """The assembly, binding, work result, or transition is invalid."""
+
+
+class Conflict(KernelError):
+    """An id or unit of work already exists."""
+
+
+class RunClosed(KernelError):
+    """A terminal run is immutable and accepts no further work."""
+
+    def __init__(self, state: RunState) -> None:
+        self.state = state
+        super().__init__(f"run is closed: {RunState.Name(state)}")
 
 
 _LIFECYCLE_VERB = {
@@ -88,6 +116,8 @@ class Kernel:
         self._subs: list[tuple[list[str], queue.Queue]] = []
         self._ledger: list[LedgerEntry] = []
         self._gates: dict[str, GateDecision] = {}
+        self._runs: dict[str, dict] = {}
+        self._derivations: list[Derivation] = []
         self._event_seq = 0
         self._gate_counter = 0
 
@@ -118,6 +148,8 @@ class Kernel:
             for cap in manifest.provides:
                 self._capabilities.append(copy.deepcopy(cap))
                 self._contracts.setdefault(cap.contract, Contract(ref=cap.contract))
+                for port in list(cap.inputs) + list(cap.outputs):
+                    self._contracts.setdefault(port.contract, Contract(ref=port.contract))
             self._modules.append(
                 [copy.deepcopy(manifest), Lifecycle.LIFECYCLE_REGISTERED]
             )
@@ -201,7 +233,9 @@ class Kernel:
             for topics, q in self._subs:
                 if event.topic in topics:
                     q.put(copy.deepcopy(event))
-            self._append_locked("event.published", event.topic)
+            for_log = copy.deepcopy(event)
+            for_log.ClearField("payload")
+            self._append_locked("event.published", event.topic, _canonical(for_log))
             return PublishAck(seq=event.seq)
 
     # ── 5. Ledger ──────────────────────────────────────────────────────────
@@ -295,3 +329,393 @@ class Kernel:
                 capabilities=[copy.deepcopy(c) for c in self._capabilities],
                 contracts=[copy.deepcopy(c) for c in self._contracts.values()],
             )
+
+    # ── 8. Run / convergence ──────────────────────────────────────────────
+
+    def start_run(self, req: RunRequest) -> Run:
+        """Validate and freeze one finite feed-forward assembly."""
+        with self._lock:
+            if not req.id:
+                raise Invalid("run id is required")
+            if req.id in self._runs:
+                raise Conflict(f"run {req.id} already exists")
+            if not req.HasField("assembly"):
+                raise Invalid("assembly is required")
+            self._validate_assembly(req.assembly, req.inputs)
+            max_steps = req.limits.max_steps if req.HasField("limits") else 0
+            max_steps = max_steps or len(req.assembly.nodes)
+            if not max_steps:
+                raise Invalid("max_steps must be positive")
+            run = Run(
+                id=req.id,
+                assembly=req.assembly,
+                inputs=req.inputs,
+                state=RunState.RUN_STATE_RUNNING,
+                max_steps=max_steps,
+            )
+            self._runs[run.id] = {
+                "run": run,
+                "claimed": {},
+                "committed": {},
+            }
+            self._append_locked("run.started", run.id, _canonical(run))
+            return copy.deepcopy(run)
+
+    def claim_ready(self, req: ClaimRequest) -> WorkItem:
+        """Atomically claim one ready node for a module, or return an empty item."""
+        with self._lock:
+            slot = self._runs.get(req.run_id)
+            if slot is None:
+                raise NotFound(req.run_id)
+            run = slot["run"]
+            if run.state != RunState.RUN_STATE_RUNNING:
+                raise RunClosed(run.state)
+            selected = None
+            selected_inputs = None
+            any_ready = False
+            for node in run.assembly.nodes:
+                if node.id in slot["claimed"] or node.id in slot["committed"]:
+                    continue
+                inputs = self._resolve_inputs(slot, node)
+                if inputs is not None:
+                    any_ready = True
+                    if selected is None and node.module == req.module:
+                        selected, selected_inputs = node, inputs
+            if selected is not None:
+                work = WorkItem(
+                    id=f"work:{req.run_id}/{selected.id}",
+                    run_id=req.run_id,
+                    node_id=selected.id,
+                    module=selected.module,
+                    module_version=selected.module_version,
+                    capability=selected.capability,
+                    inputs=selected_inputs,
+                )
+                slot["claimed"][selected.id] = work
+                self._append_locked("work.claimed", work.id, _canonical(work))
+                return copy.deepcopy(work)
+            if not any_ready and not slot["claimed"]:
+                run.state = RunState.RUN_STATE_STALLED
+                run.reason = "no node is ready and no work is in flight"
+                self._append_locked("run.stalled", run.id, _canonical(run))
+            return WorkItem()
+
+    def commit(self, submitted: Derivation) -> Run:
+        """Commit one claimed transformation and release its downstream nodes."""
+        with self._lock:
+            slot = self._runs.get(submitted.run_id)
+            if slot is None:
+                raise NotFound(submitted.run_id)
+            run = slot["run"]
+            if run.state != RunState.RUN_STATE_RUNNING:
+                raise RunClosed(run.state)
+            work = slot["claimed"].get(submitted.node_id)
+            if work is None:
+                raise Conflict("node was not claimed")
+            if submitted.work_id != work.id:
+                raise Invalid("work_id does not match the claim")
+            cap = self._capability_for(
+                work.module, work.module_version, work.capability
+            )
+            self._validate_outputs(cap, submitted.outputs)
+            derivation = Derivation(
+                run_id=work.run_id,
+                work_id=work.id,
+                node_id=work.node_id,
+                module=work.module,
+                module_version=work.module_version,
+                capability=work.capability,
+                inputs=work.inputs,
+                outputs=submitted.outputs,
+            )
+            derivation.id = _derivation_id(derivation)
+            del slot["claimed"][work.node_id]
+            slot["committed"][work.node_id] = derivation
+            run.steps += 1
+            closed = False
+            terminal = run.assembly.terminal
+            if terminal.node == work.node_id:
+                for output in derivation.outputs:
+                    if output.name == terminal.port:
+                        run.answer.CopyFrom(output.artifact)
+                        run.state = RunState.RUN_STATE_COMPLETED
+                        closed = True
+                        break
+            if not closed and run.steps >= run.max_steps:
+                run.state = RunState.RUN_STATE_FAILED
+                run.reason = "max_steps exhausted before the terminal output"
+                closed = True
+            if not closed:
+                any_ready = any(
+                    node.id not in slot["claimed"]
+                    and node.id not in slot["committed"]
+                    and self._resolve_inputs(slot, node) is not None
+                    for node in run.assembly.nodes
+                )
+                if not any_ready and not slot["claimed"]:
+                    run.state = RunState.RUN_STATE_STALLED
+                    run.reason = "no node is ready and no work is in flight"
+                    closed = True
+            self._derivations.append(copy.deepcopy(derivation))
+            self._append_locked(
+                "derivation.committed",
+                derivation.id,
+                _canonical(derivation),
+            )
+            kind = "run.progressed"
+            if run.state == RunState.RUN_STATE_COMPLETED:
+                kind = "run.completed"
+            elif run.state == RunState.RUN_STATE_STALLED:
+                kind = "run.stalled"
+            elif closed:
+                kind = "run.failed"
+            self._append_locked(kind, run.id, _canonical(run))
+            return copy.deepcopy(run)
+
+    def get_run(self, ref: RunRef) -> Run:
+        with self._lock:
+            slot = self._runs.get(ref.id)
+            if slot is None:
+                raise NotFound(ref.id)
+            return copy.deepcopy(slot["run"])
+
+    def cancel_run(self, ref: RunRef) -> Run:
+        with self._lock:
+            slot = self._runs.get(ref.id)
+            if slot is None:
+                raise NotFound(ref.id)
+            run = slot["run"]
+            if run.state != RunState.RUN_STATE_RUNNING:
+                raise RunClosed(run.state)
+            run.state = RunState.RUN_STATE_CANCELLED
+            run.reason = "cancelled"
+            slot["claimed"].clear()
+            self._append_locked("run.cancelled", run.id, _canonical(run))
+            return copy.deepcopy(run)
+
+    def derivations(self) -> list[Derivation]:
+        with self._lock:
+            return copy.deepcopy(self._derivations)
+
+    def list_derivations(self, ref: RunRef) -> DerivationList:
+        with self._lock:
+            if ref.id not in self._runs:
+                raise NotFound(ref.id)
+            return DerivationList(
+                derivations=[
+                    copy.deepcopy(item)
+                    for item in self._derivations
+                    if item.run_id == ref.id
+                ]
+            )
+
+    def _capability_for(self, module: str, version: str, capability: str):
+        matches = []
+        for manifest, _ in self._modules:
+            if manifest.name == module and manifest.version == version:
+                for cap in manifest.provides:
+                    if cap.name == capability:
+                        matches.append(cap)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise Invalid(f"{module}@{version} provides {capability} ambiguously")
+        raise Invalid(f"{module}@{version} does not provide {capability}")
+
+    @staticmethod
+    def _port(ports, name: str):
+        return next((port for port in ports if port.name == name), None)
+
+    def _validate_assembly(self, assembly: Assembly, inputs) -> None:
+        if not assembly.id:
+            raise Invalid("assembly id is required")
+        if not assembly.nodes or not assembly.HasField("terminal"):
+            raise Invalid("assembly needs nodes and a terminal")
+        nodes = {}
+        for node in assembly.nodes:
+            if not node.id or node.id in nodes:
+                raise Invalid(f"duplicate or empty node id: {node.id}")
+            nodes[node.id] = node
+            cap = self._capability_for(
+                node.module, node.module_version, node.capability
+            )
+            for ports in (cap.inputs, cap.outputs):
+                names = set()
+                for port in ports:
+                    if (
+                        not port.name
+                        or not port.contract
+                        or port.name in names
+                    ):
+                        raise Invalid(
+                            f"{node.id} has an empty or duplicate typed port"
+                        )
+                    names.add(port.name)
+        terminal_node = nodes.get(assembly.terminal.node)
+        if terminal_node is None:
+            raise Invalid("terminal node does not exist")
+        terminal_cap = self._capability_for(
+            terminal_node.module,
+            terminal_node.module_version,
+            terminal_node.capability,
+        )
+        terminal_port = self._port(terminal_cap.outputs, assembly.terminal.port)
+        if terminal_port is None:
+            raise Invalid("terminal output does not exist")
+        if terminal_port.multiple:
+            raise Invalid("terminal output must be scalar")
+        named_inputs = {}
+        for item in inputs:
+            if not item.name or item.name in named_inputs:
+                raise Invalid(f"duplicate or empty run input: {item.name}")
+            if not item.HasField("artifact"):
+                raise Invalid(f"input {item.name} has no artifact")
+            if item.artifact.id not in self._artifacts:
+                raise NotFound(item.artifact.id)
+            named_inputs[item.name] = item
+        counts = {}
+        edges = {}
+        for binding in assembly.bindings:
+            target_node = nodes.get(binding.to_node)
+            if target_node is None:
+                raise Invalid(f"unknown target {binding.to_node}")
+            target_cap = self._capability_for(
+                target_node.module,
+                target_node.module_version,
+                target_node.capability,
+            )
+            target = self._port(target_cap.inputs, binding.to_port)
+            if target is None:
+                raise Invalid(f"unknown input {binding.to_node}.{binding.to_port}")
+            key = (binding.to_node, binding.to_port)
+            counts[key] = counts.get(key, 0) + 1
+            upstream = bool(binding.from_node or binding.from_port)
+            external = bool(binding.input)
+            if upstream == external:
+                raise Invalid("binding must have exactly one source")
+            if external:
+                item = named_inputs.get(binding.input)
+                if item is None:
+                    raise Invalid(f"unknown run input {binding.input}")
+                contract = self._artifacts[item.artifact.id].type
+            else:
+                source_node = nodes.get(binding.from_node)
+                if source_node is None:
+                    raise Invalid(f"unknown source {binding.from_node}")
+                source_cap = self._capability_for(
+                    source_node.module,
+                    source_node.module_version,
+                    source_node.capability,
+                )
+                source = self._port(source_cap.outputs, binding.from_port)
+                if source is None:
+                    raise Invalid(
+                        f"unknown output {binding.from_node}.{binding.from_port}"
+                    )
+                contract = source.contract
+                edges.setdefault(binding.from_node, []).append(binding.to_node)
+            if contract != target.contract:
+                raise Invalid(
+                    f"contract mismatch at {binding.to_node}.{binding.to_port}"
+                )
+        for node in assembly.nodes:
+            cap = self._capability_for(
+                node.module, node.module_version, node.capability
+            )
+            for port in cap.inputs:
+                count = counts.get((node.id, port.name), 0)
+                if not count and not port.optional:
+                    raise Invalid(f"required input {node.id}.{port.name} is unbound")
+                if count > 1 and not port.multiple:
+                    raise Invalid(f"input {node.id}.{port.name} is not multiple")
+        visiting, done = set(), set()
+
+        def visit(node):
+            if node in done:
+                return
+            if node in visiting:
+                raise Invalid("assembly contains a cycle")
+            visiting.add(node)
+            for downstream in edges.get(node, []):
+                visit(downstream)
+            visiting.remove(node)
+            done.add(node)
+
+        for node in nodes:
+            visit(node)
+
+    @staticmethod
+    def _resolve_inputs(slot, node: AssemblyNode):
+        resolved = []
+        for binding in slot["run"].assembly.bindings:
+            if binding.to_node != node.id:
+                continue
+            ref = None
+            if binding.input:
+                item = next(
+                    (
+                        item
+                        for item in slot["run"].inputs
+                        if item.name == binding.input
+                    ),
+                    None,
+                )
+                ref = item.artifact if item is not None else None
+            else:
+                derivation = slot["committed"].get(binding.from_node)
+                if derivation is not None:
+                    item = next(
+                        (
+                            item
+                            for item in derivation.outputs
+                            if item.name == binding.from_port
+                        ),
+                        None,
+                    )
+                    ref = item.artifact if item is not None else None
+            if ref is None:
+                return None
+            resolved.append(NamedArtifact(name=binding.to_port, artifact=ref))
+        return resolved
+
+    def _validate_outputs(self, cap, outputs) -> None:
+        for expected in cap.outputs:
+            matching = [item for item in outputs if item.name == expected.name]
+            if not matching and not expected.optional:
+                raise Invalid(f"required output {expected.name} is absent")
+            if len(matching) > 1 and not expected.multiple:
+                raise Invalid(f"output {expected.name} is not multiple")
+        for output in outputs:
+            expected = self._port(cap.outputs, output.name)
+            if expected is None or not output.HasField("artifact"):
+                raise Invalid(f"undeclared or empty output {output.name}")
+            artifact = self._artifacts.get(output.artifact.id)
+            if artifact is None:
+                raise NotFound(output.artifact.id)
+            if artifact.type != expected.contract:
+                raise Invalid(
+                    f"output {output.name} has contract {artifact.type}, "
+                    f"want {expected.contract}"
+                )
+
+
+def _derivation_id(derivation: Derivation) -> str:
+    h = hashlib.sha256()
+
+    def write(value: str) -> None:
+        h.update(value.encode())
+        h.update(b"\x00")
+
+    for value in (
+        derivation.run_id,
+        derivation.work_id,
+        derivation.node_id,
+        derivation.module,
+        derivation.module_version,
+        derivation.capability,
+    ):
+        write(value)
+    for value in list(derivation.inputs) + list(derivation.outputs):
+        write(value.name)
+        write(value.artifact.id if value.HasField("artifact") else "")
+    return "sha256:" + h.hexdigest()

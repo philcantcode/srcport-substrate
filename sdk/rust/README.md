@@ -2,7 +2,7 @@
 
 The in-process Rust realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
-It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI,
+It conforms to [`SPEC.md`](../../SPEC.md) — the eight primitives and the one ABI,
 nothing more.
 
 > This crate does **not** re-derive the core. Its wire types are generated from
