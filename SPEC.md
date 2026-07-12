@@ -35,7 +35,7 @@ shapes just carry them.
 |---|-----------|------------|---------------------------------|
 | 1 | **Module** | `ModuleManifest`, `Capability`, `Port`, `Lifecycle` | A module is a self-contained vertical slice. Capabilities declare typed input/output ports; `requires` is availability only, never dataflow. It moves through `REGISTERED → LOADED → ACTIVE → DEACTIVATED` and never imports another module. |
 | 2 | **Artifact** | `Artifact`, `ArtifactRef` | Typed, content-addressed, **immutable**. `id = "sha256:" + hex(sha256(type + 0x00 + body))`. Same content ⇒ same id; any change ⇒ a new id. Stored artifacts are never mutated in place. Production provenance lives in separate `Derivation` records, so equal values converge without losing distinct paths. |
-| 3 | **Contract** | `Contract`, `Capability.contract`, `Artifact.type`, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to a contract *ref* (a string name), never to each other's code. |
+| 3 | **Contract** | `Contract`, `Port.contract`, `Capability.contract`, `Artifact.type`, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to a contract *ref* (a string name), never to each other's code. |
 | 4 | **Event** | `Event`, `Subscription` | Modules publish to topics and subscribe to topics; they never call each other directly. Every event gets a monotonic `seq` — a **total order** within the kernel. |
 | 5 | **Ledger** | `LedgerEntry` | Append-only and **hash-chained**. Each entry commits to the previous entry's hash, so the whole history is tamper-evident and fully agent-observable. Every meaningful kernel action writes one entry. |
 | 6 | **Gate** | `GateRequest`, `GateDecision`, `Decision` | A **human-held** checkpoint. Before anything irreversible, a module requests a gate and must not proceed until a human decides `APPROVED`. `PENDING` and `REJECTED` both block. Non-bypassable by design. |
@@ -48,8 +48,8 @@ shapes just carry them.
 implements. It is the union of the operations above (`Register`, `PutArtifact`,
 `GetArtifact`, `Publish`, `Subscribe`, `Append`, `RequestGate`, `DecideGate`,
 `AwaitGate`, `Snapshot`, `StartRun`, `ClaimReady`, `Commit`, `GetRun`,
-`CancelRun`, `ListDerivations`). An SDK MAY realise it in-process (Rust methods) or over
-the wire (gRPC) — the *invariants* are identical either way. Modules see only the
+`CancelRun`, `ListDerivations`). An SDK MAY realise it in-process (methods mirroring
+these RPCs) or over the wire (gRPC) — the *invariants* are identical either way. Modules see only the
 kernel; they never see each other.
 
 ---

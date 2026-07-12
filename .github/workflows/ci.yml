@@ -46,6 +46,12 @@ jobs:
         run: cargo test --manifest-path sdk/rust/Cargo.toml
       - name: Clippy
         run: cargo clippy --manifest-path sdk/rust/Cargo.toml --all-targets -- -D warnings
+      # The example is a downstream consumer of the SDK's public ABI: build and
+      # lint it too, so a contract change that breaks real usage fails CI here.
+      - name: Example builds and runs on the public ABI
+        run: |
+          cargo clippy --manifest-path example/Cargo.toml --all-targets -- -D warnings
+          cargo run --manifest-path example/Cargo.toml
 
   go:
     runs-on: ubuntu-latest

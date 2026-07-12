@@ -29,7 +29,7 @@ flowchart TB
         M4["Growth module"]
     end
 
-    subgraph Kernel["Kernel ABI — the only seam a module ever touches"]
+    subgraph Kernel["The kernel — eight frozen primitives"]
         direction LR
         P1["① Module"]
         P2["② Artifact"]
@@ -64,9 +64,26 @@ thing that finally becomes boring, trusted, and legible.
 
 ---
 
+## See it run
+
+[`example/`](example/) builds a tiny three-module domain on the Rust SDK, drives
+a **real** convergent Run, then reconstructs the whole dataflow **solely by
+decoding the append-only ledger** — proving, not merely illustrating, that
+artifact refs are the data plane and the chain records exactly what happened.
+
+```
+cd example && cargo run
+```
+
+It prints a live trace and writes a self-contained `flow.html` — every box and
+arrow rebuilt from the tamper-evident chain, never from live kernel state.
+
+---
+
 ## The eight primitives
 
-Eight primitives plus one `Kernel` ABI. Small enough to hold in your head.
+Eight primitives (the nouns) plus one `Kernel` ABI — the verb set (`Register`,
+`PutArtifact`, `Publish`, …) that operates on them. Small enough to hold in your head.
 
 | # | Primitive | Guarantees |
 |---|-----------|------------|
@@ -77,40 +94,7 @@ Eight primitives plus one `Kernel` ABI. Small enough to hold in your head.
 | ⑤ | **Ledger** | Append-only, **hash-chained**, tamper-evident record of every action. |
 | ⑥ | **Gate** | A **human-held** checkpoint before anything irreversible. Non-bypassable. |
 | ⑦ | **Registry** | Discovery — "what modules, capabilities, and contracts exist right now?" |
-| ⑧ | **Run** | A finite typed assembly that must close as completed, stalled, failed, or cancelled. |
-
----
-
-## How the primitives converge (the bounded run)
-
-The human-owned assembly pins module versions and binds typed ports. The kernel
-only releases a node after every bound input artifact exists; each commit records
-a separate derivation and releases downstream work. Producing the declared
-terminal artifact closes the run. Events may wake workers, but artifact refs are
-the data plane.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant H as Human / assembly owner
-    participant A as Upstream module
-    participant B as Downstream module
-    participant K as Kernel
-    participant L as ⑤ Ledger
-
-    H->>K: StartRun(assembly + input artifact refs)
-    K-->>L: run.started
-    A->>K: ClaimReady
-    K-->>A: exact typed inputs
-    A->>K: PutArtifact + Commit(Derivation)
-    K-->>L: derivation.committed
-    Note over B,K: downstream is now ready
-    B->>K: ClaimReady
-    K-->>B: complete fan-in input set
-    B->>K: Put terminal Artifact + Commit
-    K-->>L: run.completed
-    K-->>H: Answer ArtifactRef
-```
+| ⑧ | **Run** | Applies an immutable input set to a finite typed assembly; must close as completed, stalled, failed, or cancelled. |
 
 ---
 
@@ -131,9 +115,8 @@ stateDiagram-v2
 
 ## Content addressing
 
-The artifact id **is** a hash of its content. Same `(type, body)` always yields
-the same id; flip a single byte and you get a brand-new id. Stored artifacts are
-never mutated in place.
+The id **is** sha256 over `type · 0x00 · body`, so flipping a single byte yields
+a brand-new id:
 
 ```mermaid
 flowchart LR
@@ -169,14 +152,44 @@ Each `hash = sha256(seq, kind, subject, detail, prev_hash)`.
 
 ---
 
+## How the primitives converge (the bounded, feed-forward run)
+
+A node is released only after every bound input artifact exists, so fan-in waits
+rather than races; events may wake workers, but artifact refs — not event
+payloads — are the run's data plane. The diagram below traces one such bounded run.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Human / assembly owner
+    participant A as Upstream module
+    participant B as Downstream module
+    participant K as Kernel
+    participant L as ⑤ Ledger
+
+    H->>K: StartRun(assembly + input artifact refs)
+    K-->>L: run.started
+    A->>K: ClaimReady
+    K-->>A: exact typed inputs
+    A->>K: PutArtifact + Commit(Derivation)
+    K-->>L: derivation.committed
+    Note over B,K: downstream is now ready
+    B->>K: ClaimReady
+    K-->>B: complete fan-in input set
+    B->>K: Put terminal Artifact + Commit
+    K-->>L: run.completed
+    K-->>H: Answer ArtifactRef
+```
+
+---
+
 ## The one rule
 
 > **Do not create a new repo that re-implements this core.** If it lacks
 > something, **widen this contract by adding to it**, tag a new version, and let
 > every project pick it up. Re-derivation is the bug this repo exists to kill.
 
-Evolution is by **addition, never mutation** — enforced mechanically, not by
-good intentions:
+Evolution is by **addition, never mutation**:
 
 ```mermaid
 flowchart LR
@@ -205,35 +218,35 @@ srcport-substrate/
 ├─ scripts/gen.sh                           # regenerate the SDK types
 ├─ contracts/proto/srcport/substrate/v1/
 │  └─ substrate.proto                       # THE contract
+├─ example/                                 # a runnable domain on the Rust SDK (see below)
 └─ sdk/                                     # each conforms to SPEC.md
    ├─ rust/                                 # in-process Rust SDK (types generated by build.rs)
    ├─ go/                                   # in-process Go SDK (types generated via buf)
    └─ python/                               # in-process Python SDK (types generated via buf)
 ```
 
+---
+
+## Conformance
+
 Every SDK's message types are **generated from `substrate.proto`** — Rust at
 build time (`build.rs`), Go and Python via `buf generate` (committed). None
 hand-writes the contract, so none can drift from it; CI fails if the committed
 codegen falls out of sync. Every SDK realises the same `Kernel` ABI in-process
-and ships the same convergence-aware conformance suite:
+and ships the same convergence-aware conformance suite.
+[`SPEC.md` §Conformance](SPEC.md) states each invariant in full; the eleven it proves:
 
-| # | Test | Proves |
-|---|------|--------|
-| 1 | **Addressing** | same `(type, body)` ⇒ same id; one-byte change ⇒ different id |
-| 2 | **Immutability** | a stored artifact reads back byte-identical |
-| 3 | **Ordering & isolation** | events reach exactly their subscribers, in `seq` order |
-| 4 | **Ledger integrity** | the chain verifies; tampering breaks it |
-| 5 | **Gate non-bypass** | irreversible action blocked until `APPROVED` |
-| 6 | **Discovery** | the registry reports every module, capability, and contract |
-| 7 | **Canonical reconstruction** | state-bearing ledger entries round-trip identically across SDKs |
-| 8 | **Address invariance** | metadata and provenance do not change value identity |
-| 9 | **Feed-forward convergence** | fan-in waits, terminal output closes, closed runs stay closed |
-| 10 | **Structural termination** | cycles are rejected and work is bounded |
-| 11 | **Derivation preservation** | equal values converge without erasing distinct production paths |
+| # | Invariant | | # | Invariant |
+|---|-----------|---|---|-----------|
+| 1 | **Addressing** | | 7 | **Ledger reconstruction & canonical detail** |
+| 2 | **Immutability** | | 8 | **Address invariance** |
+| 3 | **Ordering & isolation** | | 9 | **Feed-forward convergence** |
+| 4 | **Ledger integrity** | | 10 | **Structural termination** |
+| 5 | **Gate non-bypass** | | 11 | **Derivation preservation** |
+| 6 | **Discovery** | | | |
 
 As a cross-check, all three SDKs produce **byte-identical artifact addresses**
-for the same `(type, body)`, and the same convergent run produces an identical
-derivation id and final ledger hash in every language.
+for the same `(type, body)`.
 
 ---
 
@@ -241,14 +254,6 @@ derivation id and final ledger hash in every language.
 
 `v0.1` draft — **unfrozen, pending review**. Rust, Go, and Python implement the
 same ABI; the `v1.0.0` freeze comes after the schema is approved.
-
-```mermaid
-flowchart LR
-    A["v0.x<br/>unfrozen · may reshape"]:::now --> B["v0.1.0<br/>this draft · pending approval"] --> C["v1.0.0<br/>the freeze · rule is law"]:::frozen
-
-    classDef now fill:#fff7ed,stroke:#f59e0b,color:#7c2d12;
-    classDef frozen fill:#eff6ff,stroke:#3b82f6,color:#1e3a8a;
-```
 
 ---
 

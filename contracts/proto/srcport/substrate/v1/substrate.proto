@@ -255,9 +255,9 @@ message Derivation {
 message DerivationList { repeated Derivation derivations = 1; }
 
 // ─── KERNEL ABI ─────────────────────────────────────────────────────────────
-// The seam every SDK implements. The v0.1 Rust SDK realises this IN-PROCESS
-// (Rust methods mirroring these RPCs). This service definition is the canonical
-// WIRE ABI for the day a cross-process or cross-language SDK is needed.
+// The seam every SDK implements. Rust, Go, and Python each realise it IN-PROCESS
+// today (methods mirroring these RPCs). This service definition is the canonical
+// WIRE ABI for the day a cross-process SDK is needed.
 
 message RegisterAck   { Lifecycle state = 1; }
 message PublishAck    { uint64 seq = 1; }

@@ -36,7 +36,7 @@ func main() {
 		Name:    "recon",
 		Version: "0.1.0",
 		Provides: []*substrate.Capability{
-			{Name: "recon.scan", Contract: "acme.recon.v1.Host"},
+			{Name: "recon.scan", Outputs: []*substrate.Port{{Name: "host", Contract: "acme.recon.v1.Host"}}},
 		},
 	})
 
@@ -47,12 +47,13 @@ func main() {
 		ProducedBy: "recon",
 	})
 
-	// 3. ...and publishes an event. Coupling is only through contract refs.
+	// 3. ...and publishes an event. Artifact refs are the data plane; coupling
+	//    is only through contract refs.
 	k.Publish(&substrate.Event{
-		Topic:   "recon.host.found",
-		Type:    "acme.recon.v1.Host",
-		Payload: []byte(host.Id),
-		Source:  "recon",
+		Topic:     "recon.host.found",
+		Type:      "acme.recon.v1.Host",
+		Artifacts: []*substrate.ArtifactRef{host},
+		Source:    "recon",
 	})
 
 	// 4. Before anything irreversible, open a human-held gate and wait.

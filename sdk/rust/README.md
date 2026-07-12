@@ -23,7 +23,7 @@ kernel.register(ModuleManifest {
     version: "0.1.0".into(),
     provides: vec![Capability {
         name: "recon.scan".into(),
-        contract: "acme.recon.v1.Host".into(),
+        outputs: vec![Port { name: "host".into(), contract: "acme.recon.v1.Host".into(), ..Default::default() }],
         ..Default::default()
     }],
     requires: vec![],
@@ -37,11 +37,12 @@ let host = kernel.put_artifact(Artifact {
     ..Default::default()
 });
 
-// 3. ...and publishes an event. Coupling is only through contract refs.
+// 3. ...and publishes an event. Artifact refs are the data plane; coupling is
+//    only through contract refs.
 kernel.publish(Event {
     topic: "recon.host.found".into(),
     r#type: "acme.recon.v1.Host".into(),
-    payload: host.id.into_bytes(),
+    artifacts: vec![host.clone()],
     source: "recon".into(),
     ..Default::default()
 });

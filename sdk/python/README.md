@@ -23,7 +23,7 @@ pip install "git+https://github.com/philcantcode/srcport-substrate.git#subdirect
 
 ```python
 from srcport_substrate import (
-    Kernel, ModuleManifest, Capability, Artifact, Event, GateRequest,
+    Kernel, ModuleManifest, Capability, Port, Artifact, Event, GateRequest,
 )
 
 kernel = Kernel()
@@ -32,7 +32,7 @@ kernel = Kernel()
 kernel.register(ModuleManifest(
     name="recon",
     version="0.1.0",
-    provides=[Capability(name="recon.scan", contract="acme.recon.v1.Host")],
+    provides=[Capability(name="recon.scan", outputs=[Port(name="host", contract="acme.recon.v1.Host")])],
 ))
 
 # 2. It produces an immutable, content-addressed artifact...
@@ -40,10 +40,11 @@ host = kernel.put_artifact(Artifact(
     type="acme.recon.v1.Host", body=b"10.0.0.1", produced_by="recon",
 ))
 
-# 3. ...and publishes an event. Coupling is only through contract refs.
+# 3. ...and publishes an event. Artifact refs are the data plane; coupling is
+#    only through contract refs.
 kernel.publish(Event(
     topic="recon.host.found", type="acme.recon.v1.Host",
-    payload=host.id.encode(), source="recon",
+    artifacts=[host], source="recon",
 ))
 
 # 4. Before anything irreversible, open a human-held gate and wait.

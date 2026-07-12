@@ -1,0 +1,17 @@
+[package]
+name = "flow-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "LicenseRef-srcport-all-rights-reserved"
+description = "A runnable example: drive a real convergent Run on the Rust SDK, then reconstruct and visualise the dataflow from the tamper-evident ledger alone."
+
+# Depends on the SDK exactly as a downstream project would: by path, through
+# the public ABI. The example imports NOTHING private — if it compiles, the
+# published surface is enough to build a domain on top of the kernel.
+[dependencies]
+srcport-substrate = { path = "../sdk/rust" }
+
+[[bin]]
+name = "flow"
+path = "src/main.rs"
