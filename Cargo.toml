@@ -1,7 +1,0 @@
-# Root workspace. Its only job is to make the SDK crate(s) under sdk/*
-# discoverable at the repo root, so another project can depend on this repo by
-# git URL without pointing at a subdirectory. The contract itself lives in
-# contracts/proto — this file governs the Rust realisations only.
-[workspace]
-resolver = "2"
-members = ["sdk/rust"]

@@ -1,6 +1,4 @@
-# Rust build output. With the root workspace, target/ lives at the repo root;
-# the sdk/* entry covers standalone builds inside a crate dir.
-/target/
+# Rust build output. Each SDK crate under sdk/* builds standalone.
 /sdk/*/target/
 
 # buf
