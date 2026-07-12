@@ -68,6 +68,48 @@ collapse to this.
 
 ---
 
+## Ledger detail — what each entry carries
+
+The Ledger is only as good as what it commits to. `LedgerEntry.detail` is not
+free-form: for every state-bearing `kind` it holds the **canonical protobuf
+encoding of exactly one `substrate.proto` message**, so the chain records not
+merely *that* something happened but *what* — reconstructable, and tamper-evident
+because `detail` is folded into the entry hash.
+
+| `kind` | `detail` message |
+|--------|------------------|
+| `module.registered` | `ModuleManifest` |
+| `module.{loaded,activated,deactivated}` | *(empty — `kind` + `subject` suffice)* |
+| `artifact.put` | `Artifact`, `body` cleared |
+| `event.published` | `Event`, `payload` cleared |
+| `gate.requested` | `GateRequest` |
+| `gate.decided` | `GateDecision` |
+| module `Append` | opaque, module-owned bytes (the kernel never interprets them) |
+
+Where `subject` already commits to large content — an `artifact.put` body is
+addressed by its id; an `event.published` payload travels as an artifact — the
+field is cleared and the log leans on that reference. The chain never duplicates
+blob content into a record it can never prune.
+
+**Canonical form.** Two conformant SDKs must hash identical bytes for the same
+history, or their chains would not cross-verify. So the encoding is pinned:
+
+1. fields in ascending field-number order (proto3 default);
+2. `map<>` entries in ascending key order, compared as raw UTF-8 bytes;
+3. proto3 default-omission, plus the explicit clears above;
+4. no unknown fields; standard varint / fixed-width encodings only.
+
+This is a rule SDKs uphold, **not** a wire change — `detail` was always `bytes`.
+Pin it now, while one SDK exists; discovered after several exist, it is a breaking
+change to chain verification.
+
+> **Status (v0.1).** The Rust SDK enforces this for `gate.requested` /
+> `gate.decided` first — the approval record is the entry where tamper-evidence
+> matters most. The remaining kinds adopt fat detail as it is implemented; the
+> encoding rule above is fixed regardless.
+
+---
+
 ## Evolution policy (why this can be "the last one")
 
 The core stays trustworthy only if it changes by **addition**, never by mutation.
@@ -109,6 +151,11 @@ The minimal conformance suite (each SDK ships it) is:
    and permitted only after `APPROVED`.
 6. **Discovery** — the registry reports every registered module, capability, and
    contract.
+7. **Ledger reconstruction & canonical detail** — a state-bearing entry's `detail`
+   decodes to the message named for its `kind` and reproduces the original value,
+   and re-encoding it canonically is byte-identical, so chains cross-verify. The
+   v0.1 Rust SDK enforces this for gates: a gate's full request and its decision
+   (who / what / why) round-trip from the tamper-evident chain alone.
 
-An SDK is "done" when these six pass and the human-owned contract above is
-unchanged. Everything else in the SDK is a leaf you never have to read.
+An SDK is "done" when these pass and the human-owned contract above is unchanged.
+Everything else in the SDK is a leaf you never have to read.

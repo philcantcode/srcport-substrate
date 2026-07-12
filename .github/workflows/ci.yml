@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The contract is law: it must lint, it may only evolve by addition, and the
+  # committed SDK codegen must match it exactly (no drift).
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking needs main's history
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.50.0
+      - name: Lint the contract
+        run: buf lint
+      - name: Evolve by addition only
+        run: buf breaking --against '.git#branch=main'
+      - name: SDK codegen is in lockstep with the contract
+        run: |
+          bash scripts/gen.sh
+          if ! git diff --quiet; then
+            echo "::error::Generated code is stale. Run scripts/gen.sh and commit the result."
+            git --no-pager diff --stat
+            exit 1
+          fi
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Test (types are generated from the proto by build.rs)
+        run: cargo test --manifest-path sdk/rust/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --manifest-path sdk/rust/Cargo.toml --all-targets -- -D warnings
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Vet
+        run: go vet ./...
+        working-directory: sdk/go
+      - name: Test
+        run: go test ./...
+        working-directory: sdk/go
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the SDK
+        run: pip install ./sdk/python
+      - name: Conformance suite
+        run: python -m unittest discover -s sdk/python/tests -v

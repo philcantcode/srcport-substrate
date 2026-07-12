@@ -2,156 +2,62 @@
 // microkernel: seven primitives (Module · Artifact · Contract · Event ·
 // Ledger · Gate · Registry) and one Kernel ABI, conformant to SPEC.md.
 //
-// The types below are a faithful hand-port of the canonical contract in
-// contracts/proto/srcport/substrate/v1/substrate.proto — that proto remains
-// the single source of truth. Field names and numbering mirror it; do not
-// re-derive the core, widen the proto and follow it.
+// The message types are GENERATED from the canonical contract in
+// contracts/proto/srcport/substrate/v1/substrate.proto (see buf.gen.yaml and
+// scripts/gen.sh) and re-exported here as aliases, so this SDK can never drift
+// from the contract. To add capability, widen the proto and regenerate; do not
+// re-derive the core.
 package substrate
 
 import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+
+	pb "github.com/philcantcode/srcport-substrate/sdk/go/internal/genpb/srcport/substrate/v1"
 )
 
-// ─── enums ──────────────────────────────────────────────────────────────────
+// ─── the seven primitives + ABI acks, aliased to the generated types ─────────
+// These ARE the protobuf messages; construct with a pointer, e.g.
+// &substrate.Artifact{Type: "…", Body: …}.
 
-type Lifecycle int32
+type (
+	Capability       = pb.Capability
+	ModuleManifest   = pb.ModuleManifest
+	Artifact         = pb.Artifact
+	ArtifactRef      = pb.ArtifactRef
+	Contract         = pb.Contract
+	Event            = pb.Event
+	Subscription     = pb.Subscription
+	LedgerEntry      = pb.LedgerEntry
+	GateRequest      = pb.GateRequest
+	GateDecision     = pb.GateDecision
+	GateTicket       = pb.GateTicket
+	RegistrySnapshot = pb.RegistrySnapshot
+	RegisterAck      = pb.RegisterAck
+	PublishAck       = pb.PublishAck
+	AppendRequest    = pb.AppendRequest
 
+	Lifecycle = pb.Lifecycle
+	Decision  = pb.Decision
+)
+
+// Lifecycle values (REGISTERED → LOADED → ACTIVE → DEACTIVATED).
 const (
-	LifecycleUnspecified Lifecycle = 0
-	LifecycleRegistered  Lifecycle = 1
-	LifecycleLoaded      Lifecycle = 2
-	LifecycleActive      Lifecycle = 3
-	LifecycleDeactivated Lifecycle = 4
+	LifecycleUnspecified = pb.Lifecycle_LIFECYCLE_UNSPECIFIED
+	LifecycleRegistered  = pb.Lifecycle_LIFECYCLE_REGISTERED
+	LifecycleLoaded      = pb.Lifecycle_LIFECYCLE_LOADED
+	LifecycleActive      = pb.Lifecycle_LIFECYCLE_ACTIVE
+	LifecycleDeactivated = pb.Lifecycle_LIFECYCLE_DEACTIVATED
 )
 
-type Decision int32
-
+// Gate decisions.
 const (
-	DecisionUnspecified Decision = 0
-	DecisionPending     Decision = 1
-	DecisionApproved    Decision = 2
-	DecisionRejected    Decision = 3
+	DecisionUnspecified = pb.Decision_DECISION_UNSPECIFIED
+	DecisionPending     = pb.Decision_DECISION_PENDING
+	DecisionApproved    = pb.Decision_DECISION_APPROVED
+	DecisionRejected    = pb.Decision_DECISION_REJECTED
 )
-
-func (d Decision) String() string {
-	switch d {
-	case DecisionPending:
-		return "PENDING"
-	case DecisionApproved:
-		return "APPROVED"
-	case DecisionRejected:
-		return "REJECTED"
-	default:
-		return "UNSPECIFIED"
-	}
-}
-
-// ─── 1. Module ──────────────────────────────────────────────────────────────
-
-// Capability is a named thing a module can do, bound to the contract it speaks.
-type Capability struct {
-	Name     string // e.g. "recon.scan"
-	Contract string // contract ref, e.g. "acme.recon.v1.ScanRequest"
-}
-
-// ModuleManifest declares what a module provides and requires. It never imports
-// another module.
-type ModuleManifest struct {
-	Name     string
-	Version  string
-	Provides []Capability
-	Requires []string // capability names that must be present
-}
-
-// ─── 2. Artifact ────────────────────────────────────────────────────────────
-
-// Artifact is a typed, content-addressed, immutable value that flows between
-// modules. The kernel never parses Body; Type (a contract ref) says what it is.
-type Artifact struct {
-	ID         string // content address, assigned by the kernel
-	Type       string // contract ref describing Body
-	Body       []byte // opaque encoded value
-	Meta       map[string]string
-	ProducedBy string // module name
-}
-
-type ArtifactRef struct{ ID string }
-
-// ─── 3. Contract ────────────────────────────────────────────────────────────
-
-// Contract is the declarative schema that is the sole coupling point.
-type Contract struct {
-	Ref    string // fully-qualified name, e.g. "acme.recon.v1.Host"
-	Schema string // schema text (proto / JSON Schema); may be empty
-}
-
-// ─── 4. Event ───────────────────────────────────────────────────────────────
-
-// Event is a bus message. Modules publish/subscribe to topics; Seq is a total
-// order assigned by the kernel.
-type Event struct {
-	ID      string
-	Topic   string // dotted, e.g. "recon.host.found"
-	Type    string // contract ref of payload
-	Payload []byte
-	Source  string // module name
-	Seq     uint64 // kernel-assigned, monotonic
-}
-
-type Subscription struct {
-	Module string
-	Topics []string
-}
-
-// ─── 5. Ledger ──────────────────────────────────────────────────────────────
-
-// LedgerEntry is one link in the append-only, hash-chained record.
-type LedgerEntry struct {
-	Seq      uint64
-	Kind     string // "module.registered", "artifact.put", "event.published", …
-	Subject  string // id of the thing this entry is about
-	Detail   []byte
-	PrevHash string // hash of entry seq-1 ("" for genesis)
-	Hash     string // sha256 over (seq, kind, subject, detail, prev_hash)
-}
-
-// ─── 6. Gate ────────────────────────────────────────────────────────────────
-
-type GateRequest struct {
-	ID          string
-	Action      string // human-readable description of the irreversible act
-	Context     []byte // evidence the human decides on
-	RequestedBy string // module name
-}
-
-type GateDecision struct {
-	RequestID string
-	Decision  Decision
-	DecidedBy string // human identity
-	Reason    string
-}
-
-type GateTicket struct{ RequestID string }
-
-// ─── 7. Registry ────────────────────────────────────────────────────────────
-
-type RegistrySnapshot struct {
-	Modules      []ModuleManifest
-	Capabilities []Capability
-	Contracts    []Contract
-}
-
-// ─── ABI acks ───────────────────────────────────────────────────────────────
-
-type RegisterAck struct{ State Lifecycle }
-type PublishAck struct{ Seq uint64 }
-type AppendRequest struct {
-	Kind    string
-	Subject string
-	Detail  []byte
-}
 
 // ─── addressing & ledger hashing — the two hash rules SPEC.md pins down ──────
 
@@ -192,7 +98,7 @@ func ledgerHash(seq uint64, kind, subject string, detail []byte, prevHash string
 // VerifyChain checks a ledger end-to-end: every entry's Hash must recompute
 // from its own fields, and every PrevHash must equal the previous entry's Hash
 // (genesis links to ""). Tampering with any committed entry breaks this.
-func VerifyChain(entries []LedgerEntry) bool {
+func VerifyChain(entries []*LedgerEntry) bool {
 	prev := ""
 	for i, e := range entries {
 		if e.Seq != uint64(i) || e.PrevHash != prev {

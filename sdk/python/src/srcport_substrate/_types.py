@@ -1,175 +1,40 @@
-"""Message types + the two hash rules SPEC.md pins down.
+"""Message types (re-exported from the generated protobuf code) + the two hash
+rules SPEC.md pins down.
 
-These dataclasses are a faithful hand-port of the canonical contract in
-``contracts/proto/srcport/substrate/v1/substrate.proto`` — that proto remains
-the single source of truth. Field names mirror it; do not re-derive the core,
-widen the proto and follow it.
+The messages are GENERATED from the canonical contract in
+``contracts/proto/srcport/substrate/v1/substrate.proto`` (see buf.gen.yaml and
+scripts/gen.sh) and re-exported here, so this SDK can never drift from the
+contract. To add capability, widen the proto and regenerate; do not re-derive
+the core.
+
+Note the generated ergonomics: construct with keyword args
+(``Artifact(type="…", body=b"…")``); enum values are fully qualified
+(``Decision.DECISION_APPROVED``, ``Lifecycle.LIFECYCLE_REGISTERED``).
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
-from enum import IntEnum
 
-# ─── enums ──────────────────────────────────────────────────────────────────
-
-
-class Lifecycle(IntEnum):
-    UNSPECIFIED = 0
-    REGISTERED = 1
-    LOADED = 2
-    ACTIVE = 3
-    DEACTIVATED = 4
-
-
-class Decision(IntEnum):
-    UNSPECIFIED = 0
-    PENDING = 1
-    APPROVED = 2
-    REJECTED = 3
-
-
-# ─── 1. Module ──────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Capability:
-    """A named thing a module can do, bound to the contract it speaks."""
-
-    name: str = ""  # e.g. "recon.scan"
-    contract: str = ""  # contract ref, e.g. "acme.recon.v1.ScanRequest"
-
-
-@dataclass
-class ModuleManifest:
-    """Declares what a module provides and requires. Never imports another."""
-
-    name: str = ""
-    version: str = ""
-    provides: list[Capability] = field(default_factory=list)
-    requires: list[str] = field(default_factory=list)
-
-
-# ─── 2. Artifact ────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Artifact:
-    """A typed, content-addressed, immutable value that flows between modules."""
-
-    id: str = ""  # content address, assigned by the kernel
-    type: str = ""  # contract ref describing body
-    body: bytes = b""  # opaque encoded value
-    meta: dict[str, str] = field(default_factory=dict)
-    produced_by: str = ""  # module name
-
-
-@dataclass
-class ArtifactRef:
-    id: str = ""
-
-
-# ─── 3. Contract ────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Contract:
-    """The declarative schema that is the sole coupling point."""
-
-    ref: str = ""  # fully-qualified name, e.g. "acme.recon.v1.Host"
-    schema: str = ""  # schema text (proto / JSON Schema); may be empty
-
-
-# ─── 4. Event ───────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Event:
-    """A bus message. ``seq`` is a total order assigned by the kernel."""
-
-    id: str = ""
-    topic: str = ""  # dotted, e.g. "recon.host.found"
-    type: str = ""  # contract ref of payload
-    payload: bytes = b""
-    source: str = ""  # module name
-    seq: int = 0  # kernel-assigned, monotonic
-
-
-@dataclass
-class Subscription:
-    module: str = ""
-    topics: list[str] = field(default_factory=list)
-
-
-# ─── 5. Ledger ──────────────────────────────────────────────────────────────
-
-
-@dataclass
-class LedgerEntry:
-    """One link in the append-only, hash-chained record."""
-
-    seq: int = 0
-    kind: str = ""  # "module.registered", "artifact.put", "event.published", …
-    subject: str = ""  # id of the thing this entry is about
-    detail: bytes = b""
-    prev_hash: str = ""  # hash of entry seq-1 ("" for genesis)
-    hash: str = ""  # sha256 over (seq, kind, subject, detail, prev_hash)
-
-
-# ─── 6. Gate ────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class GateRequest:
-    id: str = ""
-    action: str = ""  # human-readable description of the irreversible act
-    context: bytes = b""  # evidence the human decides on
-    requested_by: str = ""  # module name
-
-
-@dataclass
-class GateDecision:
-    request_id: str = ""
-    decision: Decision = Decision.UNSPECIFIED
-    decided_by: str = ""  # human identity
-    reason: str = ""
-
-
-@dataclass
-class GateTicket:
-    request_id: str = ""
-
-
-# ─── 7. Registry ────────────────────────────────────────────────────────────
-
-
-@dataclass
-class RegistrySnapshot:
-    modules: list[ModuleManifest] = field(default_factory=list)
-    capabilities: list[Capability] = field(default_factory=list)
-    contracts: list[Contract] = field(default_factory=list)
-
-
-# ─── ABI acks ───────────────────────────────────────────────────────────────
-
-
-@dataclass
-class RegisterAck:
-    state: Lifecycle = Lifecycle.UNSPECIFIED
-
-
-@dataclass
-class PublishAck:
-    seq: int = 0
-
-
-@dataclass
-class AppendRequest:
-    kind: str = ""
-    subject: str = ""
-    detail: bytes = b""
-
+from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
+    AppendRequest,
+    Artifact,
+    ArtifactRef,
+    Capability,
+    Contract,
+    Decision,
+    Event,
+    GateDecision,
+    GateRequest,
+    GateTicket,
+    LedgerEntry,
+    Lifecycle,
+    ModuleManifest,
+    PublishAck,
+    RegisterAck,
+    RegistrySnapshot,
+    Subscription,
+)
 
 # ─── addressing & ledger hashing ────────────────────────────────────────────
 
@@ -206,7 +71,7 @@ def _ledger_hash(
     return h.hexdigest()
 
 
-def verify_chain(entries: list[LedgerEntry]) -> bool:
+def verify_chain(entries: "list[LedgerEntry]") -> bool:
     """Verify a ledger end-to-end. Tampering with any committed entry breaks it."""
     prev = ""
     for i, e in enumerate(entries):

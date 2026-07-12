@@ -25,6 +25,11 @@ pub mod proto {
 
 pub use proto::*;
 
+/// The protobuf codec trait, re-exported so callers — and the conformance
+/// suite — can encode/decode `detail` payloads and artifact bodies without
+/// taking a direct `prost` dependency.
+pub use prost::Message;
+
 // ─────────────────────────────────────────────────────────────────────────
 // Errors
 // ─────────────────────────────────────────────────────────────────────────
@@ -341,7 +346,8 @@ impl Kernel {
 
     /// `rpc RequestGate(GateRequest) -> GateTicket`. Opens a human-held
     /// checkpoint in `PENDING`. The module must not proceed with the guarded
-    /// action until a human decides.
+    /// action until a human decides. The full request is committed to the
+    /// tamper-evident ledger.
     pub fn request_gate(&self, mut req: GateRequest) -> GateTicket {
         let mut state = self.state.lock().unwrap();
         if req.id.is_empty() {
@@ -358,12 +364,18 @@ impl Kernel {
                 reason: String::new(),
             },
         );
-        Self::append_locked(&mut state, "gate.requested", &id, req.context);
+        // The full request lands in the tamper-evident chain — action,
+        // requested_by, and context are the evidence an auditor (or a human
+        // after a restart) reconstructs. `detail` is the canonical encoding of
+        // the GateRequest; see SPEC.md "Ledger detail".
+        let detail = req.encode_to_vec();
+        Self::append_locked(&mut state, "gate.requested", &id, detail);
         GateTicket { request_id: id }
     }
 
     /// `rpc DecideGate(GateDecision) -> GateDecision`. A human records
-    /// APPROVED or REJECTED. Wakes anyone in [`Kernel::await_gate`].
+    /// APPROVED or REJECTED. Wakes anyone in [`Kernel::await_gate`]. The
+    /// decision is committed to the tamper-evident ledger.
     pub fn decide_gate(&self, decision: GateDecision) -> Result<GateDecision> {
         let d = decision.decision();
         if d != Decision::Approved && d != Decision::Rejected {
@@ -375,7 +387,12 @@ impl Kernel {
         }
         let id = decision.request_id.clone();
         state.gates.insert(id.clone(), decision.clone());
-        Self::append_locked(&mut state, "gate.decided", &id, Vec::new());
+        // The decision itself — who decided, what, and why — is hash-committed,
+        // so the approval record can't be rewritten without breaking the chain.
+        // Previously only the gate id landed here, leaving the decision outside
+        // the tamper-evident log. `detail` is the canonical GateDecision.
+        let detail = decision.encode_to_vec();
+        Self::append_locked(&mut state, "gate.decided", &id, detail);
         drop(state);
         self.gate_signal.notify_all();
         Ok(decision)

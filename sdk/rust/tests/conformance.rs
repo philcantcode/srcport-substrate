@@ -1,6 +1,6 @@
 //! The minimal conformance suite from `SPEC.md` §Conformance. An SDK is
-//! conformant iff all six pass. Each test names the primitive and invariant it
-//! pins down. If you widen the contract, add tests here — never weaken these.
+//! conformant iff all of them pass. Each test names the primitive and invariant
+//! it pins down. If you widen the contract, add tests here — never weaken these.
 
 use std::collections::HashMap;
 use std::thread;
@@ -257,6 +257,62 @@ fn await_gate_blocks_until_decided() {
     let decision = k.await_gate(&t).unwrap();
     assert_eq!(decision.decision(), Decision::Approved);
     decider.join().unwrap();
+}
+
+// 7. LEDGER RECONSTRUCTION & CANONICAL DETAIL — a gate's request and decision
+//    round-trip from the tamper-evident chain alone (`detail` carries the
+//    canonical message), and forging the recorded decision breaks verification.
+#[test]
+fn gate_request_and_decision_are_in_the_chain() {
+    let k = Kernel::new();
+
+    let t = k.request_gate(GateRequest {
+        action: "delete production".into(),
+        context: b"rows=42".to_vec(),
+        requested_by: "danger-module".into(),
+        ..Default::default()
+    });
+    k.decide_gate(GateDecision {
+        request_id: t.request_id.clone(),
+        decision: Decision::Approved as i32,
+        decided_by: "phil".into(),
+        reason: "reviewed the evidence".into(),
+    })
+    .unwrap();
+
+    let chain = k.ledger();
+
+    // The request reconstructs from the chain: action, requester, and evidence.
+    let req_entry = chain.iter().find(|e| e.kind == "gate.requested").unwrap();
+    let req = GateRequest::decode(&req_entry.detail[..]).unwrap();
+    assert_eq!(req.action, "delete production");
+    assert_eq!(req.requested_by, "danger-module");
+    assert_eq!(req.context, b"rows=42");
+
+    // The decision reconstructs too: who decided, what, and why.
+    let dec_entry = chain.iter().find(|e| e.kind == "gate.decided").unwrap();
+    let dec = GateDecision::decode(&dec_entry.detail[..]).unwrap();
+    assert_eq!(dec.decision(), Decision::Approved);
+    assert_eq!(dec.decided_by, "phil");
+    assert_eq!(dec.reason, "reviewed the evidence");
+
+    assert!(k.verify_ledger(), "the chain with fat detail still verifies");
+
+    // The approval record is now hash-committed: forging who approved it (by
+    // re-encoding a different decider into `detail`) breaks verification.
+    let mut forged = chain.clone();
+    let idx = forged.iter().position(|e| e.kind == "gate.decided").unwrap();
+    forged[idx].detail = GateDecision {
+        request_id: t.request_id.clone(),
+        decision: Decision::Approved as i32,
+        decided_by: "attacker".into(),
+        reason: "reviewed the evidence".into(),
+    }
+    .encode_to_vec();
+    assert!(
+        !verify_chain(&forged),
+        "rewriting the recorded decision must break the chain"
+    );
 }
 
 // 6. DISCOVERY — the registry reports every module, capability, and contract.

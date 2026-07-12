@@ -9,13 +9,13 @@ import (
 	"time"
 )
 
-func recv(t *testing.T, ch <-chan Event, d time.Duration) (Event, bool) {
+func recv(t *testing.T, ch <-chan *Event, d time.Duration) (*Event, bool) {
 	t.Helper()
 	select {
 	case e := <-ch:
 		return e, true
 	case <-time.After(d):
-		return Event{}, false
+		return nil, false
 	}
 }
 
@@ -23,24 +23,24 @@ func recv(t *testing.T, ch <-chan Event, d time.Duration) (Event, bool) {
 func TestAddressingIsContentDerivedAndMetamorphic(t *testing.T) {
 	k := NewKernel()
 
-	a := k.PutArtifact(Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "recon"})
-	b := k.PutArtifact(Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "someone-else"})
-	if a.ID != b.ID {
-		t.Fatalf("same (type, body) must yield the same id: %s != %s", a.ID, b.ID)
+	a := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "recon"})
+	b := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"), ProducedBy: "someone-else"})
+	if a.Id != b.Id {
+		t.Fatalf("same (type, body) must yield the same id: %s != %s", a.Id, b.Id)
 	}
-	if len(a.ID) < 7 || a.ID[:7] != "sha256:" {
-		t.Fatalf("id must be sha256-prefixed, got %s", a.ID)
+	if len(a.Id) < 7 || a.Id[:7] != "sha256:" {
+		t.Fatalf("id must be sha256-prefixed, got %s", a.Id)
 	}
 
-	c := k.PutArtifact(Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.2")})
-	if a.ID == c.ID {
+	c := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Host", Body: []byte("10.0.0.2")})
+	if a.Id == c.Id {
 		t.Fatal("a one-byte change must change the address")
 	}
-	d := k.PutArtifact(Artifact{Type: "acme.recon.v1.Port", Body: []byte("10.0.0.1")})
-	if a.ID == d.ID {
+	d := k.PutArtifact(&Artifact{Type: "acme.recon.v1.Port", Body: []byte("10.0.0.1")})
+	if a.Id == d.Id {
 		t.Fatal("type must participate in the address")
 	}
-	if a.ID != ArtifactID("acme.recon.v1.Host", []byte("10.0.0.1")) {
+	if a.Id != ArtifactID("acme.recon.v1.Host", []byte("10.0.0.1")) {
 		t.Fatal("pure function must agree with the kernel")
 	}
 }
@@ -49,7 +49,7 @@ func TestAddressingIsContentDerivedAndMetamorphic(t *testing.T) {
 func TestArtifactsAreImmutable(t *testing.T) {
 	k := NewKernel()
 
-	r := k.PutArtifact(Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "true"}})
+	r := k.PutArtifact(&Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "true"}})
 	got, err := k.GetArtifact(r)
 	if err != nil {
 		t.Fatal(err)
@@ -63,8 +63,8 @@ func TestArtifactsAreImmutable(t *testing.T) {
 
 	// A later put of the same content with different meta must NOT change what
 	// is stored. First write wins.
-	r2 := k.PutArtifact(Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "false", "sneaky": "yes"}})
-	if r2.ID != r.ID {
+	r2 := k.PutArtifact(&Artifact{Type: "t", Body: []byte("payload"), Meta: map[string]string{"first": "false", "sneaky": "yes"}})
+	if r2.Id != r.Id {
 		t.Fatal("same content ⇒ same id")
 	}
 	after, _ := k.GetArtifact(r)
@@ -80,12 +80,12 @@ func TestArtifactsAreImmutable(t *testing.T) {
 //    order, and never reach non-subscribers.
 func TestEventsAreOrderedAndIsolated(t *testing.T) {
 	k := NewKernel()
-	hosts := k.Subscribe(Subscription{Module: "a", Topics: []string{"recon.host.found"}})
-	ports := k.Subscribe(Subscription{Module: "b", Topics: []string{"recon.port.found"}})
+	hosts := k.Subscribe(&Subscription{Module: "a", Topics: []string{"recon.host.found"}})
+	ports := k.Subscribe(&Subscription{Module: "b", Topics: []string{"recon.port.found"}})
 
-	s1 := k.Publish(Event{Topic: "recon.host.found", Payload: []byte("h1")}).Seq
-	s2 := k.Publish(Event{Topic: "recon.host.found", Payload: []byte("h2")}).Seq
-	s3 := k.Publish(Event{Topic: "recon.port.found", Payload: []byte("p1")}).Seq
+	s1 := k.Publish(&Event{Topic: "recon.host.found", Payload: []byte("h1")}).Seq
+	s2 := k.Publish(&Event{Topic: "recon.host.found", Payload: []byte("h2")}).Seq
+	s3 := k.Publish(&Event{Topic: "recon.port.found", Payload: []byte("p1")}).Seq
 
 	if !(s1 < s2 && s2 < s3) {
 		t.Fatalf("seq must be monotonic across topics: %d %d %d", s1, s2, s3)
@@ -115,9 +115,9 @@ func TestEventsAreOrderedAndIsolated(t *testing.T) {
 // 4. LEDGER INTEGRITY — the chain verifies; tampering breaks verification.
 func TestLedgerIsTamperEvident(t *testing.T) {
 	k := NewKernel()
-	k.Register(ModuleManifest{Name: "m", Version: "0.1.0"})
-	k.PutArtifact(Artifact{Type: "t", Body: []byte("x")})
-	k.Append(AppendRequest{Kind: "domain.fact", Subject: "s", Detail: []byte("d")})
+	k.Register(&ModuleManifest{Name: "m", Version: "0.1.0"})
+	k.PutArtifact(&Artifact{Type: "t", Body: []byte("x")})
+	k.Append(&AppendRequest{Kind: "domain.fact", Subject: "s", Detail: []byte("d")})
 
 	chain := k.Ledger()
 	if len(chain) < 3 {
@@ -133,7 +133,8 @@ func TestLedgerIsTamperEvident(t *testing.T) {
 		t.Fatal("tampering must break verification")
 	}
 
-	spliced := append(k.Ledger()[:1], k.Ledger()[2:]...)
+	full := k.Ledger()
+	spliced := append(full[:1], full[2:]...)
 	if VerifyChain(spliced) {
 		t.Fatal("removing an entry must break the chain")
 	}
@@ -143,24 +144,24 @@ func TestLedgerIsTamperEvident(t *testing.T) {
 func TestGatesAreNonBypassable(t *testing.T) {
 	k := NewKernel()
 
-	tkt := k.RequestGate(GateRequest{Action: "delete production", RequestedBy: "danger"})
+	tkt := k.RequestGate(&GateRequest{Action: "delete production", RequestedBy: "danger"})
 	var blocked *GateBlockedError
 	if err := k.EnsureApproved(tkt); !errors.As(err, &blocked) || blocked.Decision != DecisionPending {
 		t.Fatalf("must be blocked while PENDING, got %v", err)
 	}
 
-	if _, err := k.DecideGate(GateDecision{RequestID: tkt.RequestID, Decision: DecisionRejected, DecidedBy: "phil", Reason: "no"}); err != nil {
+	if _, err := k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionRejected, DecidedBy: "phil", Reason: "no"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := k.EnsureApproved(tkt); !errors.As(err, &blocked) || blocked.Decision != DecisionRejected {
 		t.Fatalf("REJECTED must block, got %v", err)
 	}
 
-	t2 := k.RequestGate(GateRequest{Action: "delete production"})
+	t2 := k.RequestGate(&GateRequest{Action: "delete production"})
 	if err := k.EnsureApproved(t2); err == nil {
 		t.Fatal("fresh gate must block")
 	}
-	if _, err := k.DecideGate(GateDecision{RequestID: t2.RequestID, Decision: DecisionApproved, DecidedBy: "phil"}); err != nil {
+	if _, err := k.DecideGate(&GateDecision{RequestId: t2.RequestId, Decision: DecisionApproved, DecidedBy: "phil"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := k.EnsureApproved(t2); err != nil {
@@ -168,7 +169,7 @@ func TestGatesAreNonBypassable(t *testing.T) {
 	}
 
 	// A non-decision is rejected at the ABI.
-	if _, err := k.DecideGate(GateDecision{RequestID: t2.RequestID, Decision: DecisionPending}); !errors.Is(err, ErrNotADecision) {
+	if _, err := k.DecideGate(&GateDecision{RequestId: t2.RequestId, Decision: DecisionPending}); !errors.Is(err, ErrNotADecision) {
 		t.Fatalf("PENDING is not a decision, got %v", err)
 	}
 }
@@ -176,10 +177,10 @@ func TestGatesAreNonBypassable(t *testing.T) {
 // 5b. AwaitGate really blocks until a human decides.
 func TestAwaitGateBlocksUntilDecided(t *testing.T) {
 	k := NewKernel()
-	tkt := k.RequestGate(GateRequest{Action: "irreversible"})
+	tkt := k.RequestGate(&GateRequest{Action: "irreversible"})
 
 	go func() {
-		k.DecideGate(GateDecision{RequestID: tkt.RequestID, Decision: DecisionApproved, DecidedBy: "phil"})
+		k.DecideGate(&GateDecision{RequestId: tkt.RequestId, Decision: DecisionApproved, DecidedBy: "phil"})
 	}()
 
 	d, err := k.AwaitGate(tkt)
@@ -194,13 +195,13 @@ func TestAwaitGateBlocksUntilDecided(t *testing.T) {
 // 6. DISCOVERY — the registry reports every module, capability, and contract.
 func TestRegistryReportsEverything(t *testing.T) {
 	k := NewKernel()
-	k.Register(ModuleManifest{
+	k.Register(&ModuleManifest{
 		Name: "recon", Version: "0.1.0",
-		Provides: []Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
+		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
 	})
-	k.Register(ModuleManifest{
+	k.Register(&ModuleManifest{
 		Name: "report", Version: "0.2.0",
-		Provides: []Capability{{Name: "report.render", Contract: "acme.report.v1.Report"}},
+		Provides: []*Capability{{Name: "report.render", Contract: "acme.report.v1.Report"}},
 		Requires: []string{"recon.scan"},
 	})
 
@@ -216,7 +217,7 @@ func TestRegistryReportsEverything(t *testing.T) {
 	}
 }
 
-func hasModule(ms []ModuleManifest, name string) bool {
+func hasModule(ms []*ModuleManifest, name string) bool {
 	for _, m := range ms {
 		if m.Name == name {
 			return true
@@ -224,7 +225,7 @@ func hasModule(ms []ModuleManifest, name string) bool {
 	}
 	return false
 }
-func hasCap(cs []Capability, name string) bool {
+func hasCap(cs []*Capability, name string) bool {
 	for _, c := range cs {
 		if c.Name == name {
 			return true
@@ -232,7 +233,7 @@ func hasCap(cs []Capability, name string) bool {
 	}
 	return false
 }
-func hasContract(cs []Contract, ref string) bool {
+func hasContract(cs []*Contract, ref string) bool {
 	for _, c := range cs {
 		if c.Ref == ref {
 			return true

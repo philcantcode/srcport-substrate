@@ -85,7 +85,9 @@ message LedgerEntry {
   uint64 seq       = 1;
   string kind      = 2;  // "module.activated", "artifact.put", "event.published", …
   string subject   = 3;  // id of the thing this entry is about
-  bytes  detail    = 4;
+  bytes  detail    = 4;  // canonical proto of one message, keyed by `kind` (see
+                         // SPEC.md "Ledger detail"); content already addressed by
+                         // `subject`, e.g. an artifact body, is cleared.
   string prev_hash = 5;  // hash of entry seq-1 ("" for genesis)
   string hash      = 6;  // sha256 over (seq, kind, subject, detail, prev_hash)
 }

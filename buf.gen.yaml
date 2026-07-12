@@ -1,0 +1,30 @@
+# Code generation from the canonical contract. `buf generate` turns
+# substrate.proto into the typed messages each SDK uses, so the Go and Python
+# SDKs can never drift from the contract (the Rust SDK already generates via
+# build.rs). Plugin versions are PINNED so the emitted gencode always matches a
+# runtime the SDKs depend on — never bump these without bumping the SDK deps.
+#
+# Managed mode keeps substrate.proto language-neutral: no go_package or other
+# per-language options leak into the human-owned contract.
+#
+#   scripts/gen.sh        # regenerate
+#   buf lint              # keep the contract clean
+#   buf breaking --against '.git#branch=main'
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/philcantcode/srcport-substrate/sdk/go/internal/genpb
+plugins:
+  # Go — canonical protoc-gen-go (google.golang.org/protobuf runtime).
+  - remote: buf.build/protocolbuffers/go:v1.36.5
+    out: sdk/go/internal/genpb
+    opt: paths=source_relative
+
+  # Python — canonical protobuf (_pb2). gencode 5.29.x; requires protobuf
+  # runtime >= 5.29 (see sdk/python/pyproject.toml).
+  - remote: buf.build/protocolbuffers/python:v29.3
+    out: sdk/python/src/srcport_substrate/_gen
+  - remote: buf.build/protocolbuffers/pyi:v29.3
+    out: sdk/python/src/srcport_substrate/_gen

@@ -9,7 +9,6 @@ import unittest
 from srcport_substrate import (
     AppendRequest,
     Artifact,
-    ArtifactRef,
     Capability,
     Decision,
     Event,
@@ -115,25 +114,31 @@ class Conformance(unittest.TestCase):
         t = k.request_gate(GateRequest(action="delete production", requested_by="danger"))
         with self.assertRaises(GateBlocked) as cm:
             k.ensure_approved(t)
-        self.assertEqual(cm.exception.decision, Decision.PENDING)
+        self.assertEqual(cm.exception.decision, Decision.DECISION_PENDING)
 
         k.decide_gate(
-            GateDecision(request_id=t.request_id, decision=Decision.REJECTED, decided_by="phil")
+            GateDecision(
+                request_id=t.request_id, decision=Decision.DECISION_REJECTED, decided_by="phil"
+            )
         )
         with self.assertRaises(GateBlocked) as cm:
             k.ensure_approved(t)
-        self.assertEqual(cm.exception.decision, Decision.REJECTED)
+        self.assertEqual(cm.exception.decision, Decision.DECISION_REJECTED)
 
         t2 = k.request_gate(GateRequest(action="delete production"))
         with self.assertRaises(GateBlocked):
             k.ensure_approved(t2)
         k.decide_gate(
-            GateDecision(request_id=t2.request_id, decision=Decision.APPROVED, decided_by="phil")
+            GateDecision(
+                request_id=t2.request_id, decision=Decision.DECISION_APPROVED, decided_by="phil"
+            )
         )
         k.ensure_approved(t2)  # APPROVED permits — must not raise
 
         with self.assertRaises(NotADecision):
-            k.decide_gate(GateDecision(request_id=t2.request_id, decision=Decision.PENDING))
+            k.decide_gate(
+                GateDecision(request_id=t2.request_id, decision=Decision.DECISION_PENDING)
+            )
 
     # 5b. await_gate really blocks until a human decides.
     def test_await_gate_blocks_until_decided(self):
@@ -142,12 +147,14 @@ class Conformance(unittest.TestCase):
 
         def decide():
             k.decide_gate(
-                GateDecision(request_id=t.request_id, decision=Decision.APPROVED, decided_by="phil")
+                GateDecision(
+                    request_id=t.request_id, decision=Decision.DECISION_APPROVED, decided_by="phil"
+                )
             )
 
         threading.Timer(0.05, decide).start()
         decision = k.await_gate(t)
-        self.assertEqual(decision.decision, Decision.APPROVED)
+        self.assertEqual(decision.decision, Decision.DECISION_APPROVED)
 
     # 6. DISCOVERY — the registry reports every module, capability, and contract.
     def test_registry_reports_everything(self):

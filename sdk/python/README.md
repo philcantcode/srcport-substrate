@@ -3,11 +3,15 @@
 The in-process Python realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
 It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI.
-Stdlib only; no runtime dependencies.
+One runtime dependency: the `protobuf` runtime.
 
-> The dataclasses in [`_types.py`](src/srcport_substrate/_types.py) are a
-> faithful hand-port of `substrate.proto`, which stays the single source of
-> truth. To add capability, widen the proto; do not fork this.
+> The message types are **generated** from `substrate.proto` (via
+> `buf generate`, committed under `src/srcport_substrate/_gen/`) and
+> re-exported from `srcport_substrate`, so the SDK can never drift from the
+> contract. They are canonical protobuf messages: construct with keyword args
+> (`Artifact(type=…, body=…)`) and use fully-qualified enum values
+> (`Decision.DECISION_APPROVED`). To add capability, widen the proto and run
+> `scripts/gen.sh`; do not fork this.
 
 ## Install
 
@@ -47,6 +51,10 @@ ticket = kernel.request_gate(GateRequest(
     action="exploit host 10.0.0.1", requested_by="recon",
 ))
 kernel.ensure_approved(ticket)  # raises GateBlocked until a human APPROVES
+# a human decides:
+#   from srcport_substrate import GateDecision, Decision
+#   kernel.decide_gate(GateDecision(
+#       request_id=ticket.request_id, decision=Decision.DECISION_APPROVED))
 
 # 5. The registry always answers "what exists right now."
 snapshot = kernel.snapshot()

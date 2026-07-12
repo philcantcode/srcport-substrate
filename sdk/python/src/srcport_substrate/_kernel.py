@@ -48,21 +48,24 @@ class GateBlocked(KernelError):
 
     def __init__(self, decision: Decision) -> None:
         self.decision = decision
-        super().__init__(f"gate blocked: decision is {decision.name}, not APPROVED")
+        name = Decision.Name(decision)
+        super().__init__(f"gate blocked: decision is {name}, not APPROVED")
 
 
 _LIFECYCLE_VERB = {
-    Lifecycle.UNSPECIFIED: "unspecified",
-    Lifecycle.REGISTERED: "registered",
-    Lifecycle.LOADED: "loaded",
-    Lifecycle.ACTIVE: "activated",
-    Lifecycle.DEACTIVATED: "deactivated",
+    Lifecycle.LIFECYCLE_UNSPECIFIED: "unspecified",
+    Lifecycle.LIFECYCLE_REGISTERED: "registered",
+    Lifecycle.LIFECYCLE_LOADED: "loaded",
+    Lifecycle.LIFECYCLE_ACTIVE: "activated",
+    Lifecycle.LIFECYCLE_DEACTIVATED: "deactivated",
 }
 
 
 class Kernel:
     """The in-process microkernel. Thread-safe; share one instance across
     module threads. Every meaningful action lands one append-only ledger entry.
+    Values handed in and out are copied, so a caller can never mutate stored
+    state through a shared message.
     """
 
     def __init__(self) -> None:
@@ -93,7 +96,7 @@ class Kernel:
             hash=_ledger_hash(seq, kind, subject, detail, prev_hash),
         )
         self._ledger.append(entry)
-        return entry
+        return copy.deepcopy(entry)
 
     # ── 1. Module ──────────────────────────────────────────────────────────
 
@@ -105,9 +108,11 @@ class Kernel:
             for cap in manifest.provides:
                 self._capabilities.append(copy.deepcopy(cap))
                 self._contracts.setdefault(cap.contract, Contract(ref=cap.contract))
-            self._modules.append([copy.deepcopy(manifest), Lifecycle.REGISTERED])
+            self._modules.append(
+                [copy.deepcopy(manifest), Lifecycle.LIFECYCLE_REGISTERED]
+            )
             self._append_locked("module.registered", manifest.name)
-            return RegisterAck(state=Lifecycle.REGISTERED)
+            return RegisterAck(state=Lifecycle.LIFECYCLE_REGISTERED)
 
     def transition(self, module: str, to: Lifecycle) -> Lifecycle:
         """Advance REGISTERED → LOADED → ACTIVE → DEACTIVATED. Only forward
@@ -187,7 +192,7 @@ class Kernel:
     def ledger(self) -> list[LedgerEntry]:
         """A snapshot copy of the whole ledger, for verification/audit."""
         with self._lock:
-            return copy.deepcopy(self._ledger)
+            return [copy.deepcopy(e) for e in self._ledger]
 
     def verify_ledger(self) -> bool:
         """Verify the kernel's own live ledger."""
@@ -203,13 +208,15 @@ class Kernel:
             if not rid:
                 self._gate_counter += 1
                 rid = f"gate-{self._gate_counter}"
-            self._gates[rid] = GateDecision(request_id=rid, decision=Decision.PENDING)
+            self._gates[rid] = GateDecision(
+                request_id=rid, decision=Decision.DECISION_PENDING
+            )
             self._append_locked("gate.requested", rid, req.context)
             return GateTicket(request_id=rid)
 
     def decide_gate(self, decision: GateDecision) -> GateDecision:
         """rpc DecideGate. Records APPROVED/REJECTED and wakes await_gate()."""
-        if decision.decision not in (Decision.APPROVED, Decision.REJECTED):
+        if decision.decision not in (Decision.DECISION_APPROVED, Decision.DECISION_REJECTED):
             raise NotADecision()
         with self._gate_cv:
             if decision.request_id not in self._gates:
@@ -226,7 +233,7 @@ class Kernel:
                 g = self._gates.get(ticket.request_id)
                 if g is None:
                     raise NotFound(ticket.request_id)
-                if g.decision != Decision.PENDING:
+                if g.decision != Decision.DECISION_PENDING:
                     return copy.deepcopy(g)
                 self._gate_cv.wait()
 
@@ -243,7 +250,7 @@ class Kernel:
         REJECTED both raise GateBlocked. Call before an irreversible act.
         """
         d = self.gate_status(ticket)
-        if d != Decision.APPROVED:
+        if d != Decision.DECISION_APPROVED:
             raise GateBlocked(d)
 
     # ── 7. Registry ────────────────────────────────────────────────────────
