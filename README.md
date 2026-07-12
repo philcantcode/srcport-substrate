@@ -31,10 +31,7 @@ SDKs and backends sit *under* the contract and implement it.
 flowchart TB
     subgraph L1["① domains — horizontal peers, nothing privileged"]
         direction LR
-        M1["VR<br/>module"]
-        M2["Game<br/>module"]
-        M3["Content<br/>module"]
-        M4["Growth<br/>module"]
+        M1["VR<br/>module"] ~~~ M2["Game<br/>module"] ~~~ M3["Content<br/>module"] ~~~ M4["Growth<br/>module"]
     end
 
     ABI["↓ only the Kernel ABI · modules never import each other ↓"]
@@ -43,13 +40,7 @@ flowchart TB
         direction TB
         subgraph Nouns["primitives · the nouns"]
             direction LR
-            P1["① Module"]
-            P2["② Artifact"]
-            P3["③ Contract"]
-            P4["④ Event"]
-            P5["⑤ Ledger"]
-            P6["⑥ Registry"]
-            P7["⑦ Run"]
+            P1["① Module"] ~~~ P2["② Artifact"] ~~~ P3["③ Contract"] ~~~ P4["④ Event"] ~~~ P5["⑤ Ledger"] ~~~ P6["⑥ Registry"] ~~~ P7["⑦ Run"]
         end
         Verbs["Kernel service · the verbs<br/>Register · PutArtifact · Publish · StartRun · Commit · …"]
         Nouns --- Verbs
@@ -59,15 +50,12 @@ flowchart TB
 
     subgraph L3["③ SDKs — conforming implementations"]
         direction LR
-        S1["Rust"]
-        S2["Go"]
-        S3["Python"]
+        S1["Rust"] ~~~ S2["Go"] ~~~ S3["Python"]
     end
 
     subgraph L4["④ KernelApi backends — durability lives here, not in the core"]
         direction LR
-        B1["MemoryKernel<br/>shipped · in-memory"]
-        B2["Your durable store<br/>Postgres · files · …"]
+        B1["MemoryKernel<br/>shipped · in-memory"] ~~~ B2["Your durable store<br/>Postgres · files · …"]
     end
 
     L1 --> ABI --> L2 --> IMPL --> L3 --> L4
@@ -123,21 +111,17 @@ refs (not events) feed runs; every action lands on the ledger.
 flowchart TB
     subgraph Band1["structure · who and what exists"]
         direction LR
-        P1["① Module<br/>vertical slice · typed ports<br/>never imports another module"]
-        P6["⑥ Registry<br/>discovery snapshot<br/>modules · caps · contracts"]
-        P3["③ Contract<br/>sole coupling point<br/>ref pinned to content digest"]
+        P1["① Module<br/>vertical slice · typed ports<br/>never imports another module"] ~~~ P6["⑥ Registry<br/>discovery snapshot<br/>modules · caps · contracts"] ~~~ P3["③ Contract<br/>sole coupling point<br/>ref pinned to content digest"]
     end
 
     subgraph Band2["values · what is said"]
         direction LR
-        P2["② Artifact<br/>data plane · immutable<br/>content-addressed"]
-        P4["④ Event<br/>notification only<br/>total order via seq"]
+        P2["② Artifact<br/>data plane · immutable<br/>content-addressed"] ~~~ P4["④ Event<br/>notification only<br/>total order via seq"]
     end
 
     subgraph Band3["process · what converges and what was recorded"]
         direction LR
-        P7["⑦ Run<br/>bounded assembly<br/>completes · stalls · fails · cancels"]
-        P5["⑤ Ledger<br/>append-only hash chain<br/>tamper-evident history"]
+        P7["⑦ Run<br/>bounded assembly<br/>completes · stalls · fails · cancels"] ~~~ P5["⑤ Ledger<br/>append-only hash chain<br/>tamper-evident history"]
     end
 
     Band1 -->|"contracts type ports and values"| Band2
@@ -193,8 +177,7 @@ Two horizontal modes share one id formula; only the content source differs:
 flowchart TB
     subgraph Modes["two modes · pick one content source"]
         direction LR
-        BI["inline · small<br/>content = body<br/>bytes live in the artifact record"]
-        BE["external · large<br/>content = object_ref_bytes<br/>bytes live in the blob store"]
+        BI["inline · small<br/>content = body<br/>bytes live in the artifact record"] ~~~ BE["external · large<br/>content = object_ref_bytes<br/>bytes live in the blob store"]
     end
 
     subgraph Formula["one formula · both modes"]
@@ -249,68 +232,65 @@ Each `hash = sha256(seq, kind, subject, detail, prev_hash)`.
 
 ## How the primitives converge (the bounded, feed-forward run)
 
-A node is released only after every bound input artifact exists, so fan-in waits
-rather than races; events may wake workers, but artifact refs — not event
-payloads — are the run's data plane.
+A **Run** freezes a finite acyclic assembly plus immutable input **Artifact**
+refs. Modules never call each other: each talks only to the kernel. A node
+becomes claimable only when **every** bound input artifact already exists
+(fan-in waits; it does not race). Events may wake workers, but **artifact refs
+are the data plane** — not event payloads. Every step is appended to the
+**Ledger**.
 
-Layers of one run — owner above, module peers side-by-side, kernel + ledger
-below. Data plane is artifact refs; events only notify.
+Feed-forward shape (left → right):
 
 ```mermaid
-flowchart TB
-    subgraph Owners["assembly owner"]
-        H["Human / host<br/>StartRun · input artifact refs · wait for Answer"]
-    end
+flowchart LR
+    IN["input<br/>ArtifactRefs"] --> UP["upstream node<br/>claim → put → commit"]
+    UP --> MID["intermediate<br/>ArtifactRefs"]
+    MID --> DN["downstream node<br/>claim → put → commit"]
+    DN --> OUT["Answer<br/>ArtifactRef"]
 
-    subgraph Modules["modules · horizontal peers · no direct calls"]
-        direction LR
-        A["Upstream<br/>ClaimReady → PutArtifact → Commit"]
-        B["Downstream<br/>ClaimReady → PutArtifact → Commit"]
-    end
-
-    subgraph KernelBand["kernel · shared seam"]
-        direction LR
-        K["Kernel ABI<br/>readiness · fan-in · termination"]
-        L["⑤ Ledger<br/>run.started · derivation · run.completed"]
-    end
-
-    H -->|"StartRun"| K
-    A -->|"Claim / Put / Commit"| K
-    B -->|"Claim / Put / Commit"| K
-    K -->|"every action appends"| L
-    K -.->|"readiness via artifact refs<br/>data plane · not module-to-module"| B
-
-    classDef o fill:#faf5ff,stroke:#a855f7,color:#581c87;
+    classDef a fill:#ecfdf5,stroke:#10b981,color:#064e3b;
     classDef m fill:#eef2ff,stroke:#6366f1,color:#1e1b4b;
-    classDef k fill:#ecfdf5,stroke:#10b981,color:#064e3b;
-    class H o;
-    class A,B m;
-    class K,L k;
+    class IN,MID,OUT a;
+    class UP,DN m;
 ```
 
-The sequence below is the same story, step by step:
+Same story as a timeline. Read top → bottom; each phase is one closed beat.
+Ledger writes are notes on the kernel (side effects), not a separate actor.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant H as Human / assembly owner
-    participant A as Upstream module
-    participant B as Downstream module
-    participant K as Kernel
-    participant L as ⑤ Ledger
+    actor Owner as Owner
+    participant Kernel as Kernel
+    participant Up as Upstream module
+    participant Down as Downstream module
 
-    H->>K: StartRun(assembly + input artifact refs)
-    K-->>L: run.started
-    A->>K: ClaimReady
-    K-->>A: exact typed inputs
-    A->>K: PutArtifact + Commit(Derivation)
-    K-->>L: derivation.committed
-    Note over B,K: downstream is now ready
-    B->>K: ClaimReady
-    K-->>B: complete fan-in input set
-    B->>K: Put terminal Artifact + Commit
-    K-->>L: run.completed
-    K-->>H: Answer ArtifactRef
+    rect rgb(248, 250, 252)
+        Note over Owner,Kernel: Phase 1 — start the run
+        Owner->>Kernel: StartRun(assembly + input ArtifactRefs)
+        Note right of Kernel: ledger ← run.started<br/>upstream is ready (inputs exist)<br/>downstream is NOT ready yet
+    end
+
+    rect rgb(238, 242, 255)
+        Note over Kernel,Up: Phase 2 — upstream produces intermediate artifacts
+        Up->>Kernel: ClaimReady
+        Kernel-->>Up: typed input ArtifactRefs
+        Up->>Kernel: PutArtifact + Commit(Derivation)
+        Note right of Kernel: ledger ← derivation.committed<br/>downstream fan-in is now complete
+    end
+
+    rect rgb(236, 253, 245)
+        Note over Kernel,Down: Phase 3 — downstream runs only after fan-in
+        Down->>Kernel: ClaimReady
+        Kernel-->>Down: full input ArtifactRefs
+        Down->>Kernel: Put terminal Artifact + Commit
+        Note right of Kernel: ledger ← run.completed
+    end
+
+    rect rgb(255, 247, 237)
+        Note over Owner,Kernel: Phase 4 — answer
+        Kernel-->>Owner: Answer ArtifactRef
+    end
 ```
 
 ---
