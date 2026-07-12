@@ -101,24 +101,48 @@ fn events_are_ordered_and_isolated() {
         topics: vec!["recon.port.found".into()],
     });
 
+    let h1 = k
+        .put_artifact(Artifact {
+            r#type: "acme.recon.v1.Host".into(),
+            body: b"h1".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+    let h2 = k
+        .put_artifact(Artifact {
+            r#type: "acme.recon.v1.Host".into(),
+            body: b"h2".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+    let p1 = k
+        .put_artifact(Artifact {
+            r#type: "acme.recon.v1.Port".into(),
+            body: b"p1".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
     let s1 = k
         .publish(Event {
             topic: "recon.host.found".into(),
-            payload: b"h1".to_vec(),
+            r#type: "acme.recon.v1.Host".into(),
+            artifacts: vec![h1.clone()],
             ..Default::default()
         })
         .seq;
     let s2 = k
         .publish(Event {
             topic: "recon.host.found".into(),
-            payload: b"h2".to_vec(),
+            r#type: "acme.recon.v1.Host".into(),
+            artifacts: vec![h2.clone()],
             ..Default::default()
         })
         .seq;
     let s3 = k
         .publish(Event {
             topic: "recon.port.found".into(),
-            payload: b"p1".to_vec(),
+            r#type: "acme.recon.v1.Port".into(),
+            artifacts: vec![p1.clone()],
             ..Default::default()
         })
         .seq;
@@ -129,14 +153,17 @@ fn events_are_ordered_and_isolated() {
     // Subscriber A got exactly its two host events, in seq order...
     let e1 = hosts.try_recv().unwrap();
     let e2 = hosts.try_recv().unwrap();
-    assert_eq!((e1.seq, &e1.payload[..]), (s1, &b"h1"[..]));
-    assert_eq!((e2.seq, &e2.payload[..]), (s2, &b"h2"[..]));
+    assert_eq!(e1.seq, s1);
+    assert_eq!(e1.artifacts[0].id, h1.id);
+    assert_eq!(e2.seq, s2);
+    assert_eq!(e2.artifacts[0].id, h2.id);
     assert!(e1.seq < e2.seq, "delivered in seq order");
     assert!(hosts.try_recv().is_err(), "A never received the port event");
 
     // ...and subscriber B got exactly the one port event.
     let p = ports.try_recv().unwrap();
     assert_eq!(p.seq, s3);
+    assert_eq!(p.artifacts[0].id, p1.id);
     assert!(
         ports.try_recv().is_err(),
         "B never received the host events"
@@ -183,9 +210,9 @@ fn ledger_is_tamper_evident() {
 }
 
 // 7b. Fat detail for artifact.put and module.registered — both reconstruct from
-//     the chain (including the artifact's `derived_from` lineage), and the body
-//     is cleared (already addressed by the id in `subject`, so the log never
-//     duplicates blob content).
+//     the chain, and the body is cleared (already addressed by the id in
+//     `subject`, so the log never duplicates blob content). Provenance is a
+//     separate Derivation record, not on the Artifact.
 #[test]
 fn artifact_and_module_reconstruct_from_the_chain() {
     let k = MemoryKernel::new();
@@ -198,7 +225,6 @@ fn artifact_and_module_reconstruct_from_the_chain() {
         body: b"10.0.0.1".to_vec(),
         meta: meta.clone(),
         produced_by: "recon".into(),
-        derived_from: vec!["sha256:parent-a".into(), "sha256:parent-b".into()],
         ..Default::default()
     }).unwrap();
 
@@ -207,7 +233,11 @@ fn artifact_and_module_reconstruct_from_the_chain() {
         version: "0.1.0".into(),
         provides: vec![Capability {
             name: "recon.scan".into(),
-            contract: "acme.recon.v1.ScanRequest".into(),
+            outputs: vec![Port {
+                name: "host".into(),
+                contract: "acme.recon.v1.Host".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         requires: vec!["report.render".into()],
@@ -223,11 +253,6 @@ fn artifact_and_module_reconstruct_from_the_chain() {
     assert_eq!(a.r#type, "acme.recon.v1.Host");
     assert_eq!(a.meta, meta);
     assert_eq!(a.produced_by, "recon");
-    assert_eq!(
-        a.derived_from,
-        vec!["sha256:parent-a".to_string(), "sha256:parent-b".to_string()],
-        "derived_from lineage round-trips through the ledger"
-    );
     assert!(
         a.body.is_empty(),
         "body is cleared — the id already addresses it"
@@ -243,6 +268,7 @@ fn artifact_and_module_reconstruct_from_the_chain() {
     assert_eq!(m.version, "0.1.0");
     assert_eq!(m.provides.len(), 1);
     assert_eq!(m.provides[0].name, "recon.scan");
+    assert_eq!(m.provides[0].outputs[0].contract, "acme.recon.v1.Host");
     assert_eq!(m.requires, vec!["report.render".to_string()]);
 
     assert!(k.verify_ledger(), "the chain with fat detail verifies");
@@ -272,9 +298,10 @@ fn map_detail_encodes_canonically() {
     );
 }
 
-// 8. ADDRESS INVARIANCE — `meta`, `produced_by`, and `derived_from` are NOT part
-//    of the address; transforming them must not move the `id`. The mirror of #1:
-//    an identity-preserving change must NOT change the address (metamorphic).
+// 8. ADDRESS INVARIANCE — `meta` and `produced_by` are NOT part of the address;
+//    transforming them must not move the `id`. The mirror of #1: an
+//    identity-preserving change must NOT change the address (metamorphic).
+//    Provenance is a Derivation, not an Artifact field.
 #[test]
 fn address_ignores_non_identity_fields() {
     let k = MemoryKernel::new();
@@ -291,13 +318,12 @@ fn address_ignores_non_identity_fields() {
         body: b"10.0.0.1".to_vec(),
         meta,
         produced_by: "whoever".into(),
-        derived_from: vec!["sha256:some-parent".into()],
         ..Default::default()
     }).unwrap();
 
     assert_eq!(
         enriched.id, base.id,
-        "meta, produced_by, and derived_from must not participate in the address"
+        "meta and produced_by must not participate in the address"
     );
     assert_eq!(enriched.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"));
 }
@@ -309,7 +335,7 @@ fn address_ignores_non_identity_fields() {
 // all three suites in lockstep — never one SDK alone.
 #[test]
 fn ledger_hash_known_answer_cross_sdk() {
-    const WANT: &str = "287449b9f8f2f7462177b01d55b32cc6b65580fefa22172e8ecfaa96bdbf60a1";
+    const WANT: &str = "5d9dea28f0fa779b7d76dd6137c9b6079561289b12ed6dff022a889b94d69cd2";
 
     let k = MemoryKernel::new();
     k.register(ModuleManifest {
@@ -317,7 +343,11 @@ fn ledger_hash_known_answer_cross_sdk() {
         version: "0.1.0".into(),
         provides: vec![Capability {
             name: "recon.scan".into(),
-            contract: "acme.recon.v1.ScanRequest".into(),
+            outputs: vec![Port {
+                name: "host".into(),
+                contract: "acme.recon.v1.Host".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         requires: vec!["report.render".into()],
@@ -330,7 +360,6 @@ fn ledger_hash_known_answer_cross_sdk() {
         body: b"10.0.0.1".to_vec(),
         meta,
         produced_by: "recon".into(),
-        derived_from: vec!["sha256:parent-a".into(), "sha256:parent-b".into()],
         ..Default::default()
     }).unwrap();
     let chain = k.ledger();
@@ -351,7 +380,11 @@ fn registry_reports_everything() {
         version: "0.1.0".into(),
         provides: vec![Capability {
             name: "recon.scan".into(),
-            contract: "acme.recon.v1.ScanRequest".into(),
+            outputs: vec![Port {
+                name: "host".into(),
+                contract: "acme.recon.v1.Host".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         requires: vec![],
@@ -361,7 +394,11 @@ fn registry_reports_everything() {
         version: "0.2.0".into(),
         provides: vec![Capability {
             name: "report.render".into(),
-            contract: "acme.report.v1.Report".into(),
+            outputs: vec![Port {
+                name: "report".into(),
+                contract: "acme.report.v1.Report".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         requires: vec!["recon.scan".into()],
@@ -376,7 +413,7 @@ fn registry_reports_everything() {
     assert!(caps.contains(&"recon.scan") && caps.contains(&"report.render"));
 
     let contracts: Vec<_> = snap.contracts.iter().map(|c| c.r#ref.as_str()).collect();
-    assert!(contracts.contains(&"acme.recon.v1.ScanRequest"));
+    assert!(contracts.contains(&"acme.recon.v1.Host"));
     assert!(contracts.contains(&"acme.report.v1.Report"));
 }
 
@@ -437,7 +474,11 @@ fn contracts_are_immutable_and_identifiable() {
         version: "1".into(),
         provides: vec![Capability {
             name: "do".into(),
-            contract: "acme.NewThing".into(),
+            outputs: vec![Port {
+                name: "out".into(),
+                contract: "acme.NewThing".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         ..Default::default()
@@ -504,7 +545,6 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
                 contract: "demo.Facts".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }],
         ..Default::default()
     });
@@ -530,7 +570,6 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
                 contract: "demo.Answer".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }],
         ..Default::default()
     });
@@ -689,7 +728,6 @@ fn cyclic_assembly_is_rejected_before_it_can_expand_forever() {
                 contract: "demo.Value".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }],
         ..Default::default()
     });
@@ -770,7 +808,6 @@ fn run_stalls_when_no_remaining_node_can_become_ready() {
                 contract: "demo.Answer".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }],
         ..Default::default()
     });
@@ -1118,4 +1155,83 @@ fn value_identity_independent_of_blob_identity() {
         })
         .unwrap();
     assert_ne!(art_c.id, art_a.id);
+}
+
+// RequestContext: deadline rejects past absolute times; request_key de-duplicates
+// PutArtifact / StartRun / Commit without re-applying side effects.
+#[test]
+fn request_context_deadline_and_idempotency() {
+    let k = MemoryKernel::new();
+    let past = RequestContext {
+        deadline_unix_ms: 1, // 1970-01-01
+        ..Default::default()
+    };
+    assert!(matches!(
+        KernelApi::put_artifact(
+            &k,
+            Artifact {
+                r#type: "t".into(),
+                body: b"x".to_vec(),
+                ..Default::default()
+            },
+            &past
+        ),
+        Err(KernelError::FailedPrecondition(_))
+    ));
+
+    let key_ctx = RequestContext {
+        caller: "worker".into(),
+        request_key: "put-once".into(),
+        ..Default::default()
+    };
+    let a = KernelApi::put_artifact(
+        &k,
+        Artifact {
+            r#type: "t".into(),
+            body: b"unique-body".to_vec(),
+            ..Default::default()
+        },
+        &key_ctx,
+    )
+    .unwrap();
+    let before = k.ledger().len();
+    let b = KernelApi::put_artifact(
+        &k,
+        Artifact {
+            r#type: "t".into(),
+            body: b"unique-body".to_vec(),
+            ..Default::default()
+        },
+        &key_ctx,
+    )
+    .unwrap();
+    assert_eq!(a.id, b.id);
+    assert_eq!(
+        k.ledger().len(),
+        before,
+        "idempotent replay must not append another ledger entry"
+    );
+}
+
+// Transition is on the Kernel ABI (not MemoryKernel-only).
+#[test]
+fn transition_is_on_the_abi() {
+    let k = MemoryKernel::new();
+    k.register(ModuleManifest {
+        name: "m".into(),
+        version: "1".into(),
+        ..Default::default()
+    });
+    let ack = KernelApi::transition(
+        &k,
+        TransitionRequest {
+            module: "m".into(),
+            to: Lifecycle::Loaded as i32,
+        },
+        &RequestContext::default(),
+    )
+    .unwrap();
+    assert_eq!(ack.state, Lifecycle::Loaded as i32);
+    let chain = k.ledger();
+    assert!(chain.iter().any(|e| e.kind == "module.loaded"));
 }

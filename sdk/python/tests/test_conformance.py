@@ -19,9 +19,11 @@ from srcport_substrate import (
     Contract,
     Derivation,
     Event,
+    FailedPrecondition,
     GetBlobRequest,
     HasBlobRequest,
     Invalid,
+    Lifecycle,
     MemoryKernel,
     ModuleManifest,
     NamedArtifact,
@@ -30,10 +32,12 @@ from srcport_substrate import (
     ObjectRef,
     Port,
     PutBlobRequest,
+    RequestContext,
     RunRequest,
     RunRef,
     RunState,
     Subscription,
+    TransitionRequest,
     artifact_id,
     blob_id,
     contract_digest,
@@ -89,21 +93,33 @@ class Conformance(unittest.TestCase):
         hosts = k.subscribe(Subscription(module="a", topics=["recon.host.found"]))
         ports = k.subscribe(Subscription(module="b", topics=["recon.port.found"]))
 
-        s1 = k.publish(Event(topic="recon.host.found", payload=b"h1")).seq
-        s2 = k.publish(Event(topic="recon.host.found", payload=b"h2")).seq
-        s3 = k.publish(Event(topic="recon.port.found", payload=b"p1")).seq
+        h1 = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"h1"))
+        h2 = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"h2"))
+        p1 = k.put_artifact(Artifact(type="acme.recon.v1.Port", body=b"p1"))
+        s1 = k.publish(
+            Event(topic="recon.host.found", type="acme.recon.v1.Host", artifacts=[h1])
+        ).seq
+        s2 = k.publish(
+            Event(topic="recon.host.found", type="acme.recon.v1.Host", artifacts=[h2])
+        ).seq
+        s3 = k.publish(
+            Event(topic="recon.port.found", type="acme.recon.v1.Port", artifacts=[p1])
+        ).seq
         self.assertTrue(s1 < s2 < s3, "seq is monotonic across topics")
 
         e1 = hosts.get_nowait()
         e2 = hosts.get_nowait()
-        self.assertEqual((e1.seq, e1.payload), (s1, b"h1"))
-        self.assertEqual((e2.seq, e2.payload), (s2, b"h2"))
+        self.assertEqual(e1.seq, s1)
+        self.assertEqual(e1.artifacts[0].id, h1.id)
+        self.assertEqual(e2.seq, s2)
+        self.assertEqual(e2.artifacts[0].id, h2.id)
         self.assertTrue(e1.seq < e2.seq, "delivered in seq order")
         with self.assertRaises(queue.Empty):
             hosts.get_nowait()  # A never received the port event
 
         p = ports.get_nowait()
         self.assertEqual(p.seq, s3)
+        self.assertEqual(p.artifacts[0].id, p1.id)
         with self.assertRaises(queue.Empty):
             ports.get_nowait()  # B never received the host events
 
@@ -134,14 +150,14 @@ class Conformance(unittest.TestCase):
             ModuleManifest(
                 name="recon",
                 version="0.1.0",
-                provides=[Capability(name="recon.scan", contract="acme.recon.v1.ScanRequest")],
+                provides=[Capability(name="recon.scan", outputs=[Port(name="out", contract="acme.recon.v1.Host")])],
             )
         )
         k.register(
             ModuleManifest(
                 name="report",
                 version="0.2.0",
-                provides=[Capability(name="report.render", contract="acme.report.v1.Report")],
+                provides=[Capability(name="report.render", outputs=[Port(name="out", contract="acme.report.v1.Report")])],
                 requires=["recon.scan"],
             )
         )
@@ -152,7 +168,7 @@ class Conformance(unittest.TestCase):
         caps = {c.name for c in snap.capabilities}
         self.assertTrue({"recon.scan", "report.render"} <= caps)
         refs = {c.ref for c in snap.contracts}
-        self.assertTrue({"acme.recon.v1.ScanRequest", "acme.report.v1.Report"} <= refs)
+        self.assertTrue({"acme.recon.v1.Host", "acme.report.v1.Report"} <= refs)
 
     # 6b. CONTRACT IDENTITY — content-addressed under ref; immutable; conflict on
     # redefinition; placeholder fill-once; ports bind to the pinned identity.
@@ -204,7 +220,7 @@ class Conformance(unittest.TestCase):
             ModuleManifest(
                 name="mod",
                 version="1",
-                provides=[Capability(name="do", contract="acme.NewThing")],
+                provides=[Capability(name="do", outputs=[Port(name="out", contract="acme.NewThing")])],
             )
         )
         filled = k.put_contract(
@@ -255,14 +271,13 @@ class Conformance(unittest.TestCase):
                 body=b"10.0.0.1",
                 meta={"region": "eu", "scan": "full"},
                 produced_by="recon",
-                derived_from=["sha256:parent-a", "sha256:parent-b"],
             )
         )
         k.register(
             ModuleManifest(
                 name="recon",
                 version="0.1.0",
-                provides=[Capability(name="recon.scan", contract="acme.recon.v1.ScanRequest")],
+                provides=[Capability(name="recon.scan", outputs=[Port(name="out", contract="acme.recon.v1.Host")])],
                 requires=["report.render"],
             )
         )
@@ -280,11 +295,6 @@ class Conformance(unittest.TestCase):
         self.assertEqual(a.type, "acme.recon.v1.Host")
         self.assertEqual(a.produced_by, "recon")
         self.assertEqual(dict(a.meta), {"region": "eu", "scan": "full"})
-        self.assertEqual(
-            list(a.derived_from),
-            ["sha256:parent-a", "sha256:parent-b"],
-            "derived_from lineage must round-trip through the ledger",
-        )
         self.assertEqual(a.body, b"", "body is cleared — the id already addresses it")
 
         # module.registered reconstructs the whole manifest.
@@ -313,7 +323,7 @@ class Conformance(unittest.TestCase):
             )
 
     # METAMORPHIC — the address depends ONLY on (type, body). Transforming fields
-    # that aren't identity (meta, produced_by, derived_from) is a known no-op: the
+    # that aren't identity (meta, produced_by) is a known no-op: the
     # id must not move, or the address would be keyed on provenance, not content.
     def test_address_ignores_non_identity_fields(self):
         k = MemoryKernel()
@@ -324,12 +334,11 @@ class Conformance(unittest.TestCase):
                 body=b"10.0.0.1",
                 meta={"x": "y"},
                 produced_by="whoever",
-                derived_from=["sha256:some-parent"],
             )
         )
         self.assertEqual(
             enriched.id, base.id,
-            "meta, produced_by, derived_from must not participate in the address",
+            "meta and produced_by must not participate in the address",
         )
         self.assertEqual(enriched.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"))
 
@@ -339,14 +348,14 @@ class Conformance(unittest.TestCase):
     # three chains are pinned to cross-verify. If it ever changes, it changes in
     # all three suites in lockstep — never one SDK alone.
     def test_ledger_hash_known_answer_cross_sdk(self):
-        want = "287449b9f8f2f7462177b01d55b32cc6b65580fefa22172e8ecfaa96bdbf60a1"
+        want = "5d9dea28f0fa779b7d76dd6137c9b6079561289b12ed6dff022a889b94d69cd2"
 
         k = MemoryKernel()
         k.register(
             ModuleManifest(
                 name="recon",
                 version="0.1.0",
-                provides=[Capability(name="recon.scan", contract="acme.recon.v1.ScanRequest")],
+                provides=[Capability(name="recon.scan", outputs=[Port(name="host", contract="acme.recon.v1.Host")])],
                 requires=["report.render"],
             )
         )
@@ -356,7 +365,6 @@ class Conformance(unittest.TestCase):
                 body=b"10.0.0.1",
                 meta={"region": "eu", "scan": "full"},
                 produced_by="recon",
-                derived_from=["sha256:parent-a", "sha256:parent-b"],
             )
         )
         chain = k.ledger()
@@ -719,6 +727,24 @@ class Conformance(unittest.TestCase):
         )
         self.assertNotEqual(art_c.id, art_a.id)
 
+    def test_request_context_deadline_and_idempotency(self):
+        k = MemoryKernel()
+        past = RequestContext(deadline_unix_ms=1)
+        with self.assertRaises(FailedPrecondition):
+            k.put_artifact(Artifact(type="t", body=b"x"), ctx=past)
+        ctx = RequestContext(caller="worker", request_key="put-once")
+        a = k.put_artifact(Artifact(type="t", body=b"unique-body"), ctx=ctx)
+        before = len(k.ledger())
+        b = k.put_artifact(Artifact(type="t", body=b"unique-body"), ctx=ctx)
+        self.assertEqual(a.id, b.id)
+        self.assertEqual(len(k.ledger()), before, "idempotent replay must not append")
+
+    def test_transition_is_on_the_abi(self):
+        k = MemoryKernel()
+        k.register(ModuleManifest(name="m", version="1"))
+        ack = k.transition(TransitionRequest(module="m", to=Lifecycle.LIFECYCLE_LOADED))
+        self.assertEqual(ack.state, Lifecycle.LIFECYCLE_LOADED)
+        self.assertTrue(any(e.kind == "module.loaded" for e in k.ledger()))
 
 if __name__ == "__main__":
     unittest.main()

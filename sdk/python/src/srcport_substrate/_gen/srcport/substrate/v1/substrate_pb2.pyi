@@ -52,16 +52,14 @@ ERROR_CODE_RESOURCE_EXHAUSTED: ErrorCode
 ERROR_CODE_BLOB_INTEGRITY: ErrorCode
 
 class Capability(_message.Message):
-    __slots__ = ("name", "contract", "inputs", "outputs")
+    __slots__ = ("name", "inputs", "outputs")
     NAME_FIELD_NUMBER: _ClassVar[int]
-    CONTRACT_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
     OUTPUTS_FIELD_NUMBER: _ClassVar[int]
     name: str
-    contract: str
     inputs: _containers.RepeatedCompositeFieldContainer[Port]
     outputs: _containers.RepeatedCompositeFieldContainer[Port]
-    def __init__(self, name: _Optional[str] = ..., contract: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ...) -> None: ...
+    def __init__(self, name: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ...) -> None: ...
 
 class Port(_message.Message):
     __slots__ = ("name", "contract", "multiple", "optional")
@@ -108,7 +106,7 @@ class ObjectRef(_message.Message):
     def __init__(self, digest: _Optional[str] = ..., byte_count: _Optional[int] = ..., namespace: _Optional[str] = ...) -> None: ...
 
 class Artifact(_message.Message):
-    __slots__ = ("id", "type", "body", "meta", "produced_by", "derived_from", "object")
+    __slots__ = ("id", "type", "body", "meta", "produced_by", "object")
     class MetaEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -121,16 +119,14 @@ class Artifact(_message.Message):
     BODY_FIELD_NUMBER: _ClassVar[int]
     META_FIELD_NUMBER: _ClassVar[int]
     PRODUCED_BY_FIELD_NUMBER: _ClassVar[int]
-    DERIVED_FROM_FIELD_NUMBER: _ClassVar[int]
     OBJECT_FIELD_NUMBER: _ClassVar[int]
     id: str
     type: str
     body: bytes
     meta: _containers.ScalarMap[str, str]
     produced_by: str
-    derived_from: _containers.RepeatedScalarFieldContainer[str]
     object: ObjectRef
-    def __init__(self, id: _Optional[str] = ..., type: _Optional[str] = ..., body: _Optional[bytes] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ..., derived_from: _Optional[_Iterable[str]] = ..., object: _Optional[_Union[ObjectRef, _Mapping]] = ...) -> None: ...
+    def __init__(self, id: _Optional[str] = ..., type: _Optional[str] = ..., body: _Optional[bytes] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ..., object: _Optional[_Union[ObjectRef, _Mapping]] = ...) -> None: ...
 
 class ArtifactRef(_message.Message):
     __slots__ = ("id",)
@@ -199,11 +195,10 @@ class Contract(_message.Message):
     def __init__(self, ref: _Optional[str] = ..., schema: _Optional[str] = ..., media_type: _Optional[str] = ..., version: _Optional[str] = ..., digest: _Optional[str] = ..., compatible_with: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class Event(_message.Message):
-    __slots__ = ("id", "topic", "type", "payload", "source", "seq", "run_id", "artifacts")
+    __slots__ = ("id", "topic", "type", "source", "seq", "run_id", "artifacts")
     ID_FIELD_NUMBER: _ClassVar[int]
     TOPIC_FIELD_NUMBER: _ClassVar[int]
     TYPE_FIELD_NUMBER: _ClassVar[int]
-    PAYLOAD_FIELD_NUMBER: _ClassVar[int]
     SOURCE_FIELD_NUMBER: _ClassVar[int]
     SEQ_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
@@ -211,12 +206,11 @@ class Event(_message.Message):
     id: str
     topic: str
     type: str
-    payload: bytes
     source: str
     seq: int
     run_id: str
     artifacts: _containers.RepeatedCompositeFieldContainer[ArtifactRef]
-    def __init__(self, id: _Optional[str] = ..., topic: _Optional[str] = ..., type: _Optional[str] = ..., payload: _Optional[bytes] = ..., source: _Optional[str] = ..., seq: _Optional[int] = ..., run_id: _Optional[str] = ..., artifacts: _Optional[_Iterable[_Union[ArtifactRef, _Mapping]]] = ...) -> None: ...
+    def __init__(self, id: _Optional[str] = ..., topic: _Optional[str] = ..., type: _Optional[str] = ..., source: _Optional[str] = ..., seq: _Optional[int] = ..., run_id: _Optional[str] = ..., artifacts: _Optional[_Iterable[_Union[ArtifactRef, _Mapping]]] = ...) -> None: ...
 
 class LedgerEntry(_message.Message):
     __slots__ = ("seq", "kind", "subject", "detail", "prev_hash", "hash")
@@ -455,3 +449,17 @@ class AppendRequest(_message.Message):
     subject: str
     detail: bytes
     def __init__(self, kind: _Optional[str] = ..., subject: _Optional[str] = ..., detail: _Optional[bytes] = ...) -> None: ...
+
+class TransitionRequest(_message.Message):
+    __slots__ = ("module", "to")
+    MODULE_FIELD_NUMBER: _ClassVar[int]
+    TO_FIELD_NUMBER: _ClassVar[int]
+    module: str
+    to: Lifecycle
+    def __init__(self, module: _Optional[str] = ..., to: _Optional[_Union[Lifecycle, str]] = ...) -> None: ...
+
+class TransitionAck(_message.Message):
+    __slots__ = ("state",)
+    STATE_FIELD_NUMBER: _ClassVar[int]
+    state: Lifecycle
+    def __init__(self, state: _Optional[_Union[Lifecycle, str]] = ...) -> None: ...

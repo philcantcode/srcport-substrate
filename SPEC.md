@@ -26,16 +26,20 @@ modules. A content factory is a set of modules. They share *this*, and nothing
 else — that shared, versioned contract is the thing that finally becomes boring,
 trusted, and legible.
 
-### Durability lives in Modules, not the core
+### Two durability homes (kernel vs domain)
 
 This is a central design decision. The SDKs ship an in-memory realisation of the
 ABI (`MemoryKernel` in Rust/Go/Python) so the contract is executable and
 conformance-testable without a database. That type is **one** implementation of
 `KernelApi`, not *the* authority.
 
-- State that must survive a process restart is the job of a **Module** (or of
-  another `KernelApi` backend over durable storage). The core stays small,
-  bounded, and domain-neutral either way.
+| Concern | Owner |
+|---------|--------|
+| **Kernel state** — registry, ledger, runs, blob index | A **`KernelApi` backend** (`MemoryKernel` today; Postgres/files/… later) |
+| **Domain state** — findings, game world, content packs, evidence | **Modules** (artifacts, blobs, or a module's own store) |
+
+The core stays small, bounded, and domain-neutral either way.
+
 - The event bus is **notification, not the data plane**. Artifact refs carry
   values; the ledger is the durable record. Subscriber queues are therefore
   **bounded** — a slow consumer is shed rather than allowed to OOM the kernel.
@@ -45,6 +49,12 @@ conformance-testable without a database. That type is **one** implementation of
   in-process. It is deliberately **not** folded into hash-chained ledger
   `detail`: the chain records *what happened to state*, not who asked. Folding
   caller/trace ids into the hash would break the cross-SDK known-answer chain.
+- **Deadline:** when `deadline_unix_ms > 0` and wall clock is past that instant,
+  Result-returning RPCs fail with `FAILED_PRECONDITION` (`deadline exceeded`).
+- **Idempotency:** a non-empty `request_key` on `PutArtifact`, `StartRun`, and
+  `Commit` de-duplicates by `(caller, request_key, operation)` — the first
+  success is cached; later calls with the same key return the same response
+  without re-applying side effects.
 
 ---
 
@@ -60,10 +70,10 @@ trusted; modules and host processes are not principals the kernel polices.
 
 | # | Primitive | Message(s) | Invariant the kernel guarantees |
 |---|-----------|------------|---------------------------------|
-| 1 | **Module** | `ModuleManifest`, `Capability`, `Port`, `Lifecycle` | A module is a self-contained vertical slice. Capabilities declare typed input/output ports; `requires` is availability only, never dataflow. It moves through `REGISTERED → LOADED → ACTIVE → DEACTIVATED` and never imports another module. |
-| 2 | **Artifact** | `Artifact`, `ArtifactRef`, `ObjectRef`, `BlobRef` | Typed, content-addressed, **immutable**. Value identity and blob identity are distinct. **Inline (small):** `id = H(type ‖ 0x00 ‖ body)`. **External (large):** `id = H(type ‖ 0x00 ‖ object_ref_bytes(object))` where `object_ref_bytes = digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace`. **Blob identity** is pure content: `digest = "sha256:" + hex(sha256(data))`. Same value ⇒ same artifact id; any change ⇒ a new id. Large blobs live in the content-addressed blob store; artifacts hold a verified `ObjectRef` without copying bytes. Production provenance lives in separate `Derivation` records. |
-| 3 | **Contract** | `Contract`, `Port.contract`, `Capability.contract`, `Artifact.type`, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to a contract **identity** (`ref` pinned to a content `digest`), never to each other's code. Registration is **immutable**: same ref + different content ⇒ conflict. |
-| 4 | **Event** | `Event`, `Subscription` | Modules publish to topics and subscribe to topics; they never call each other directly. Every event gets a monotonic `seq` — a **total order** within the kernel. |
+| 1 | **Module** | `ModuleManifest`, `Capability`, `Port`, `Lifecycle`, `TransitionRequest` | A module is a self-contained vertical slice. Capabilities declare typed input/output **ports** (the only I/O typing). `requires` is a boot/load **availability hint only** — never run dataflow; the kernel does not gate `LOADED` or `ClaimReady` on it. Lifecycle moves through `REGISTERED → LOADED → ACTIVE → DEACTIVATED` via `Transition` (one forward step at a time) and the module never imports another module. |
+| 2 | **Artifact** | `Artifact`, `ArtifactRef`, `ObjectRef`, `BlobRef` | Typed, content-addressed, **immutable**. Value identity and blob identity are distinct. **Inline (small):** `id = H(type ‖ 0x00 ‖ body)`. **External (large):** `id = H(type ‖ 0x00 ‖ object_ref_bytes(object))` where `object_ref_bytes = digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace`. **Blob identity** is pure content: `digest = "sha256:" + hex(sha256(data))`. Same value ⇒ same artifact id; any change ⇒ a new id. Large blobs live in the content-addressed blob store; artifacts hold a verified `ObjectRef` without copying bytes. Production provenance lives **only** in separate `Derivation` records — not on the Artifact. |
+| 3 | **Contract** | `Contract`, `Port.contract`, `Artifact.type`, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to a contract **identity** (`ref` pinned to a content `digest`), never to each other's code. Ports (and artifact/event types) name the ref. Registration is **immutable**: same ref + different content ⇒ conflict. |
+| 4 | **Event** | `Event`, `Subscription` | Modules publish to topics and subscribe to topics; they never call each other directly. Every event gets a monotonic `seq` — a **total order** within the kernel. **Artifact refs are the data plane** (`Event.artifacts`); the bus never carries domain value bytes. |
 | 5 | **Ledger** | `LedgerEntry` | Append-only and **hash-chained**. Each entry commits to the previous entry's hash, so the whole history is tamper-evident and fully agent-observable. Every meaningful kernel action writes one entry. |
 | 6 | **Registry** | `RegistrySnapshot` | Discovery. At any moment you can ask the kernel what modules, capabilities, and contracts exist. This is the "what systems are here?" answer, always available. |
 | 7 | **Run** | `Assembly`, `Run`, `WorkItem`, `Derivation` | Convergence. A finite, acyclic, version-pinned assembly connects typed capability ports and names exactly one terminal output. A run executes each node at most once and terminates as `COMPLETED`, `STALLED`, `FAILED`, or `CANCELLED`. |
@@ -71,19 +81,20 @@ trusted; modules and host processes are not principals the kernel polices.
 ### The Kernel ABI
 
 `substrate.proto` also defines one `service Kernel` — the seam every SDK
-implements. It is the union of the operations above (`Register`, `PutArtifact`,
-`GetArtifact`, `PutBlob`, `GetBlob`, `HasBlob`, `PutContract`, `Publish`,
-`Subscribe`, `Append`, `Snapshot`, `StartRun`, `ClaimReady`, `Commit`, `GetRun`,
-`CancelRun`, `ListDerivations`). An SDK MAY realise it in-process (methods
-mirroring these RPCs) or over the wire (gRPC) — the *invariants* are identical
-either way. Modules see only the kernel; they never see each other.
+implements. It is the union of the operations above (`Register`, `Transition`,
+`PutArtifact`, `GetArtifact`, `PutBlob`, `GetBlob`, `HasBlob`, `PutContract`,
+`Publish`, `Subscribe`, `Append`, `Snapshot`, `StartRun`, `ClaimReady`,
+`Commit`, `GetRun`, `CancelRun`, `ListDerivations`). An SDK MAY realise it
+in-process (methods mirroring these RPCs) or over the wire (gRPC) — the
+*invariants* are identical either way. Modules see only the kernel; they never
+see each other.
 
 In-process SDKs surface the same ABI as a language-native `KernelApi`
 (trait / interface / Protocol). The shipped `MemoryKernel` implements it; other
-backends may too. Streaming `Subscribe` and the lifecycle helper `Transition`
-are inherent helpers on the in-memory type. Every unary call also accepts an
-optional `RequestContext` and maps native failures onto the portable `Error`
-message (`ErrorCode` + retryability).
+backends may too. Streaming `Subscribe` stays inherent-only on the in-memory
+type (channel / queue). Every unary call also accepts an optional
+`RequestContext` and maps native failures onto the portable `Error` message
+(`ErrorCode` + retryability).
 
 ### Contract identity (immutable registration)
 
@@ -195,18 +206,18 @@ because `detail` is folded into the entry hash.
 | `contract.registered` | `Contract` (full, including kernel-assigned `digest`) |
 | `artifact.put` | `Artifact`, `body` cleared (`object` retained — it is small and part of value identity) |
 | `blob.put` | `BlobRef` (no data bytes) |
-| `event.published` | `Event`, `payload` cleared |
+| `event.published` | `Event` (artifact refs are the data plane; no domain value body) |
 | `run.started`, `run.{progressed,completed,stalled,failed,cancelled}` | `Run` |
 | `work.claimed` | `WorkItem` |
 | `derivation.committed` | `Derivation` |
 | module `Append` | opaque, module-owned bytes (the kernel never interprets them) |
 
 Where `subject` already commits to large content — an inline `artifact.put`
-body is addressed by its id; a `blob.put` is addressed by its digest; a
-convergent event carries artifact refs — the large field is cleared and the log
-leans on that reference. Verified `ObjectRef` / `BlobRef` metadata stays in
-`detail` so external values reconstruct without re-inlining blob bytes. The
-chain never duplicates multi-megabyte content into a record it can never prune.
+body is addressed by its id; a `blob.put` is addressed by its digest — the large
+field is cleared and the log leans on that reference. Verified `ObjectRef` /
+`BlobRef` metadata stays in `detail` so external values reconstruct without
+re-inlining blob bytes. Events carry artifact refs, not value bytes. The chain
+never duplicates multi-megabyte content into a record it can never prune.
 
 **Canonical form.** Two conformant SDKs must hash identical bytes for the same
 history, or their chains would not cross-verify. So the encoding is pinned:
@@ -315,10 +326,10 @@ The minimal conformance suite (each SDK ships it) is:
    registry and the artifact store both round-trip from the tamper-evident chain
    alone. A shared known-answer fixture pins the exact chain hash identically
    across Rust, Go, and Python, so cross-verification is proven, not assumed.
-7. **Address invariance** — `meta`, `produced_by`, and `derived_from` are not part
-   of the address; an identity-preserving change to them must *not* move the `id`.
-   (Metamorphic: the mirror of #1 — a change that preserves the typed value must
-   preserve the address.)
+7. **Address invariance** — `meta` and `produced_by` are not part of the address;
+   an identity-preserving change to them must *not* move the `id`. (Metamorphic:
+   the mirror of #1 — a change that preserves the typed value must preserve the
+   address.) Provenance is a `Derivation`, never part of artifact identity.
 8. **Feed-forward convergence** — downstream work is unavailable until every
    typed binding resolves; fan-in supplies the complete input set; the declared
    terminal artifact closes the run and a closed run cannot reopen.

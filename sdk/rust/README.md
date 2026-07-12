@@ -4,8 +4,9 @@ The in-process Rust realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
 It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI,
 nothing more. The in-memory type is [`MemoryKernel`](src/lib.rs); it implements
-the [`KernelApi`](src/lib.rs) trait. **Durability lives in Modules, not the
-core** — `MemoryKernel` is one backend, not the authority.
+the [`KernelApi`](src/lib.rs) trait. **Kernel-state durability** is a
+`KernelApi` backend concern; **domain** state lives in Modules.
+`MemoryKernel` is one backend, not the authority.
 
 > This crate does **not** re-derive the core. Its wire types are generated from
 > `substrate.proto` at build time (`build.rs`, via `protox` — no `protoc`
@@ -71,7 +72,9 @@ kernel.put_contract(Contract {
 let snapshot = kernel.snapshot();
 ```
 
-`MemoryKernel` implements `KernelApi` — the 16 unary RPCs one-for-one
+`MemoryKernel` implements `KernelApi` — the unary RPCs one-for-one (including
+`Transition`). `RequestContext` enforces deadlines and de-duplicates
+`PutArtifact` / `StartRun` / `Commit` via `request_key`
 (`register`, `put_artifact`, `get_artifact`, `put_blob`, `get_blob`, `has_blob`,
 `put_contract`, `publish`, `append`, `snapshot`, and the convergent-run methods).
 `subscribe` returns a bounded mpsc `Receiver<Event>` (`SUBSCRIBER_BUFFER`).

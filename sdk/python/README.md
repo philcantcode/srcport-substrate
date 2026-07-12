@@ -3,8 +3,8 @@
 The in-process Python realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
 It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one ABI.
-`MemoryKernel` implements `KernelApi`. **Durability lives in Modules, not the
-core** — the in-memory kernel is one backend, not the authority. One runtime
+`MemoryKernel` implements `KernelApi`. **Kernel-state durability** is a
+`KernelApi` backend concern; **domain** state lives in Modules. One runtime
 dependency: the `protobuf` runtime.
 
 > The message types are **generated** from `substrate.proto` (via
@@ -62,7 +62,9 @@ kernel.put_contract(Contract(
 snapshot = kernel.snapshot()
 ```
 
-`MemoryKernel` implements `KernelApi` — the 16 unary RPCs one-for-one.
+`MemoryKernel` implements `KernelApi` — the unary RPCs one-for-one (including
+`transition`). `RequestContext` enforces deadlines and de-duplicates
+`put_artifact` / `start_run` / `commit` via `request_key`.
 `subscribe()` returns a bounded `queue.Queue[Event]` (`SUBSCRIBER_BUFFER`); a
 slow consumer is shed rather than allowed to OOM the kernel. Events arrive in
 kernel `seq` order. `MemoryKernel` is thread-safe.

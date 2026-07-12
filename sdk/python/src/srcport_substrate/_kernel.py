@@ -6,6 +6,7 @@ import copy
 import hashlib
 import queue
 import threading
+import time
 from typing import Protocol, runtime_checkable
 
 from ._types import (
@@ -42,6 +43,8 @@ from ._types import (
     RunState,
     SnapshotRequest,
     Subscription,
+    TransitionAck,
+    TransitionRequest,
     WorkItem,
     _ledger_hash,
     artifact_id_of,
@@ -122,17 +125,42 @@ class RunClosed(KernelError):
         return e
 
 
-class BlobIntegrity(KernelError):
-    """Stored blob bytes do not match the claimed digest or byte_count."""
+class FailedPrecondition(KernelError):
+    """A call precondition failed (e.g. absolute deadline already passed)."""
 
     def code(self) -> ErrorCode:
-        # Match Rust: BlobIntegrity maps to FAILED_PRECONDITION with detail.
         return ErrorCode.ERROR_CODE_FAILED_PRECONDITION
 
     def to_proto(self) -> Error:
         e = super().to_proto()
         e.failed_precondition = str(self)
         return e
+
+
+class BlobIntegrity(KernelError):
+    """Stored blob bytes do not match the claimed digest or byte_count."""
+
+    def code(self) -> ErrorCode:
+        return ErrorCode.ERROR_CODE_BLOB_INTEGRITY
+
+    def to_proto(self) -> Error:
+        e = super().to_proto()
+        e.failed_precondition = str(self)
+        return e
+
+
+def _check_deadline(ctx: RequestContext | None) -> None:
+    if ctx is None or not ctx.deadline_unix_ms:
+        return
+    now_ms = int(time.time() * 1000)
+    if now_ms > ctx.deadline_unix_ms:
+        raise FailedPrecondition("deadline exceeded")
+
+
+def _idempotency_key(op: str, ctx: RequestContext | None) -> str | None:
+    if ctx is None or not ctx.request_key:
+        return None
+    return f"{op}\0{ctx.caller}\0{ctx.request_key}"
 
 
 def _is_sha256_digest(d: str) -> bool:
@@ -162,16 +190,24 @@ def _canonical(msg) -> bytes:
 
 @runtime_checkable
 class KernelApi(Protocol):
-    """The portable ABI: the 16 unary RPCs of ``service Kernel``.
+    """The portable ABI: unary RPCs of ``service Kernel`` (including Transition).
 
-    Streaming ``subscribe`` and the lifecycle helper ``transition`` stay
-    inherent-only on :class:`MemoryKernel`. ``RequestContext`` rides as call
-    metadata (optional kwarg) and is deliberately not folded into ledger detail.
+    Streaming ``subscribe`` stays inherent-only on :class:`MemoryKernel`.
+    ``RequestContext`` rides as call metadata (optional kwarg) and is
+    deliberately not folded into ledger detail.
+
+    Enforced context semantics: past ``deadline_unix_ms`` raises
+    :class:`FailedPrecondition`; non-empty ``request_key`` de-duplicates
+    ``put_artifact`` / ``start_run`` / ``commit`` by
+    ``(caller, request_key, operation)``.
     """
 
     def register(
         self, manifest: ModuleManifest, ctx: RequestContext | None = None
     ) -> RegisterAck: ...
+    def transition(
+        self, req: TransitionRequest, ctx: RequestContext | None = None
+    ) -> TransitionAck: ...
     def put_artifact(
         self, artifact: Artifact, ctx: RequestContext | None = None
     ) -> ArtifactRef: ...
@@ -225,7 +261,8 @@ class MemoryKernel:
     append-only ledger entry. Values handed in and out are copied, so a caller
     can never mutate stored state through a shared message.
 
-    **Durability lives in Modules, not the core** — this type is one backend.
+    Kernel-state durability is a :class:`KernelApi` backend concern; domain
+    state lives in Modules. This type is one backend, not the authority.
     """
 
     def __init__(self) -> None:
@@ -241,6 +278,8 @@ class MemoryKernel:
         self._runs: dict[str, dict] = {}
         self._derivations: list[Derivation] = []
         self._event_seq = 0
+        # op\\0caller\\0request_key -> ArtifactRef | Run
+        self._idempotency: dict[str, object] = {}
 
     # ── ledger helper: the ONLY path that creates entries. Caller holds lock.
     def _append_locked(
@@ -263,13 +302,13 @@ class MemoryKernel:
 
     def register(self, manifest: ModuleManifest, ctx: RequestContext | None = None) -> RegisterAck:
         """rpc Register. Records the module, its capabilities, and (implicitly)
-        name-only placeholders for the contracts they speak. Lands in REGISTERED;
-        advance with transition(). Placeholders may be filled once via put_contract.
+        name-only placeholders for contracts named on ports. Lands in REGISTERED;
+        advance with :meth:`transition`. Placeholders may be filled once via
+        :meth:`put_contract`.
         """
         with self._lock:
             for cap in manifest.provides:
                 self._capabilities.append(copy.deepcopy(cap))
-                self._ensure_contract_placeholder(cap.contract)
                 for port in list(cap.inputs) + list(cap.outputs):
                     self._ensure_contract_placeholder(port.contract)
             self._modules.append(
@@ -291,17 +330,40 @@ class MemoryKernel:
             ref=ref, digest=contract_digest("", "", "", [])
         )
 
-    def transition(self, module: str, to: Lifecycle, ctx: RequestContext | None = None) -> Lifecycle:
-        """Advance REGISTERED → LOADED → ACTIVE → DEACTIVATED. Only forward
-        moves are honoured; anything else is a no-op returning the current state.
+    def transition(
+        self,
+        req: TransitionRequest | str,
+        to: Lifecycle | None = None,
+        ctx: RequestContext | None = None,
+    ) -> TransitionAck | Lifecycle:
+        """rpc Transition. Advance REGISTERED → LOADED → ACTIVE → DEACTIVATED.
+
+        Accepts either a :class:`TransitionRequest` (ABI form) or
+        ``(module, to)`` for convenience. Only a single forward step is
+        applied; anything else is a no-op returning the current state.
         """
+        if isinstance(req, str):
+            if to is None:
+                raise Invalid("lifecycle target is required")
+            module = req
+            target = to
+        else:
+            module = req.module
+            target = req.to
+            if ctx is None:
+                pass
+        _check_deadline(ctx)
         with self._lock:
             for slot in self._modules:
                 if slot[0].name == module:
-                    if int(to) == int(slot[1]) + 1:
-                        slot[1] = to
-                        self._append_locked(f"module.{_LIFECYCLE_VERB[to]}", module)
-                    return slot[1]
+                    if int(target) == int(slot[1]) + 1:
+                        slot[1] = target
+                        self._append_locked(
+                            f"module.{_LIFECYCLE_VERB[target]}", module
+                        )
+                    if isinstance(req, str):
+                        return slot[1]
+                    return TransitionAck(state=slot[1])
             raise NotFound(module)
 
     # ── 2. Artifact ────────────────────────────────────────────────────────
@@ -313,9 +375,14 @@ class MemoryKernel:
         Inline: set ``body``, leave ``object`` unset. External: ``put_blob``
         first, then set ``object`` with empty ``body``. The blob must already
         exist and match. Exactly one of body or object may carry the value.
+        Honour deadline and ``request_key`` idempotency.
         """
+        _check_deadline(ctx)
         self._validate_artifact_content(artifact)
         with self._lock:
+            key = _idempotency_key("put_artifact", ctx)
+            if key is not None and key in self._idempotency:
+                return copy.deepcopy(self._idempotency[key])  # type: ignore[return-value]
             if has_external_object(artifact):
                 self._verify_object_ref_locked(artifact.object)
             aid = artifact_id_of(artifact)
@@ -328,10 +395,14 @@ class MemoryKernel:
                 for_log = copy.deepcopy(stored)
                 for_log.ClearField("body")
                 self._append_locked("artifact.put", aid, _canonical(for_log))
-            return ArtifactRef(id=aid)
+            ref = ArtifactRef(id=aid)
+            if key is not None and key not in self._idempotency:
+                self._idempotency[key] = copy.deepcopy(ref)
+            return ref
 
     def get_artifact(self, ref: ArtifactRef, ctx: RequestContext | None = None) -> Artifact:
         """rpc GetArtifact. Reads back byte-identical."""
+        _check_deadline(ctx)
         with self._lock:
             a = self._artifacts.get(ref.id)
             if a is None:
@@ -353,6 +424,7 @@ class MemoryKernel:
 
     def get_blob(self, req: GetBlobRequest, ctx: RequestContext | None = None) -> BlobData:
         """rpc GetBlob. Returns verified blob bytes (re-hashes on read)."""
+        _check_deadline(ctx)
         with self._lock:
             slot = self._blobs.get((req.namespace, req.digest))
             if slot is None:
@@ -435,6 +507,7 @@ class MemoryKernel:
         no-ops; different content under the same ref raises :class:`Conflict`.
         A name-only placeholder from :meth:`register` may be filled once.
         """
+        _check_deadline(ctx)
         if not contract.ref:
             raise Invalid("contract ref is required")
         c = copy.deepcopy(contract)
@@ -500,9 +573,8 @@ class MemoryKernel:
                 else:
                     alive.append((topics, q))
             self._subs = alive
-            for_log = copy.deepcopy(event)
-            for_log.ClearField("payload")
-            self._append_locked("event.published", event.topic, _canonical(for_log))
+            # Artifact refs are the data plane; the Event lands fully in the chain.
+            self._append_locked("event.published", event.topic, _canonical(event))
             return PublishAck(seq=event.seq)
 
     # ── 5. Ledger ──────────────────────────────────────────────────────────
@@ -536,8 +608,15 @@ class MemoryKernel:
     # ── 7. Run / convergence ──────────────────────────────────────────────
 
     def start_run(self, req: RunRequest, ctx: RequestContext | None = None) -> Run:
-        """Validate and freeze one finite feed-forward assembly."""
+        """Validate and freeze one finite feed-forward assembly.
+
+        Honour deadline and ``request_key`` idempotency.
+        """
+        _check_deadline(ctx)
         with self._lock:
+            key = _idempotency_key("start_run", ctx)
+            if key is not None and key in self._idempotency:
+                return copy.deepcopy(self._idempotency[key])  # type: ignore[return-value]
             if not req.id:
                 raise Invalid("run id is required")
             if req.id in self._runs:
@@ -562,10 +641,14 @@ class MemoryKernel:
                 "committed": {},
             }
             self._append_locked("run.started", run.id, _canonical(run))
-            return copy.deepcopy(run)
+            out = copy.deepcopy(run)
+            if key is not None and key not in self._idempotency:
+                self._idempotency[key] = copy.deepcopy(out)
+            return out
 
     def claim_ready(self, req: ClaimRequest, ctx: RequestContext | None = None) -> WorkItem:
         """Atomically claim one ready node for a module, or return an empty item."""
+        _check_deadline(ctx)
         with self._lock:
             slot = self._runs.get(req.run_id)
             if slot is None:
@@ -604,8 +687,15 @@ class MemoryKernel:
             return WorkItem()
 
     def commit(self, submitted: Derivation, ctx: RequestContext | None = None) -> Run:
-        """Commit one claimed transformation and release its downstream nodes."""
+        """Commit one claimed transformation and release its downstream nodes.
+
+        Honour deadline and ``request_key`` idempotency.
+        """
+        _check_deadline(ctx)
         with self._lock:
+            key = _idempotency_key("commit", ctx)
+            if key is not None and key in self._idempotency:
+                return copy.deepcopy(self._idempotency[key])  # type: ignore[return-value]
             slot = self._runs.get(submitted.run_id)
             if slot is None:
                 raise NotFound(submitted.run_id)
@@ -673,9 +763,13 @@ class MemoryKernel:
             elif closed:
                 kind = "run.failed"
             self._append_locked(kind, run.id, _canonical(run))
-            return copy.deepcopy(run)
+            out = copy.deepcopy(run)
+            if key is not None and key not in self._idempotency:
+                self._idempotency[key] = copy.deepcopy(out)
+            return out
 
     def get_run(self, ref: RunRef, ctx: RequestContext | None = None) -> Run:
+        _check_deadline(ctx)
         with self._lock:
             slot = self._runs.get(ref.id)
             if slot is None:
@@ -683,6 +777,7 @@ class MemoryKernel:
             return copy.deepcopy(slot["run"])
 
     def cancel_run(self, ref: RunRef, ctx: RequestContext | None = None) -> Run:
+        _check_deadline(ctx)
         with self._lock:
             slot = self._runs.get(ref.id)
             if slot is None:
@@ -701,6 +796,7 @@ class MemoryKernel:
             return copy.deepcopy(self._derivations)
 
     def list_derivations(self, ref: RunRef, ctx: RequestContext | None = None) -> DerivationList:
+        _check_deadline(ctx)
         with self._lock:
             if ref.id not in self._runs:
                 raise NotFound(ref.id)

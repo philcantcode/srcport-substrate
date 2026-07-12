@@ -73,7 +73,6 @@ fn main() {
             version: "1.0.0".into(),
             provides: vec![Capability {
                 name: "facts.extract".into(),
-                contract: "demo.v1.Extract".into(),
                 inputs: vec![port("question", "demo.v1.Question")],
                 outputs: vec![port("facts", "demo.v1.Facts")],
             }],
@@ -87,7 +86,6 @@ fn main() {
         version: "1.0.0".into(),
         provides: vec![Capability {
             name: "sources.retrieve".into(),
-            contract: "demo.v1.Retrieve".into(),
             inputs: vec![port("question", "demo.v1.Question")],
             outputs: vec![port("sources", "demo.v1.Sources")],
         }],
@@ -99,7 +97,6 @@ fn main() {
         version: "2.0.0".into(),
         provides: vec![Capability {
             name: "answer.write".into(),
-            contract: "demo.v1.Write".into(),
             inputs: vec![
                 port("question", "demo.v1.Question"),
                 port("facts", "demo.v1.Facts"),
@@ -183,7 +180,6 @@ fn main() {
         r#type: "demo.v1.Answer".into(),
         body: b"One versioned contract; every project is just Modules on top.".to_vec(),
         produced_by: "writer".into(),
-        derived_from: write.inputs.iter().filter_map(|i| i.artifact.as_ref().map(|a| a.id.clone())).collect(),
         ..Default::default()
     }).unwrap();
     let run = k
@@ -239,7 +235,6 @@ fn run_node(k: &MemoryKernel, module: &str, out_port: &str, contract: &str, body
         r#type: contract.into(),
         body: body.to_vec(),
         produced_by: module.into(),
-        derived_from: work.inputs.iter().filter_map(|i| i.artifact.as_ref().map(|a| a.id.clone())).collect(),
         ..Default::default()
     }).unwrap();
     k.commit(Derivation {

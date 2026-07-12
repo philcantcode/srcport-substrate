@@ -26,13 +26,12 @@ enum Lifecycle {
   LIFECYCLE_DEACTIVATED = 4;
 }
 
-// A named thing a module can do, bound to the contract identity it speaks.
+// A named thing a module can do. Typed I/O is declared exclusively on ports —
+// modules couple through Port.contract refs, never through each other's code.
 message Capability {
-  string name     = 1;  // e.g. "recon.scan"
-  // Contract *ref* (registry key). The kernel pins ref → digest at PutContract;
-  // the string is an identity handle, not a redefinable label. Prefer typed
-  // ports below for multi-port capabilities.
-  string contract = 2;
+  string name = 1;  // e.g. "recon.scan"
+  reserved 2;
+  reserved "contract";
   repeated Port inputs  = 3;
   repeated Port outputs = 4;
 }
@@ -42,7 +41,8 @@ message Capability {
 // is true. These rules let the kernel determine readiness without parsing data.
 message Port {
   string name     = 1;
-  // Contract *ref* — same identity semantics as Capability.contract.
+  // Contract *ref* — registry key. The kernel pins ref → digest at PutContract;
+  // the string is an identity handle, not a redefinable label.
   string contract = 2;
   bool multiple   = 3;
   bool optional   = 4;
@@ -52,8 +52,9 @@ message ModuleManifest {
   string name              = 1;  // unique module id, kebab-case
   string version           = 2;  // semver
   repeated Capability provides = 3;
-  // Availability dependencies only. Run dataflow is expressed exclusively by
-  // typed capability ports and Assembly bindings, never by this list.
+  // Availability dependencies only (boot/load hint). Run dataflow is expressed
+  // exclusively by typed capability ports and Assembly bindings, never by this
+  // list. The kernel does not gate LOADED or ClaimReady on requires.
   repeated string requires     = 4;
 }
 
@@ -71,6 +72,9 @@ message ModuleManifest {
 // payloads; place a verified ObjectRef for large blobs so a module can commit a
 // typed value without copying PCAP / APK / evidence bytes into the artifact store.
 // The kernel never parses domain payload; `type` is the contract ref.
+//
+// Provenance is NOT on the Artifact: equal values share one address while every
+// distinct production path is recorded as a separate immutable Derivation.
 
 // Content-addressed blob. Digest is over raw bytes only (not type, not namespace).
 message BlobRef {
@@ -94,10 +98,8 @@ message Artifact {
   bytes  body                = 3;
   map<string, string> meta   = 4;
   string produced_by         = 5;  // module name
-  // Legacy/advisory provenance. It is NOT part of the address and first-write
-  // value storage cannot preserve competing paths. Run Derivation records are
-  // the authoritative provenance: they preserve every distinct production.
-  repeated string derived_from = 6;
+  reserved 6;
+  reserved "derived_from";
   // Large external value: a verified ref to a blob. When digest is non-empty,
   // Artifact id hashes object_ref_bytes(object), not the blob bytes, and body
   // must be empty. The blob must already exist in `object.namespace`.
@@ -148,10 +150,10 @@ message HasBlobResponse {
 //   • PutContract is immutable: first write of a ref wins. An identical re-put
 //     is a no-op. A different content under the same ref is CONFLICT.
 //   • Register may create an empty name-only placeholder for a ref named by a
-//     capability/port; that placeholder may be filled once via PutContract.
+//     port; that placeholder may be filled once via PutContract.
 //
-// Port.contract, Capability.contract, Artifact.type, and Event.type hold the
-// ref. The kernel pins that ref to one digest — the string is never redefinable.
+// Port.contract, Artifact.type, and Event.type hold the ref. The kernel pins
+// that ref to one digest — the string is never redefinable.
 
 message Contract {
   string ref         = 1;  // fully-qualified name, e.g. "acme.recon.v1.Host"
@@ -169,17 +171,19 @@ message Contract {
 // ─── 4. EVENT ──────────────────────────────────────────────────────────────
 // A bus message. Modules publish to topics and subscribe to topics; they never
 // call each other directly. `seq` is a total order assigned by the kernel.
+// Artifact refs are the data plane — not event body bytes.
 
 message Event {
   string id      = 1;
   string topic   = 2;  // dotted, e.g. "recon.host.found"
-  string type    = 3;  // contract ref of payload
-  bytes  payload = 4;
+  string type    = 3;  // contract ref describing the event (optional typing)
+  reserved 4;
+  reserved "payload";
   string source  = 5;  // module name
   uint64 seq     = 6;  // kernel-assigned, monotonic
   string run_id  = 7;  // empty for events outside a bounded run
-  // Artifact refs are the data plane. `payload` remains for v0 compatibility;
-  // convergent assemblies pass values only through these immutable refs.
+  // Artifact refs are the data plane. Convergent assemblies pass values only
+  // through these immutable refs.
   repeated ArtifactRef artifacts = 8;
 }
 
@@ -325,13 +329,20 @@ message DerivationList { repeated Derivation derivations = 1; }
 // records WHAT happened to state, not who asked; folding a caller or trace id
 // into the hash would make identical histories diverge.
 //
+// Semantics the kernel enforces on every call that accepts RequestContext:
+//   • deadline_unix_ms > 0 and now past that instant → FAILED_PRECONDITION
+//   • non-empty request_key on PutArtifact / StartRun / Commit: first success
+//     for (caller, request_key, operation) is cached; later identical keys
+//     return the same response without re-applying side effects
+//
 // There is no kernel-level authorisation: systems built on this core are
-// trusted. `caller` is observational only (audit / routing hints), never an
-// access-control principal.
+// trusted. `caller` is observational only (audit / routing hints / idempotency
+// scope), never an access-control principal.
 message RequestContext {
   string caller           = 1;  // module or process identity making the call
-  string request_key      = 2;  // idempotency key; retried calls carrying the
-                                // same key must be safe to de-duplicate
+  string request_key      = 2;  // idempotency key; non-empty ⇒ de-duplicate
+                                // PutArtifact / StartRun / Commit by
+                                // (caller, request_key, operation)
   int64  deadline_unix_ms = 3;  // absolute deadline, unix epoch ms; 0 = none
   string correlation_id   = 4;  // trace ref linking related calls
 }
@@ -345,7 +356,7 @@ enum ErrorCode {
   ERROR_CODE_NOT_FOUND           = 1;  // no such artifact / blob / run
   ERROR_CODE_INVALID             = 2;  // malformed request, manifest, or assembly
   ERROR_CODE_CONFLICT            = 3;  // id exists / work already claimed
-  ERROR_CODE_FAILED_PRECONDITION = 4;  // run closed / other unmet precondition
+  ERROR_CODE_FAILED_PRECONDITION = 4;  // run closed / deadline exceeded / other
   ERROR_CODE_RESOURCE_EXHAUSTED  = 5;  // a bounded buffer is full (backpressure)
   ERROR_CODE_BLOB_INTEGRITY      = 6;  // stored bytes do not match digest/size
 }
@@ -374,8 +385,20 @@ message Subscription  { string module = 1; repeated string topics = 2; }
 message SnapshotRequest {}
 message AppendRequest { string kind = 1; string subject = 2; bytes detail = 3; }
 
+// Advance a module along REGISTERED → LOADED → ACTIVE → DEACTIVATED.
+// Only a single forward step is applied; other targets leave state unchanged.
+message TransitionRequest {
+  string    module = 1;
+  Lifecycle to     = 2;
+}
+message TransitionAck {
+  Lifecycle state = 1;
+}
+
 service Kernel {
   rpc Register    (ModuleManifest)  returns (RegisterAck);
+  // Advance module lifecycle by one legal step. Part of the Module primitive.
+  rpc Transition  (TransitionRequest) returns (TransitionAck);
   rpc PutArtifact (Artifact)        returns (ArtifactRef);
   rpc GetArtifact (ArtifactRef)     returns (Artifact);
   // Content-addressed blob store: large opaque bytes live here; Artifacts

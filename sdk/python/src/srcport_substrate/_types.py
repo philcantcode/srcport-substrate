@@ -55,6 +55,8 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     RunState,
     SnapshotRequest,
     Subscription,
+    TransitionAck,
+    TransitionRequest,
     WorkItem,
 )
 

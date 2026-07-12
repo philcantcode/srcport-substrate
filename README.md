@@ -8,11 +8,12 @@ you need (Rust first) conform to it. Production consumers may run their own
 durable backends — what must not be re-derived is the contract and its
 invariants, not necessarily the storage implementation.
 
-**Durability lives in Modules, not the core.** Each SDK ships an in-memory
-`MemoryKernel` that implements the portable `KernelApi` so the contract is
-executable and conformance-testable. That type is *one* backend, not the
-authority — persistence belongs in Modules or in another `KernelApi`
-implementation over durable storage.
+**Two durability homes.** Kernel state (registry, ledger, runs, blob index)
+belongs in a **`KernelApi` backend** — each SDK ships in-memory `MemoryKernel`
+so the contract is executable and conformance-testable; production may swap in
+Postgres, files, etc. **Domain** state (findings, worlds, evidence) lives in
+**Modules** via artifacts, blobs, or a module's own store. `MemoryKernel` is
+*one* backend, not the authority.
 
 - **[`SPEC.md`](SPEC.md)** — the two-page human-owned specification. Read this.
 - **[`substrate.proto`](contracts/proto/srcport/substrate/v1/substrate.proto)** — the canonical contract (protobuf-first).
@@ -53,7 +54,7 @@ flowchart TB
         S1["Rust"] ~~~ S2["Go"] ~~~ S3["Python"]
     end
 
-    subgraph L4["④ KernelApi backends — durability lives here, not in the core"]
+    subgraph L4["④ KernelApi backends — kernel-state durability"]
         direction LR
         B1["MemoryKernel<br/>shipped · in-memory"] ~~~ B2["Your durable store<br/>Postgres · files · …"]
     end
@@ -137,10 +138,10 @@ flowchart TB
 
 | # | Primitive | Guarantees |
 |---|-----------|------------|
-| ① | **Module** | A vertical slice with typed capability ports; never imports another module. |
-| ② | **Artifact** | Typed, content-addressed, **immutable**. Small values inline; large values hold a verified external blob ref. Same typed value ⇒ same id. |
-| ③ | **Contract** | The declarative schema — the **sole** coupling point. Immutable identity: `ref` pinned to a content `digest`. |
-| ④ | **Event** | Publish/subscribe topics with a kernel-assigned **total order** (`seq`). |
+| ① | **Module** | A vertical slice with typed **ports** (the only I/O typing); `requires` is availability only, never dataflow; lifecycle via `Transition`; never imports another module. |
+| ② | **Artifact** | Typed, content-addressed, **immutable**. Small values inline; large values hold a verified external blob ref. Same typed value ⇒ same id. Provenance is a `Derivation`, not a field on the artifact. |
+| ③ | **Contract** | The declarative schema — the **sole** coupling point. Immutable identity: `ref` pinned to a content `digest`. Ports and types name the ref. |
+| ④ | **Event** | Publish/subscribe topics with a kernel-assigned **total order** (`seq`). Artifact refs are the data plane. |
 | ⑤ | **Ledger** | Append-only, **hash-chained**, tamper-evident record of every action. |
 | ⑥ | **Registry** | Discovery — "what modules, capabilities, and contracts exist right now?" |
 | ⑦ | **Run** | Applies an immutable input set to a finite typed assembly; must close as completed, stalled, failed, or cancelled. |

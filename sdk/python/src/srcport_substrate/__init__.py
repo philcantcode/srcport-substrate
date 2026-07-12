@@ -2,15 +2,16 @@
 
 One pluggable core: seven primitives (Module · Artifact · Contract · Event ·
 Ledger · Registry · Run) and one Kernel ABI, conformant to SPEC.md.
-:class:`MemoryKernel` implements :class:`KernelApi` in-process. **Durability
-lives in Modules, not the core** — the in-memory kernel is one backend, not the
-authority.
+:class:`MemoryKernel` implements :class:`KernelApi` in-process. Kernel-state
+durability is a :class:`KernelApi` backend concern; domain state lives in
+Modules.
 """
 
 from ._kernel import (
     SUBSCRIBER_BUFFER,
     BlobIntegrity,
     Conflict,
+    FailedPrecondition,
     Invalid,
     KernelApi,
     KernelError,
@@ -58,6 +59,8 @@ from ._types import (
     RunState,
     SnapshotRequest,
     Subscription,
+    TransitionAck,
+    TransitionRequest,
     WorkItem,
     artifact_content,
     artifact_id,
@@ -81,6 +84,7 @@ __all__ = [
     "Invalid",
     "Conflict",
     "RunClosed",
+    "FailedPrecondition",
     "BlobIntegrity",
     "SUBSCRIBER_BUFFER",
     "Lifecycle",
@@ -122,6 +126,8 @@ __all__ = [
     "RequestContext",
     "Error",
     "SnapshotRequest",
+    "TransitionRequest",
+    "TransitionAck",
     "MAX_INLINE_ARTIFACT_BYTES",
     "artifact_id",
     "artifact_id_of",

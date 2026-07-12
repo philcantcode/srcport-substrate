@@ -51,6 +51,8 @@ pub enum KernelError {
     Conflict(String),
     /// A terminal run is immutable and accepts no more work.
     RunClosed(RunState),
+    /// A call precondition failed (e.g. absolute deadline already passed).
+    FailedPrecondition(String),
     /// Stored blob bytes do not match the claimed digest or byte_count.
     BlobIntegrity(String),
 }
@@ -62,6 +64,7 @@ impl std::fmt::Display for KernelError {
             KernelError::Invalid(reason) => write!(f, "invalid: {reason}"),
             KernelError::Conflict(reason) => write!(f, "conflict: {reason}"),
             KernelError::RunClosed(state) => write!(f, "run is closed: {state:?}"),
+            KernelError::FailedPrecondition(reason) => write!(f, "failed precondition: {reason}"),
             KernelError::BlobIntegrity(reason) => write!(f, "blob integrity: {reason}"),
         }
     }
@@ -78,8 +81,10 @@ impl KernelError {
             KernelError::NotFound(_) => ErrorCode::NotFound,
             KernelError::Invalid(_) => ErrorCode::Invalid,
             KernelError::Conflict(_) => ErrorCode::Conflict,
-            KernelError::RunClosed(_) => ErrorCode::FailedPrecondition,
-            KernelError::BlobIntegrity(_) => ErrorCode::FailedPrecondition,
+            KernelError::RunClosed(_) | KernelError::FailedPrecondition(_) => {
+                ErrorCode::FailedPrecondition
+            }
+            KernelError::BlobIntegrity(_) => ErrorCode::BlobIntegrity,
         }
     }
 
@@ -106,7 +111,9 @@ impl KernelError {
             KernelError::RunClosed(state) => {
                 e.failed_precondition = format!("run closed: {state:?}")
             }
-            KernelError::BlobIntegrity(reason) => e.failed_precondition = reason.clone(),
+            KernelError::FailedPrecondition(reason) | KernelError::BlobIntegrity(reason) => {
+                e.failed_precondition = reason.clone()
+            }
             _ => {}
         }
         e
@@ -317,6 +324,13 @@ struct BlobSlot {
     r#ref: BlobRef,
 }
 
+/// Successful responses cached for non-empty `RequestContext.request_key`.
+#[derive(Clone)]
+enum IdempotentResult {
+    ArtifactRef(ArtifactRef),
+    Run(Box<Run>),
+}
+
 /// Everything the kernel owns, behind one lock. Small on purpose.
 #[derive(Default)]
 struct State {
@@ -331,6 +345,8 @@ struct State {
     runs: HashMap<String, RunSlot>,
     derivations: Vec<Derivation>,
     event_seq: u64,
+    /// `(operation, caller, request_key)` → first successful response.
+    idempotency: HashMap<String, IdempotentResult>,
 }
 
 /// The in-memory realisation of [`KernelApi`]. `Send + Sync`; share it behind
@@ -380,14 +396,21 @@ impl MemoryKernel {
 
     /// `rpc Register(ModuleManifest) -> RegisterAck`. Records the module, its
     /// capabilities, and (implicitly) name-only placeholders for the contracts
-    /// those capabilities speak. The module lands in `REGISTERED`; advance it
-    /// with [`MemoryKernel::transition`]. Placeholders may be filled once via
-    /// [`MemoryKernel::put_contract`].
+    /// named on those capabilities' **ports**. The module lands in `REGISTERED`;
+    /// advance it with [`MemoryKernel::transition`]. Placeholders may be filled
+    /// once via [`MemoryKernel::put_contract`].
     pub fn register(&self, manifest: ModuleManifest) -> RegisterAck {
+        self.register_ctx(manifest, &RequestContext::default())
+    }
+
+    /// Like [`MemoryKernel::register`] with an explicit context. Deadline is
+    /// not enforceable on this infallible RPC shape; use Result-returning
+    /// methods (`put_artifact_ctx`, `start_run_ctx`, `commit_ctx`,
+    /// `transition_req`) when deadlines matter.
+    pub fn register_ctx(&self, manifest: ModuleManifest, _ctx: &RequestContext) -> RegisterAck {
         let mut state = self.state.lock().unwrap();
         for cap in &manifest.provides {
             state.capabilities.push(cap.clone());
-            Self::ensure_contract_placeholder(&mut state, &cap.contract);
             for port in cap.inputs.iter().chain(cap.outputs.iter()) {
                 Self::ensure_contract_placeholder(&mut state, &port.contract);
             }
@@ -418,28 +441,47 @@ impl MemoryKernel {
         });
     }
 
-    /// Advance a module along `REGISTERED → LOADED → ACTIVE → DEACTIVATED`.
-    /// Only forward moves are honoured; anything else is a no-op returning the
-    /// current state. Returns `NotFound` if the module was never registered.
+    /// `rpc Transition(TransitionRequest) -> TransitionAck`. Advances a module
+    /// along `REGISTERED → LOADED → ACTIVE → DEACTIVATED`. Only a single
+    /// forward step is applied; anything else is a no-op returning the current
+    /// state. Returns `NotFound` if the module was never registered.
     pub fn transition(&self, module: &str, to: Lifecycle) -> Result<Lifecycle> {
+        let ack = self.transition_req(
+            TransitionRequest {
+                module: module.to_string(),
+                to: to as i32,
+            },
+            &RequestContext::default(),
+        )?;
+        Ok(Lifecycle::try_from(ack.state).unwrap_or(Lifecycle::Unspecified))
+    }
+
+    /// Full ABI form of [`MemoryKernel::transition`].
+    pub fn transition_req(
+        &self,
+        req: TransitionRequest,
+        ctx: &RequestContext,
+    ) -> Result<TransitionAck> {
+        check_deadline(ctx)?;
         let mut state = self.state.lock().unwrap();
         let slot = state
             .modules
             .iter_mut()
-            .find(|m| m.manifest.name == module)
-            .ok_or_else(|| KernelError::NotFound(module.to_string()))?;
+            .find(|m| m.manifest.name == req.module)
+            .ok_or_else(|| KernelError::NotFound(req.module.clone()))?;
+        let to = Lifecycle::try_from(req.to).unwrap_or(Lifecycle::Unspecified);
         if to as i32 == slot.lifecycle as i32 + 1 {
             slot.lifecycle = to;
             let kind = format!("module.{}", lifecycle_verb(to));
-            Self::append_locked(&mut state, &kind, module, Vec::new());
+            Self::append_locked(&mut state, &kind, &req.module, Vec::new());
         }
         let now = state
             .modules
             .iter()
-            .find(|m| m.manifest.name == module)
+            .find(|m| m.manifest.name == req.module)
             .map(|m| m.lifecycle)
             .unwrap();
-        Ok(now)
+        Ok(TransitionAck { state: now as i32 })
     }
 
     // ── 2. ARTIFACT ────────────────────────────────────────────────────────
@@ -450,9 +492,23 @@ impl MemoryKernel {
     /// Inline: set `body`, leave `object` unset. External: `put_blob` first,
     /// then set `object` with empty `body`. The blob must already exist and
     /// match. Exactly one of body or object may carry the value.
-    pub fn put_artifact(&self, mut artifact: Artifact) -> Result<ArtifactRef> {
+    pub fn put_artifact(&self, artifact: Artifact) -> Result<ArtifactRef> {
+        self.put_artifact_ctx(artifact, &RequestContext::default())
+    }
+
+    /// Like [`MemoryKernel::put_artifact`], honouring deadline and idempotency
+    /// (`request_key`) from [`RequestContext`].
+    pub fn put_artifact_ctx(
+        &self,
+        mut artifact: Artifact,
+        ctx: &RequestContext,
+    ) -> Result<ArtifactRef> {
+        check_deadline(ctx)?;
         validate_artifact_content(&artifact)?;
         let mut state = self.state.lock().unwrap();
+        if let Some(IdempotentResult::ArtifactRef(r)) = idempotent_get(&state, "put_artifact", ctx) {
+            return Ok(r);
+        }
         if has_external_object(&artifact) {
             verify_object_ref_locked(&state, artifact.object.as_ref().unwrap())?;
         }
@@ -468,7 +524,14 @@ impl MemoryKernel {
             state.artifacts.insert(id.clone(), artifact);
             Self::append_locked(&mut state, "artifact.put", &id, detail);
         }
-        Ok(ArtifactRef { id })
+        let r = ArtifactRef { id };
+        idempotent_put(
+            &mut state,
+            "put_artifact",
+            ctx,
+            IdempotentResult::ArtifactRef(r.clone()),
+        );
+        Ok(r)
     }
 
     /// `rpc GetArtifact(ArtifactRef) -> Artifact`. Reads back byte-identical.
@@ -631,7 +694,8 @@ impl MemoryKernel {
 
     /// `rpc Publish(Event) -> PublishAck`. Assigns a monotonic `seq` (the total
     /// order), delivers to exactly the subscribers of `event.topic`, and never
-    /// to anyone else. Returns the assigned seq.
+    /// to anyone else. Returns the assigned seq. Artifact refs on the event are
+    /// the data plane.
     pub fn publish(&self, mut event: Event) -> PublishAck {
         let mut state = self.state.lock().unwrap();
         state.event_seq += 1;
@@ -650,9 +714,7 @@ impl MemoryKernel {
                 true
             }
         });
-        let mut for_log = event.clone();
-        for_log.payload.clear();
-        let detail = for_log.encode_to_vec();
+        let detail = event.encode_to_vec();
         Self::append_locked(&mut state, "event.published", &event.topic, detail);
         PublishAck { seq }
     }
@@ -696,7 +758,16 @@ impl MemoryKernel {
     /// versions, bindings, input artifacts, and terminal output are frozen into
     /// the returned Run and committed to the ledger.
     pub fn start_run(&self, req: RunRequest) -> Result<Run> {
+        self.start_run_ctx(req, &RequestContext::default())
+    }
+
+    /// Like [`MemoryKernel::start_run`], honouring deadline and idempotency.
+    pub fn start_run_ctx(&self, req: RunRequest, ctx: &RequestContext) -> Result<Run> {
+        check_deadline(ctx)?;
         let mut state = self.state.lock().unwrap();
+        if let Some(IdempotentResult::Run(r)) = idempotent_get(&state, "start_run", ctx) {
+            return Ok(*r);
+        }
         if req.id.is_empty() {
             return Err(KernelError::Invalid("run id is required".into()));
         }
@@ -739,6 +810,12 @@ impl MemoryKernel {
             },
         );
         Self::append_locked(&mut state, "run.started", &run.id, run.encode_to_vec());
+        idempotent_put(
+            &mut state,
+            "start_run",
+            ctx,
+            IdempotentResult::Run(Box::new(run.clone())),
+        );
         Ok(run)
     }
 
@@ -810,7 +887,16 @@ impl MemoryKernel {
     /// contract, records a separate immutable Derivation, releases downstream
     /// work, and closes the run when its declared terminal output appears.
     pub fn commit(&self, submitted: Derivation) -> Result<Run> {
+        self.commit_ctx(submitted, &RequestContext::default())
+    }
+
+    /// Like [`MemoryKernel::commit`], honouring deadline and idempotency.
+    pub fn commit_ctx(&self, submitted: Derivation, ctx: &RequestContext) -> Result<Run> {
+        check_deadline(ctx)?;
         let mut state = self.state.lock().unwrap();
+        if let Some(IdempotentResult::Run(r)) = idempotent_get(&state, "commit", ctx) {
+            return Ok(*r);
+        }
         let slot = state
             .runs
             .get(&submitted.run_id)
@@ -914,6 +1000,12 @@ impl MemoryKernel {
             _ => "run.progressed",
         };
         Self::append_locked(&mut state, kind, &run_now.id, run_now.encode_to_vec());
+        idempotent_put(
+            &mut state,
+            "commit",
+            ctx,
+            IdempotentResult::Run(Box::new(run_now.clone())),
+        );
         Ok(run_now)
     }
 
@@ -971,9 +1063,8 @@ impl MemoryKernel {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// KernelApi — the portable ABI (16 unary RPCs of `service Kernel`).
-// Streaming `Subscribe` and the lifecycle helper `transition` stay
-// inherent-only on [`MemoryKernel`].
+// KernelApi — the portable ABI (unary RPCs of `service Kernel`).
+// Streaming `Subscribe` stays inherent-only on [`MemoryKernel`].
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The Kernel ABI: one method per unary `service Kernel` RPC, each taking a
@@ -981,11 +1072,18 @@ impl MemoryKernel {
 /// detail (that would break the cross-SDK known-answer chain hashes); it rides
 /// beside the call — gRPC headers on the wire, this parameter in-process.
 ///
-/// [`MemoryKernel`] implements this trait by delegating to its ctx-free
-/// inherent methods, so existing call sites need not change. Other backends
-/// (durable store, remote) implement the same trait.
+/// Enforced context semantics:
+/// - `deadline_unix_ms > 0` and wall clock past that instant →
+///   [`KernelError::FailedPrecondition`]
+/// - non-empty `request_key` on PutArtifact / StartRun / Commit: first success
+///   for `(caller, request_key, operation)` is replayed without re-applying
+///   side effects
+///
+/// [`MemoryKernel`] implements this trait. Other backends (durable store,
+/// remote) implement the same trait.
 pub trait KernelApi {
     fn register(&self, manifest: ModuleManifest, ctx: &RequestContext) -> RegisterAck;
+    fn transition(&self, req: TransitionRequest, ctx: &RequestContext) -> Result<TransitionAck>;
     fn put_artifact(&self, artifact: Artifact, ctx: &RequestContext) -> Result<ArtifactRef>;
     fn get_artifact(&self, r#ref: &ArtifactRef, ctx: &RequestContext) -> Result<Artifact>;
     fn put_blob(&self, req: PutBlobRequest, ctx: &RequestContext) -> BlobRef;
@@ -1004,26 +1102,31 @@ pub trait KernelApi {
 }
 
 impl KernelApi for MemoryKernel {
-    fn register(&self, manifest: ModuleManifest, _ctx: &RequestContext) -> RegisterAck {
-        // Inherent method (ctx-free) takes precedence by arity — no recursion.
-        MemoryKernel::register(self, manifest)
+    fn register(&self, manifest: ModuleManifest, ctx: &RequestContext) -> RegisterAck {
+        MemoryKernel::register_ctx(self, manifest, ctx)
     }
-    fn put_artifact(&self, artifact: Artifact, _ctx: &RequestContext) -> Result<ArtifactRef> {
-        MemoryKernel::put_artifact(self, artifact)
+    fn transition(&self, req: TransitionRequest, ctx: &RequestContext) -> Result<TransitionAck> {
+        MemoryKernel::transition_req(self, req, ctx)
     }
-    fn get_artifact(&self, r#ref: &ArtifactRef, _ctx: &RequestContext) -> Result<Artifact> {
+    fn put_artifact(&self, artifact: Artifact, ctx: &RequestContext) -> Result<ArtifactRef> {
+        MemoryKernel::put_artifact_ctx(self, artifact, ctx)
+    }
+    fn get_artifact(&self, r#ref: &ArtifactRef, ctx: &RequestContext) -> Result<Artifact> {
+        check_deadline(ctx)?;
         MemoryKernel::get_artifact(self, r#ref)
     }
     fn put_blob(&self, req: PutBlobRequest, _ctx: &RequestContext) -> BlobRef {
         MemoryKernel::put_blob(self, req)
     }
-    fn get_blob(&self, req: GetBlobRequest, _ctx: &RequestContext) -> Result<BlobData> {
+    fn get_blob(&self, req: GetBlobRequest, ctx: &RequestContext) -> Result<BlobData> {
+        check_deadline(ctx)?;
         MemoryKernel::get_blob(self, req)
     }
     fn has_blob(&self, req: HasBlobRequest, _ctx: &RequestContext) -> HasBlobResponse {
         MemoryKernel::has_blob(self, req)
     }
-    fn put_contract(&self, contract: Contract, _ctx: &RequestContext) -> Result<Contract> {
+    fn put_contract(&self, contract: Contract, ctx: &RequestContext) -> Result<Contract> {
+        check_deadline(ctx)?;
         MemoryKernel::put_contract(self, contract)
     }
     fn publish(&self, event: Event, _ctx: &RequestContext) -> PublishAck {
@@ -1035,23 +1138,60 @@ impl KernelApi for MemoryKernel {
     fn snapshot(&self, _req: SnapshotRequest, _ctx: &RequestContext) -> RegistrySnapshot {
         MemoryKernel::snapshot(self)
     }
-    fn start_run(&self, req: RunRequest, _ctx: &RequestContext) -> Result<Run> {
-        MemoryKernel::start_run(self, req)
+    fn start_run(&self, req: RunRequest, ctx: &RequestContext) -> Result<Run> {
+        MemoryKernel::start_run_ctx(self, req, ctx)
     }
-    fn claim_ready(&self, req: ClaimRequest, _ctx: &RequestContext) -> Result<WorkItem> {
+    fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<WorkItem> {
+        check_deadline(ctx)?;
         MemoryKernel::claim_ready(self, req)
     }
-    fn commit(&self, submitted: Derivation, _ctx: &RequestContext) -> Result<Run> {
-        MemoryKernel::commit(self, submitted)
+    fn commit(&self, submitted: Derivation, ctx: &RequestContext) -> Result<Run> {
+        MemoryKernel::commit_ctx(self, submitted, ctx)
     }
-    fn get_run(&self, r: &RunRef, _ctx: &RequestContext) -> Result<Run> {
+    fn get_run(&self, r: &RunRef, ctx: &RequestContext) -> Result<Run> {
+        check_deadline(ctx)?;
         MemoryKernel::get_run(self, r)
     }
-    fn cancel_run(&self, r: &RunRef, _ctx: &RequestContext) -> Result<Run> {
+    fn cancel_run(&self, r: &RunRef, ctx: &RequestContext) -> Result<Run> {
+        check_deadline(ctx)?;
         MemoryKernel::cancel_run(self, r)
     }
-    fn list_derivations(&self, r: &RunRef, _ctx: &RequestContext) -> Result<DerivationList> {
+    fn list_derivations(&self, r: &RunRef, ctx: &RequestContext) -> Result<DerivationList> {
+        check_deadline(ctx)?;
         MemoryKernel::list_derivations(self, r)
+    }
+}
+
+/// Reject calls whose absolute deadline has already passed.
+fn check_deadline(ctx: &RequestContext) -> Result<()> {
+    if ctx.deadline_unix_ms <= 0 {
+        return Ok(());
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if now_ms > ctx.deadline_unix_ms {
+        return Err(KernelError::FailedPrecondition("deadline exceeded".into()));
+    }
+    Ok(())
+}
+
+fn idempotency_key(op: &str, ctx: &RequestContext) -> Option<String> {
+    if ctx.request_key.is_empty() {
+        return None;
+    }
+    Some(format!("{op}\0{}\0{}", ctx.caller, ctx.request_key))
+}
+
+fn idempotent_get(state: &State, op: &str, ctx: &RequestContext) -> Option<IdempotentResult> {
+    let key = idempotency_key(op, ctx)?;
+    state.idempotency.get(&key).cloned()
+}
+
+fn idempotent_put(state: &mut State, op: &str, ctx: &RequestContext, value: IdempotentResult) {
+    if let Some(key) = idempotency_key(op, ctx) {
+        state.idempotency.entry(key).or_insert(value);
     }
 }
 

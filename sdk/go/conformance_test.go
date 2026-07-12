@@ -94,9 +94,12 @@ func TestEventsAreOrderedAndIsolated(t *testing.T) {
 	hosts := k.Subscribe(&Subscription{Module: "a", Topics: []string{"recon.host.found"}})
 	ports := k.Subscribe(&Subscription{Module: "b", Topics: []string{"recon.port.found"}})
 
-	s1 := k.Publish(&Event{Topic: "recon.host.found", Payload: []byte("h1")}).Seq
-	s2 := k.Publish(&Event{Topic: "recon.host.found", Payload: []byte("h2")}).Seq
-	s3 := k.Publish(&Event{Topic: "recon.port.found", Payload: []byte("p1")}).Seq
+	h1 := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Host", Body: []byte("h1")})
+	h2 := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Host", Body: []byte("h2")})
+	p1 := mustPut(t, k, &Artifact{Type: "acme.recon.v1.Port", Body: []byte("p1")})
+	s1 := k.Publish(&Event{Topic: "recon.host.found", Type: "acme.recon.v1.Host", Artifacts: []*ArtifactRef{h1}}).Seq
+	s2 := k.Publish(&Event{Topic: "recon.host.found", Type: "acme.recon.v1.Host", Artifacts: []*ArtifactRef{h2}}).Seq
+	s3 := k.Publish(&Event{Topic: "recon.port.found", Type: "acme.recon.v1.Port", Artifacts: []*ArtifactRef{p1}}).Seq
 
 	if !(s1 < s2 && s2 < s3) {
 		t.Fatalf("seq must be monotonic across topics: %d %d %d", s1, s2, s3)
@@ -107,8 +110,9 @@ func TestEventsAreOrderedAndIsolated(t *testing.T) {
 	if !ok1 || !ok2 {
 		t.Fatal("subscriber A must receive both host events")
 	}
-	if e1.Seq != s1 || !bytes.Equal(e1.Payload, []byte("h1")) || e2.Seq != s2 || !bytes.Equal(e2.Payload, []byte("h2")) {
-		t.Fatal("A must receive its events in seq order")
+	if e1.Seq != s1 || len(e1.Artifacts) != 1 || e1.Artifacts[0].Id != h1.Id ||
+		e2.Seq != s2 || len(e2.Artifacts) != 1 || e2.Artifacts[0].Id != h2.Id {
+		t.Fatal("A must receive its events in seq order with artifact refs")
 	}
 	if _, extra := recv(t, hosts, 50*time.Millisecond); extra {
 		t.Fatal("A must never receive the port event")
@@ -156,11 +160,11 @@ func TestRegistryReportsEverything(t *testing.T) {
 	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{
 		Name: "recon", Version: "0.1.0",
-		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
+		Provides: []*Capability{{Name: "recon.scan", Outputs: []*Port{{Name: "out", Contract: "acme.recon.v1.Host"}}}},
 	})
 	k.Register(&ModuleManifest{
 		Name: "report", Version: "0.2.0",
-		Provides: []*Capability{{Name: "report.render", Contract: "acme.report.v1.Report"}},
+		Provides: []*Capability{{Name: "report.render", Outputs: []*Port{{Name: "out", Contract: "acme.report.v1.Report"}}}},
 		Requires: []string{"recon.scan"},
 	})
 
@@ -171,7 +175,7 @@ func TestRegistryReportsEverything(t *testing.T) {
 	if !hasCap(snap.Capabilities, "recon.scan") || !hasCap(snap.Capabilities, "report.render") {
 		t.Fatal("registry must report every capability")
 	}
-	if !hasContract(snap.Contracts, "acme.recon.v1.ScanRequest") || !hasContract(snap.Contracts, "acme.report.v1.Report") {
+	if !hasContract(snap.Contracts, "acme.recon.v1.Host") || !hasContract(snap.Contracts, "acme.report.v1.Report") {
 		t.Fatal("registry must report every contract")
 	}
 }
@@ -224,7 +228,7 @@ func TestContractsAreImmutableAndIdentifiable(t *testing.T) {
 	// Register creates a name-only placeholder; PutContract may fill it once.
 	k.Register(&ModuleManifest{
 		Name: "mod", Version: "1",
-		Provides: []*Capability{{Name: "do", Contract: "acme.NewThing"}},
+		Provides: []*Capability{{Name: "do", Outputs: []*Port{{Name: "out", Contract: "acme.NewThing"}}}},
 	})
 	filled, err := k.PutContract(&Contract{
 		Ref: "acme.NewThing", MediaType: "text/x-protobuf",
@@ -427,11 +431,10 @@ func TestLedgerReconstructsStateFromDetail(t *testing.T) {
 		Body:        []byte("10.0.0.1"),
 		Meta:        map[string]string{"region": "eu", "scan": "full"},
 		ProducedBy:  "recon",
-		DerivedFrom: []string{"sha256:parent-a", "sha256:parent-b"},
 	})
 	k.Register(&ModuleManifest{
 		Name: "recon", Version: "0.1.0",
-		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
+		Provides: []*Capability{{Name: "recon.scan", Outputs: []*Port{{Name: "out", Contract: "acme.recon.v1.Host"}}}},
 		Requires: []string{"report.render"},
 	})
 	chain := k.Ledger()
@@ -450,9 +453,6 @@ func TestLedgerReconstructsStateFromDetail(t *testing.T) {
 	}
 	if a.Meta["region"] != "eu" || a.Meta["scan"] != "full" {
 		t.Fatal("meta must round-trip")
-	}
-	if len(a.DerivedFrom) != 2 || a.DerivedFrom[0] != "sha256:parent-a" || a.DerivedFrom[1] != "sha256:parent-b" {
-		t.Fatal("derived_from lineage must round-trip through the ledger")
 	}
 	if len(a.Body) != 0 {
 		t.Fatal("body must be cleared — the id in subject already addresses it")
@@ -498,7 +498,7 @@ func TestLedgerDetailEncodesCanonically(t *testing.T) {
 }
 
 // METAMORPHIC — the address depends ONLY on (type, body). Transforming fields
-// that aren't identity (meta, produced_by, derived_from) is a known no-op: the
+// that aren't identity (meta, produced_by) is a known no-op: the
 // id must not move. If it did, the address would be keyed on provenance, not
 // content — exactly the overfit a metamorphic test exists to catch.
 func TestAddressIgnoresNonIdentityFields(t *testing.T) {
@@ -509,10 +509,9 @@ func TestAddressIgnoresNonIdentityFields(t *testing.T) {
 		Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"),
 		Meta:        map[string]string{"x": "y"},
 		ProducedBy:  "whoever",
-		DerivedFrom: []string{"sha256:some-parent"},
 	})
 	if enriched.Id != base.Id {
-		t.Fatal("meta, produced_by, and derived_from must not participate in the address")
+		t.Fatal("meta and produced_by must not participate in the address")
 	}
 	if enriched.Id != ArtifactID("acme.recon.v1.Host", []byte("10.0.0.1")) {
 		t.Fatal("address must equal the pure (type, body) function regardless of provenance")
@@ -525,18 +524,17 @@ func TestAddressIgnoresNonIdentityFields(t *testing.T) {
 // chains are pinned to cross-verify. If this constant ever changes, it changes
 // in all three suites in lockstep — never one SDK alone.
 func TestLedgerHashKnownAnswerCrossSDK(t *testing.T) {
-	const want = "287449b9f8f2f7462177b01d55b32cc6b65580fefa22172e8ecfaa96bdbf60a1"
+	const want = "5d9dea28f0fa779b7d76dd6137c9b6079561289b12ed6dff022a889b94d69cd2"
 
 	k := NewMemoryKernel()
 	k.Register(&ModuleManifest{
 		Name: "recon", Version: "0.1.0",
-		Provides: []*Capability{{Name: "recon.scan", Contract: "acme.recon.v1.ScanRequest"}},
+		Provides: []*Capability{{Name: "recon.scan", Outputs: []*Port{{Name: "host", Contract: "acme.recon.v1.Host"}}}},
 		Requires: []string{"report.render"},
 	})
 	mustPut(t, k, &Artifact{
 		Type: "acme.recon.v1.Host", Body: []byte("10.0.0.1"),
 		Meta: map[string]string{"region": "eu", "scan": "full"}, ProducedBy: "recon",
-		DerivedFrom: []string{"sha256:parent-a", "sha256:parent-b"},
 	})
 	chain := k.Ledger()
 	if !k.VerifyLedger() {
@@ -732,5 +730,50 @@ func TestValueIdentityIndependentOfBlobIdentity(t *testing.T) {
 	artC := mustPut(t, k, &Artifact{Type: "other", Object: &ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: "a"}})
 	if artC.Id == artA.Id {
 		t.Fatal("type participates in typed value identity")
+	}
+}
+
+func TestRequestContextDeadlineAndIdempotency(t *testing.T) {
+	k := NewMemoryKernel()
+	past := &RequestContext{DeadlineUnixMs: 1}
+	if _, err := k.PutArtifact(&Artifact{Type: "t", Body: []byte("x")}, past); err == nil || !errors.Is(err, ErrFailedPrecondition) {
+		t.Fatalf("past deadline must fail: %v", err)
+	}
+	ctx := &RequestContext{Caller: "worker", RequestKey: "put-once"}
+	a, err := k.PutArtifact(&Artifact{Type: "t", Body: []byte("unique-body")}, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(k.Ledger())
+	b, err := k.PutArtifact(&Artifact{Type: "t", Body: []byte("unique-body")}, ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Id != b.Id {
+		t.Fatal("idempotent put must return same ref")
+	}
+	if len(k.Ledger()) != before {
+		t.Fatal("idempotent replay must not append ledger entries")
+	}
+}
+
+func TestTransitionIsOnTheABI(t *testing.T) {
+	k := NewMemoryKernel()
+	k.Register(&ModuleManifest{Name: "m", Version: "1"})
+	ack, err := k.Transition(&TransitionRequest{Module: "m", To: LifecycleLoaded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.State != LifecycleLoaded {
+		t.Fatalf("want LOADED, got %v", ack.State)
+	}
+	found := false
+	for _, e := range k.Ledger() {
+		if e.Kind == "module.loaded" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("module.loaded must land in the ledger")
 	}
 }

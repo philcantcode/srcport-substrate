@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -16,6 +17,10 @@ var ErrNotFound = errors.New("not found")
 
 var ErrInvalid = errors.New("invalid")
 var ErrConflict = errors.New("conflict")
+
+// ErrFailedPrecondition is returned when a call precondition fails (e.g. the
+// absolute deadline in RequestContext has already passed).
+var ErrFailedPrecondition = errors.New("failed precondition")
 
 // ErrBlobIntegrity is returned when stored blob bytes do not match the claimed
 // digest or byte_count (verified external refs).
@@ -44,7 +49,9 @@ func ToError(err error) *Error {
 		e.Code = ErrorCodeConflict
 		e.ConflictSubject = err.Error()
 	case errors.Is(err, ErrBlobIntegrity):
-		// Match Rust: BlobIntegrity maps to FAILED_PRECONDITION with detail.
+		e.Code = ErrorCodeBlobIntegrity
+		e.FailedPrecondition = err.Error()
+	case errors.Is(err, ErrFailedPrecondition):
 		e.Code = ErrorCodeFailedPrecondition
 		e.FailedPrecondition = err.Error()
 	case errors.As(err, &closed):
@@ -87,14 +94,24 @@ type blobSlot struct {
 	ref  *BlobRef
 }
 
+// idempotentResult caches a successful PutArtifact / StartRun / Commit response
+// under a non-empty RequestContext.request_key.
+type idempotentResult struct {
+	artifact *ArtifactRef
+	run      *Run
+}
+
 // MemoryKernel is the in-memory realisation of KernelApi. Its methods mirror
 // the service Kernel RPCs in substrate.proto one-for-one. It is safe for
 // concurrent use; share one *MemoryKernel across module goroutines. Every
 // meaningful action lands one append-only ledger entry. Values handed in and
 // out are cloned, so a caller can never mutate stored state through a shared
-// pointer. Durability lives in Modules (or other KernelApi backends), not here.
+// pointer.
+//
+// Durability of kernel state is the job of a KernelApi backend; domain state
+// lives in Modules. MemoryKernel is one backend, not the authority.
 type MemoryKernel struct {
-	mu       sync.Mutex
+	mu           sync.Mutex
 	modules      []moduleSlot
 	capabilities []*Capability
 	contracts    map[string]*Contract
@@ -105,24 +122,31 @@ type MemoryKernel struct {
 	runs         map[string]*runSlot
 	derivations  []*Derivation
 	eventSeq     uint64
+	idempotency  map[string]idempotentResult
 }
 
 // NewMemoryKernel returns an empty, ready in-memory kernel.
 func NewMemoryKernel() *MemoryKernel {
 	return &MemoryKernel{
-		contracts: map[string]*Contract{},
-		artifacts: map[string]*Artifact{},
-		blobs:     map[blobKey]*blobSlot{},
-		runs:      map[string]*runSlot{},
+		contracts:   map[string]*Contract{},
+		artifacts:   map[string]*Artifact{},
+		blobs:       map[blobKey]*blobSlot{},
+		runs:        map[string]*runSlot{},
+		idempotency: map[string]idempotentResult{},
 	}
 }
 
-// KernelApi is the portable ABI: the 16 unary RPCs of service Kernel.
-// Streaming Subscribe and the lifecycle helper Transition are inherent-only
-// on MemoryKernel. RequestContext rides as call metadata (variadic, optional)
-// and is deliberately not folded into ledger detail.
+// KernelApi is the portable ABI: the unary RPCs of service Kernel (including
+// Transition). Streaming Subscribe is inherent-only on MemoryKernel.
+// RequestContext rides as call metadata (variadic, optional) and is
+// deliberately not folded into ledger detail.
+//
+// Enforced context semantics: deadline_unix_ms rejects past deadlines with
+// ErrFailedPrecondition; non-empty request_key de-duplicates PutArtifact,
+// StartRun, and Commit by (caller, request_key, operation).
 type KernelApi interface {
 	Register(m *ModuleManifest, ctx ...*RequestContext) *RegisterAck
+	Transition(req *TransitionRequest, ctx ...*RequestContext) (*TransitionAck, error)
 	PutArtifact(a *Artifact, ctx ...*RequestContext) (*ArtifactRef, error)
 	GetArtifact(ref *ArtifactRef, ctx ...*RequestContext) (*Artifact, error)
 	PutBlob(req *PutBlobRequest, ctx ...*RequestContext) *BlobRef
@@ -138,6 +162,31 @@ type KernelApi interface {
 	GetRun(ref *RunRef, ctx ...*RequestContext) (*Run, error)
 	CancelRun(ref *RunRef, ctx ...*RequestContext) (*Run, error)
 	ListDerivations(ref *RunRef, ctx ...*RequestContext) (*DerivationList, error)
+}
+
+func firstCtx(ctx []*RequestContext) *RequestContext {
+	if len(ctx) > 0 && ctx[0] != nil {
+		return ctx[0]
+	}
+	return &RequestContext{}
+}
+
+func checkDeadline(ctx *RequestContext) error {
+	if ctx == nil || ctx.DeadlineUnixMs <= 0 {
+		return nil
+	}
+	now := time.Now().UnixMilli()
+	if now > ctx.DeadlineUnixMs {
+		return fmt.Errorf("%w: deadline exceeded", ErrFailedPrecondition)
+	}
+	return nil
+}
+
+func idempotencyKey(op string, ctx *RequestContext) (string, bool) {
+	if ctx == nil || ctx.RequestKey == "" {
+		return "", false
+	}
+	return op + "\x00" + ctx.Caller + "\x00" + ctx.RequestKey, true
 }
 
 // Compile-time check: MemoryKernel implements KernelApi.
@@ -181,8 +230,8 @@ func (k *MemoryKernel) appendLocked(kind, subject string, detail []byte) *Ledger
 // ─── 1. Module ────────────────────────────────────────────────────────────
 
 // Register records a module, its capabilities, and (implicitly) name-only
-// placeholders for the contracts those capabilities speak. The module lands in
-// REGISTERED; advance it with Transition. Mirrors rpc Register.
+// placeholders for the contracts named on those capabilities' ports. The module
+// lands in REGISTERED; advance it with Transition. Mirrors rpc Register.
 // Placeholders may be filled once via PutContract; they do not write
 // contract.registered ledger entries (module.registered already names the refs).
 func (k *MemoryKernel) Register(m *ModuleManifest, ctx ...*RequestContext) *RegisterAck {
@@ -191,7 +240,6 @@ func (k *MemoryKernel) Register(m *ModuleManifest, ctx ...*RequestContext) *Regi
 	defer k.mu.Unlock()
 	for _, c := range m.Provides {
 		k.capabilities = append(k.capabilities, clone(c))
-		k.ensureContractPlaceholderLocked(c.Contract)
 		for _, p := range append(append([]*Port{}, c.Inputs...), c.Outputs...) {
 			k.ensureContractPlaceholderLocked(p.Contract)
 		}
@@ -218,22 +266,30 @@ func (k *MemoryKernel) ensureContractPlaceholderLocked(ref string) {
 	}
 }
 
-// Transition advances a module along REGISTERED → LOADED → ACTIVE →
-// DEACTIVATED. Only forward moves are honoured; anything else is a no-op that
-// returns the current state. Returns ErrNotFound if the module is unknown.
-func (k *MemoryKernel) Transition(module string, to Lifecycle, ctx ...*RequestContext) (Lifecycle, error) {
+// Transition is rpc Transition(TransitionRequest) -> TransitionAck. Advances a
+// module along REGISTERED → LOADED → ACTIVE → DEACTIVATED. Only a single
+// forward step is applied; anything else is a no-op that returns the current
+// state. Returns ErrNotFound if the module is unknown.
+func (k *MemoryKernel) Transition(req *TransitionRequest, ctx ...*RequestContext) (*TransitionAck, error) {
+	c := firstCtx(ctx)
+	if err := checkDeadline(c); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, fmt.Errorf("%w: transition request is required", ErrInvalid)
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	for i := range k.modules {
-		if k.modules[i].manifest.Name == module {
-			if to == k.modules[i].lifecycle+1 {
-				k.modules[i].lifecycle = to
-				k.appendLocked("module."+lifecycleVerb(to), module, nil)
+		if k.modules[i].manifest.Name == req.Module {
+			if req.To == k.modules[i].lifecycle+1 {
+				k.modules[i].lifecycle = req.To
+				k.appendLocked("module."+lifecycleVerb(req.To), req.Module, nil)
 			}
-			return k.modules[i].lifecycle, nil
+			return &TransitionAck{State: k.modules[i].lifecycle}, nil
 		}
 	}
-	return LifecycleUnspecified, fmt.Errorf("%w: %s", ErrNotFound, module)
+	return nil, fmt.Errorf("%w: %s", ErrNotFound, req.Module)
 }
 
 // ─── 2. Artifact ──────────────────────────────────────────────────────────
@@ -244,13 +300,23 @@ func (k *MemoryKernel) Transition(module string, to Lifecycle, ctx ...*RequestCo
 // Inline: pass body, leave object unset. External: PutBlob first, then pass
 // object (digest, byte_count, namespace) with body empty. The blob must already
 // exist and match. Exactly one of body or object may carry the value.
+// Honour RequestContext deadline and request_key idempotency.
 func (k *MemoryKernel) PutArtifact(a *Artifact, ctx ...*RequestContext) (*ArtifactRef, error) {
+	c := firstCtx(ctx)
+	if err := checkDeadline(c); err != nil {
+		return nil, err
+	}
 	a = clone(a)
 	if err := validateArtifactContent(a); err != nil {
 		return nil, err
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if key, ok := idempotencyKey("put_artifact", c); ok {
+		if cached, hit := k.idempotency[key]; hit && cached.artifact != nil {
+			return clone(cached.artifact), nil
+		}
+	}
 	if HasExternalObject(a) {
 		if err := k.verifyObjectRefLocked(a.Object); err != nil {
 			return nil, err
@@ -267,11 +333,20 @@ func (k *MemoryKernel) PutArtifact(a *Artifact, ctx ...*RequestContext) (*Artifa
 		forLog.Body = nil
 		k.appendLocked("artifact.put", id, marshalCanonical(forLog))
 	}
-	return &ArtifactRef{Id: id}, nil
+	ref := &ArtifactRef{Id: id}
+	if key, ok := idempotencyKey("put_artifact", c); ok {
+		if _, hit := k.idempotency[key]; !hit {
+			k.idempotency[key] = idempotentResult{artifact: clone(ref)}
+		}
+	}
+	return ref, nil
 }
 
 // GetArtifact reads an artifact back byte-identical. Mirrors rpc GetArtifact.
 func (k *MemoryKernel) GetArtifact(ref *ArtifactRef, ctx ...*RequestContext) (*Artifact, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	a, ok := k.artifacts[ref.Id]
@@ -303,6 +378,9 @@ func (k *MemoryKernel) PutBlob(req *PutBlobRequest, ctx ...*RequestContext) *Blo
 // GetBlob streams back (in-process: returns) verified blob bytes. Re-hashes on
 // read and rejects digest/size mismatches. Mirrors rpc GetBlob.
 func (k *MemoryKernel) GetBlob(req *GetBlobRequest, ctx ...*RequestContext) (*BlobData, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	slot, ok := k.blobs[blobKey{namespace: req.Namespace, digest: req.Digest}]
@@ -416,6 +494,9 @@ func (k *MemoryKernel) verifyObjectRefLocked(o *ObjectRef) error {
 // under the same ref is ErrConflict. A name-only placeholder created by
 // Register may be filled once. Mirrors rpc PutContract.
 func (k *MemoryKernel) PutContract(c *Contract, ctx ...*RequestContext) (*Contract, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
 	if c == nil || c.Ref == "" {
 		return nil, fmt.Errorf("%w: contract ref is required", ErrInvalid)
 	}
@@ -486,9 +567,8 @@ func (k *MemoryKernel) Publish(e *Event, ctx ...*RequestContext) *PublishAck {
 		}
 	}
 	k.subs = alive
-	forLog := clone(e)
-	forLog.Payload = nil
-	k.appendLocked("event.published", e.Topic, marshalCanonical(forLog))
+	// Artifact refs are the data plane; the Event lands fully in the chain.
+	k.appendLocked("event.published", e.Topic, marshalCanonical(e))
 	return &PublishAck{Seq: e.Seq}
 }
 
@@ -548,10 +628,20 @@ func (k *MemoryKernel) Snapshot(ctx ...*RequestContext) *RegistrySnapshot {
 
 // StartRun validates and freezes a finite feed-forward assembly. Mirrors rpc
 // StartRun. No domain payload is interpreted; readiness follows typed bindings.
+// Honour RequestContext deadline and request_key idempotency.
 func (k *MemoryKernel) StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, error) {
+	c := firstCtx(ctx)
+	if err := checkDeadline(c); err != nil {
+		return nil, err
+	}
 	req = clone(req)
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if key, ok := idempotencyKey("start_run", c); ok {
+		if cached, hit := k.idempotency[key]; hit && cached.run != nil {
+			return clone(cached.run), nil
+		}
+	}
 	if req.Id == "" {
 		return nil, fmt.Errorf("%w: run id is required", ErrInvalid)
 	}
@@ -574,13 +664,22 @@ func (k *MemoryKernel) StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, 
 	run := &Run{Id: req.Id, Assembly: req.Assembly, Inputs: req.Inputs, State: RunStateRunning, MaxSteps: max}
 	k.runs[run.Id] = &runSlot{run: run, claimed: map[string]*WorkItem{}, committed: map[string]*Derivation{}}
 	k.appendLocked("run.started", run.Id, marshalCanonical(run))
-	return clone(run), nil
+	out := clone(run)
+	if key, ok := idempotencyKey("start_run", c); ok {
+		if _, hit := k.idempotency[key]; !hit {
+			k.idempotency[key] = idempotentResult{run: clone(out)}
+		}
+	}
+	return out, nil
 }
 
 // ClaimReady atomically claims one ready node for module. An empty WorkItem
 // means this module has no ready node. If no work exists anywhere, the run is
 // closed as STALLED.
 func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*WorkItem, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	slot, ok := k.runs[req.RunId]
@@ -621,10 +720,20 @@ func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*W
 
 // Commit validates and records one production path, then releases downstream
 // nodes or closes the run when the declared terminal artifact appears.
+// Honour RequestContext deadline and request_key idempotency.
 func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*Run, error) {
+	c := firstCtx(ctx)
+	if err := checkDeadline(c); err != nil {
+		return nil, err
+	}
 	submitted = clone(submitted)
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	if key, ok := idempotencyKey("commit", c); ok {
+		if cached, hit := k.idempotency[key]; hit && cached.run != nil {
+			return clone(cached.run), nil
+		}
+	}
 	slot, ok := k.runs[submitted.RunId]
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, submitted.RunId)
@@ -695,10 +804,19 @@ func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*R
 		kind = "run.failed"
 	}
 	k.appendLocked(kind, slot.run.Id, marshalCanonical(slot.run))
-	return clone(slot.run), nil
+	out := clone(slot.run)
+	if key, ok := idempotencyKey("commit", c); ok {
+		if _, hit := k.idempotency[key]; !hit {
+			k.idempotency[key] = idempotentResult{run: clone(out)}
+		}
+	}
+	return out, nil
 }
 
 func (k *MemoryKernel) GetRun(ref *RunRef, ctx ...*RequestContext) (*Run, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if slot := k.runs[ref.Id]; slot != nil {
@@ -708,6 +826,9 @@ func (k *MemoryKernel) GetRun(ref *RunRef, ctx ...*RequestContext) (*Run, error)
 }
 
 func (k *MemoryKernel) CancelRun(ref *RunRef, ctx ...*RequestContext) (*Run, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	slot := k.runs[ref.Id]
@@ -735,6 +856,9 @@ func (k *MemoryKernel) Derivations() []*Derivation {
 }
 
 func (k *MemoryKernel) ListDerivations(ref *RunRef, ctx ...*RequestContext) (*DerivationList, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.runs[ref.Id] == nil {

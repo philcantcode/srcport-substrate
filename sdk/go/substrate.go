@@ -58,10 +58,12 @@ type (
 	WorkItem         = pb.WorkItem
 	Derivation       = pb.Derivation
 	DerivationList   = pb.DerivationList
-	RequestContext   = pb.RequestContext
-	Error            = pb.Error
-	ErrorCode        = pb.ErrorCode
-	SnapshotRequest  = pb.SnapshotRequest
+	RequestContext    = pb.RequestContext
+	Error             = pb.Error
+	ErrorCode         = pb.ErrorCode
+	SnapshotRequest   = pb.SnapshotRequest
+	TransitionRequest = pb.TransitionRequest
+	TransitionAck     = pb.TransitionAck
 
 	Lifecycle = pb.Lifecycle
 	RunState  = pb.RunState
