@@ -1,0 +1,150 @@
+// ─────────────────────────────────────────────────────────────────────────
+// srcport-substrate — the frozen, domain-neutral microkernel contract.
+//
+// THIS FILE IS THE CONTRACT. It is the one artifact a human owns and reads.
+// Every SDK conforms to it. It defines SEVEN primitives and one ABI, and it
+// knows nothing about any domain — no targets, trials, findings, entities,
+// terrain, or content. All of that is a Module built ON TOP of this.
+//
+// Evolve by ADDING, never by mutating or renumbering a field. See SPEC.md.
+// ─────────────────────────────────────────────────────────────────────────
+
+syntax = "proto3";
+
+package srcport.substrate.v1;
+
+// ─── 1. MODULE ─────────────────────────────────────────────────────────────
+// A self-contained vertical slice. It declares what it provides and requires;
+// it never imports another module. Lifecycle: REGISTERED → LOADED → ACTIVE →
+// DEACTIVATED.
+
+enum Lifecycle {
+  LIFECYCLE_UNSPECIFIED = 0;
+  LIFECYCLE_REGISTERED  = 1;
+  LIFECYCLE_LOADED      = 2;
+  LIFECYCLE_ACTIVE      = 3;
+  LIFECYCLE_DEACTIVATED = 4;
+}
+
+// A named thing a module can do, bound to the contract it speaks.
+message Capability {
+  string name     = 1;  // e.g. "recon.scan"
+  string contract = 2;  // contract ref, e.g. "acme.recon.v1.ScanRequest"
+}
+
+message ModuleManifest {
+  string name              = 1;  // unique module id, kebab-case
+  string version           = 2;  // semver
+  repeated Capability provides = 3;
+  repeated string requires     = 4;  // capability names that must be present
+}
+
+// ─── 2. ARTIFACT ───────────────────────────────────────────────────────────
+// A typed, content-addressed, IMMUTABLE value that flows between modules.
+// id = "sha256:" + hex(sha256(type + 0x00 + body)). Same content ⇒ same id.
+// The kernel never parses `body`; the `type` (a contract ref) says what it is.
+
+message Artifact {
+  string id                  = 1;  // content address, assigned by the kernel
+  string type                = 2;  // contract ref describing body
+  bytes  body                = 3;  // opaque encoded value
+  map<string, string> meta   = 4;
+  string produced_by         = 5;  // module name
+}
+
+message ArtifactRef { string id = 1; }
+
+// ─── 3. CONTRACT ───────────────────────────────────────────────────────────
+// The declarative schema that is the SOLE coupling point. Modules couple to a
+// contract ref, never to each other's code. Registering a capability registers
+// the contract it speaks.
+
+message Contract {
+  string ref    = 1;  // fully-qualified name, e.g. "acme.recon.v1.Host"
+  string schema = 2;  // schema text (proto / JSON Schema); may be empty
+}
+
+// ─── 4. EVENT ──────────────────────────────────────────────────────────────
+// A bus message. Modules publish to topics and subscribe to topics; they never
+// call each other directly. `seq` is a total order assigned by the kernel.
+
+message Event {
+  string id      = 1;
+  string topic   = 2;  // dotted, e.g. "recon.host.found"
+  string type    = 3;  // contract ref of payload
+  bytes  payload = 4;
+  string source  = 5;  // module name
+  uint64 seq     = 6;  // kernel-assigned, monotonic
+}
+
+// ─── 5. LEDGER ─────────────────────────────────────────────────────────────
+// An append-only, hash-chained, agent-observable record of everything the
+// kernel did. Tamper-evident: each entry commits to the previous entry's hash.
+
+message LedgerEntry {
+  uint64 seq       = 1;
+  string kind      = 2;  // "module.activated", "artifact.put", "event.published", …
+  string subject   = 3;  // id of the thing this entry is about
+  bytes  detail    = 4;
+  string prev_hash = 5;  // hash of entry seq-1 ("" for genesis)
+  string hash      = 6;  // sha256 over (seq, kind, subject, detail, prev_hash)
+}
+
+// ─── 6. GATE ───────────────────────────────────────────────────────────────
+// A human-held checkpoint before anything irreversible. A module REQUESTS a
+// gate and must not proceed until a human DECIDES. Non-bypassable by design.
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_PENDING     = 1;
+  DECISION_APPROVED    = 2;
+  DECISION_REJECTED    = 3;
+}
+
+message GateRequest {
+  string id           = 1;
+  string action       = 2;  // human-readable description of the irreversible act
+  bytes  context      = 3;  // evidence the human decides on
+  string requested_by = 4;  // module name
+}
+
+message GateDecision {
+  string   request_id = 1;
+  Decision decision   = 2;
+  string   decided_by = 3;  // human identity
+  string   reason     = 4;
+}
+
+// ─── 7. REGISTRY ───────────────────────────────────────────────────────────
+// Discovery: what modules, capabilities, and contracts exist right now.
+
+message RegistrySnapshot {
+  repeated ModuleManifest modules      = 1;
+  repeated Capability      capabilities = 2;
+  repeated Contract        contracts    = 3;
+}
+
+// ─── KERNEL ABI ─────────────────────────────────────────────────────────────
+// The seam every SDK implements. The v0.1 Rust SDK realises this IN-PROCESS
+// (Rust methods mirroring these RPCs). This service definition is the canonical
+// WIRE ABI for the day a cross-process or cross-language SDK is needed.
+
+message RegisterAck   { Lifecycle state = 1; }
+message PublishAck    { uint64 seq = 1; }
+message Subscription  { string module = 1; repeated string topics = 2; }
+message SnapshotRequest {}
+message GateTicket    { string request_id = 1; }
+message AppendRequest { string kind = 1; string subject = 2; bytes detail = 3; }
+
+service Kernel {
+  rpc Register    (ModuleManifest)  returns (RegisterAck);
+  rpc PutArtifact (Artifact)        returns (ArtifactRef);
+  rpc GetArtifact (ArtifactRef)     returns (Artifact);
+  rpc Publish     (Event)           returns (PublishAck);
+  rpc Subscribe   (Subscription)    returns (stream Event);
+  rpc Append      (AppendRequest)   returns (LedgerEntry);
+  rpc RequestGate (GateRequest)     returns (GateTicket);
+  rpc DecideGate  (GateDecision)    returns (GateDecision);
+  rpc AwaitGate   (GateTicket)      returns (GateDecision);
+  rpc Snapshot    (SnapshotRequest) returns (RegistrySnapshot);
+}

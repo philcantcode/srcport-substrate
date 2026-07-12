@@ -1,0 +1,15 @@
+# Protobuf-first discipline. `buf lint` keeps the contract clean; `buf breaking`
+# is the mechanism that ENFORCES "add, never mutate" — it is what makes this
+# core safe to freeze and depend on. Wire it into CI before v1.0.0.
+#
+#   buf lint
+#   buf breaking --against '.git#branch=main'
+version: v2
+modules:
+  - path: contracts/proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

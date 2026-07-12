@@ -1,0 +1,8 @@
+# Rust SDK build output (added once sdk/rust exists)
+/sdk/*/target/
+
+# buf
+buf.lock
+
+# OS noise
+.DS_Store
