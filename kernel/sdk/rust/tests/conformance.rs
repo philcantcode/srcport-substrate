@@ -6,6 +6,27 @@ use std::collections::BTreeMap;
 
 use srcport_substrate::*;
 
+/// First claimed item, or default empty WorkItem when none.
+fn claim_one(k: &MemoryKernel, run_id: &str, module: &str) -> WorkItem {
+    let resp = k
+        .claim_ready(ClaimRequest {
+            run_id: run_id.into(),
+            module: module.into(),
+            ..Default::default()
+        })
+        .unwrap();
+    resp.items.into_iter().next().unwrap_or_default()
+}
+
+fn claim_result(k: &MemoryKernel, run_id: &str, module: &str) -> Result<ClaimResponse> {
+    k.claim_ready(ClaimRequest {
+        run_id: run_id.into(),
+        module: module.into(),
+        ..Default::default()
+    })
+}
+
+
 // 1. ADDRESSING — same trait bag ⇒ same id; a one-byte change ⇒ a new id.
 #[test]
 fn addressing_is_content_derived_and_metamorphic() {
@@ -596,20 +617,8 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
     assert_eq!(started.state(), RunState::Running);
 
     // Writer is not ready: its facts input has not been produced.
-    assert!(k
-        .claim_ready(ClaimRequest {
-            run_id: "run-1".into(),
-            module: "writer".into(),
-        })
-        .unwrap()
-        .id
-        .is_empty());
-    let extract = k
-        .claim_ready(ClaimRequest {
-            run_id: "run-1".into(),
-            module: "extractor".into(),
-        })
-        .unwrap();
+    assert!(claim_one(&k, "run-1", "writer").id.is_empty());
+    let extract = claim_one(&k, "run-1", "extractor");
     let facts = k.put_artifact(artifact_with_trait("demo.Facts", b"typed flow".to_vec())).unwrap();
     let progressed = k
         .commit(Derivation {
@@ -625,12 +634,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
         .unwrap();
     assert_eq!(progressed.state(), RunState::Running);
 
-    let write = k
-        .claim_ready(ClaimRequest {
-            run_id: "run-1".into(),
-            module: "writer".into(),
-        })
-        .unwrap();
+    let write = claim_one(&k, "run-1", "writer");
     assert_eq!(write.inputs.len(), 2, "fan-in supplies both typed inputs");
     let answer = k.put_artifact(artifact_with_trait("demo.Answer", b"Modules converge.".to_vec())).unwrap();
     let completed = k
@@ -655,10 +659,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
         2
     );
     assert!(matches!(
-        k.claim_ready(ClaimRequest {
-            run_id: "run-1".into(),
-            module: "writer".into(),
-        }),
+        claim_result(&k, "run-1", "writer"),
         Err(KernelError::RunClosed(RunState::Completed))
     ));
 }
@@ -800,12 +801,7 @@ fn run_stalls_when_no_remaining_node_can_become_ready() {
         ..Default::default()
     })
     .unwrap();
-    let work = k
-        .claim_ready(ClaimRequest {
-            run_id: "stall".into(),
-            module: "source".into(),
-        })
-        .unwrap();
+    let work = claim_one(&k, "stall", "source");
     let stalled = k
         .commit(Derivation {
             run_id: "stall".into(),
@@ -822,7 +818,7 @@ fn convergent_run_hashes_match_every_sdk() {
     // Trait-bag recompute (v1.2) — lockstep with Go/Python.
     const DERIVATION: &str =
         "sha256:8f7f99a396dbf79c7f2287d2f9fca7f4167343831a9283cdfbeb2fe010c8414c";
-    const LEDGER: &str = "283106692aba4aa72f5eecfda3adc53db7ef606e2a83266fefe772a6b9c6587d";
+    const LEDGER: &str = "faa944642933bb3b1b2d3789fb940a3ed8eb9802d06bf17444677f72fe974335";
     let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "answerer".into(),
@@ -857,12 +853,7 @@ fn convergent_run_hashes_match_every_sdk() {
         ..Default::default()
     })
     .unwrap();
-    let work = k
-        .claim_ready(ClaimRequest {
-            run_id: "parity".into(),
-            module: "answerer".into(),
-        })
-        .unwrap();
+    let work = claim_one(&k, "parity", "answerer");
     let answer = k.put_artifact(artifact_with_trait("demo.Answer", b"yes".to_vec())).unwrap();
     k.commit(Derivation {
         run_id: "parity".into(),
@@ -974,25 +965,14 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
             closure: Closure::Open as i32,
             ..Default::default()
         }),
-        limits: Some(Limits { max_steps: 10 }),
+        limits: Some(Limits { max_steps: 10, ..Default::default() }),
     })
     .unwrap();
 
-    let work = k
-        .claim_ready(ClaimRequest {
-            run_id: "scan".into(),
-            module: "scanner".into(),
-        })
-        .unwrap();
+    let work = claim_one(&k, "scan", "scanner");
     assert!(!work.id.is_empty());
     assert!(
-        k.claim_ready(ClaimRequest {
-            run_id: "scan".into(),
-            module: "extra".into(),
-        })
-        .unwrap()
-        .id
-        .is_empty(),
+        claim_one(&k, "scan", "extra").id.is_empty(),
         "include_nodes dropped extra"
     );
     let report = k
@@ -1021,15 +1001,7 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
         }),
     })
     .unwrap();
-    assert!(
-        k.claim_ready(ClaimRequest {
-            run_id: "scan".into(),
-            module: "scanner".into(),
-        })
-        .unwrap()
-        .id
-        .is_empty()
-    );
+    assert!(claim_one(&k, "scan", "scanner").id.is_empty());
 
     // New host → new work unit.
     k.inject_input(InjectInputRequest {
@@ -1040,12 +1012,7 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
         }),
     })
     .unwrap();
-    let work2 = k
-        .claim_ready(ClaimRequest {
-            run_id: "scan".into(),
-            module: "scanner".into(),
-        })
-        .unwrap();
+    let work2 = claim_one(&k, "scan", "scanner");
     assert!(!work2.id.is_empty());
 }
 
@@ -1103,18 +1070,13 @@ fn always_refires_on_reinject_of_same_artifact() {
             closure: Closure::Open as i32,
             ..Default::default()
         }),
-        limits: Some(Limits { max_steps: 10 }),
+        limits: Some(Limits { max_steps: 10, ..Default::default() }),
         ..Default::default()
     })
     .unwrap();
 
     for i in 0..2 {
-        let work = k
-            .claim_ready(ClaimRequest {
-                run_id: "always".into(),
-                module: "echo".into(),
-            })
-            .unwrap();
+        let work = claim_one(&k, "always", "echo");
         assert!(!work.id.is_empty(), "fire {i}");
         let out = k
             .put_artifact(artifact_with_trait("demo.Out", format!("out-{i}").into_bytes()))
@@ -1537,4 +1499,355 @@ fn store_policy_zero_inline_normalises_to_default() {
     let p = normalize_store_policy(ArtifactStorePolicy::default()).unwrap();
     assert_eq!(p.max_inline_bytes, MAX_INLINE_ARTIFACT_BYTES as u64);
     assert_eq!(p.ingest_mode, BlobIngestMode::CopyVerify as i32);
+}
+
+// 12b. LEASED CONCURRENCY — batch claim, max_in_flight, fail/retry, lease reclaim.
+#[test]
+fn batch_claim_and_max_in_flight() {
+    let k = MemoryKernel::new();
+    k.register(ModuleManifest {
+        name: "worker".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "work.item".into(),
+            firing: Firing::OncePerKey as i32,
+            inputs: vec![Port {
+                name: "key".into(),
+                traits: vec!["demo.Key".into()],
+                key: true,
+                ..Default::default()
+            }],
+            outputs: vec![Port {
+                name: "out".into(),
+                traits: vec!["demo.Out".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let a = k.put_artifact(artifact_with_trait("demo.Key", b"a".to_vec())).unwrap();
+    let b = k.put_artifact(artifact_with_trait("demo.Key", b"b".to_vec())).unwrap();
+    // Two parallel source nodes feeding the same worker capability via separate nodes.
+    k.register(ModuleManifest {
+        name: "src".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "src.emit".into(),
+            outputs: vec![Port {
+                name: "key".into(),
+                traits: vec!["demo.Key".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    // Simpler: two worker nodes with different run inputs.
+    k.start_run(RunRequest {
+        id: "batch".into(),
+        assembly: Some(Assembly {
+            id: "batch@1".into(),
+            nodes: vec![
+                AssemblyNode {
+                    id: "w1".into(),
+                    module: "worker".into(),
+                    module_version: "1".into(),
+                    capability: "work.item".into(),
+                },
+                AssemblyNode {
+                    id: "w2".into(),
+                    module: "worker".into(),
+                    module_version: "1".into(),
+                    capability: "work.item".into(),
+                },
+            ],
+            bindings: vec![
+                Binding {
+                    to_node: "w1".into(),
+                    to_port: "key".into(),
+                    input: "k1".into(),
+                    ..Default::default()
+                },
+                Binding {
+                    to_node: "w2".into(),
+                    to_port: "key".into(),
+                    input: "k2".into(),
+                    ..Default::default()
+                },
+            ],
+            terminal: Some(NodeOutput {
+                node: "w1".into(),
+                port: "out".into(),
+            }),
+        }),
+        inputs: vec![
+            NamedArtifact {
+                name: "k1".into(),
+                artifact: Some(a),
+            },
+            NamedArtifact {
+                name: "k2".into(),
+                artifact: Some(b),
+            },
+        ],
+        limits: Some(Limits {
+            max_steps: 10,
+            max_in_flight: 1,
+            ..Default::default()
+        }),
+        policy: Some(ExecutionPolicy {
+            closure: Closure::Open as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let first = k
+        .claim_ready(ClaimRequest {
+            run_id: "batch".into(),
+            max_items: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(first.items.len(), 1, "max_in_flight=1");
+    assert_eq!(first.items[0].attempt, 1);
+    assert!(!first.items[0].unit_key.is_empty());
+    assert!(first.items[0].lease_until_unix_ms > 0);
+
+    let blocked = k
+        .claim_ready(ClaimRequest {
+            run_id: "batch".into(),
+            max_items: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(blocked.items.is_empty(), "at capacity");
+
+    let out = k
+        .put_artifact(artifact_with_trait("demo.Out", b"1".to_vec()))
+        .unwrap();
+    k.commit(Derivation {
+        run_id: "batch".into(),
+        work_id: first.items[0].id.clone(),
+        node_id: first.items[0].node_id.clone(),
+        outputs: vec![NamedArtifact {
+            name: "out".into(),
+            artifact: Some(out),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let second = k
+        .claim_ready(ClaimRequest {
+            run_id: "batch".into(),
+            max_items: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+}
+
+#[test]
+fn fail_work_retries_then_terminals() {
+    let k = MemoryKernel::new();
+    k.register(ModuleManifest {
+        name: "flaky".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "flaky.run".into(),
+            outputs: vec![Port {
+                name: "out".into(),
+                traits: vec!["demo.Out".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.start_run(RunRequest {
+        id: "fail".into(),
+        assembly: Some(Assembly {
+            id: "fail@1".into(),
+            nodes: vec![AssemblyNode {
+                id: "n".into(),
+                module: "flaky".into(),
+                module_version: "1".into(),
+                capability: "flaky.run".into(),
+            }],
+            terminal: Some(NodeOutput {
+                node: "n".into(),
+                port: "out".into(),
+            }),
+            ..Default::default()
+        }),
+        limits: Some(Limits {
+            max_steps: 10,
+            max_attempts: 2,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let w1 = claim_one(&k, "fail", "flaky");
+    assert_eq!(w1.attempt, 1);
+    k.fail_work(FailWorkRequest {
+        run_id: "fail".into(),
+        work_id: w1.id.clone(),
+        reason: "boom".into(),
+        terminal: false,
+    })
+    .unwrap();
+
+    let w2 = claim_one(&k, "fail", "flaky");
+    assert_eq!(w2.attempt, 2);
+    assert_eq!(w2.id, w1.id);
+    let stalled = k
+        .fail_work(FailWorkRequest {
+            run_id: "fail".into(),
+            work_id: w2.id.clone(),
+            reason: "boom again".into(),
+            terminal: false,
+        })
+        .unwrap();
+    // attempts exhausted → DONE; no READY/CLAIMED → STALLED under FIRST_TERMINAL.
+    assert_eq!(stalled.state(), RunState::Stalled);
+    assert!(matches!(
+        claim_result(&k, "fail", "flaky"),
+        Err(KernelError::RunClosed(RunState::Stalled))
+    ));
+}
+
+#[test]
+fn lease_expiry_returns_unit_to_ready() {
+    let k = MemoryKernel::new();
+    k.register(ModuleManifest {
+        name: "slow".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "slow.run".into(),
+            outputs: vec![Port {
+                name: "out".into(),
+                traits: vec!["demo.Out".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.start_run(RunRequest {
+        id: "lease".into(),
+        assembly: Some(Assembly {
+            id: "lease@1".into(),
+            nodes: vec![AssemblyNode {
+                id: "n".into(),
+                module: "slow".into(),
+                module_version: "1".into(),
+                capability: "slow.run".into(),
+            }],
+            terminal: Some(NodeOutput {
+                node: "n".into(),
+                port: "out".into(),
+            }),
+            ..Default::default()
+        }),
+        limits: Some(Limits {
+            max_steps: 10,
+            default_lease_ms: 1,
+            max_attempts: 3,
+            ..Default::default()
+        }),
+        policy: Some(ExecutionPolicy {
+            closure: Closure::Open as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let w1 = claim_one(&k, "lease", "slow");
+    assert!(!w1.id.is_empty());
+    // Second claim while leased → empty.
+    assert!(claim_one(&k, "lease", "slow").id.is_empty());
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let w2 = claim_one(&k, "lease", "slow");
+    assert!(!w2.id.is_empty(), "reclaimed after lease expiry");
+    assert_eq!(w2.attempt, 2);
+
+    // Heartbeat keeps lease alive.
+    k.heartbeat(HeartbeatRequest {
+        run_id: "lease".into(),
+        work_ids: vec![w2.id.clone()],
+        extend_lease_ms: 60_000,
+    })
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(
+        claim_one(&k, "lease", "slow").id.is_empty(),
+        "still leased after heartbeat"
+    );
+}
+
+#[test]
+fn concurrent_claimants_do_not_double_claim() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let k = Arc::new(MemoryKernel::new());
+    k.register(ModuleManifest {
+        name: "solo".into(),
+        version: "1".into(),
+        provides: vec![Capability {
+            name: "solo.run".into(),
+            outputs: vec![Port {
+                name: "out".into(),
+                traits: vec!["demo.Out".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    k.start_run(RunRequest {
+        id: "race".into(),
+        assembly: Some(Assembly {
+            id: "race@1".into(),
+            nodes: vec![AssemblyNode {
+                id: "n".into(),
+                module: "solo".into(),
+                module_version: "1".into(),
+                capability: "solo.run".into(),
+            }],
+            terminal: Some(NodeOutput {
+                node: "n".into(),
+                port: "out".into(),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let mut handles = vec![];
+    for _ in 0..8 {
+        let k = Arc::clone(&k);
+        handles.push(thread::spawn(move || {
+            k.claim_ready(ClaimRequest {
+                run_id: "race".into(),
+                module: "solo".into(),
+                max_items: 1,
+                ..Default::default()
+            })
+            .unwrap()
+            .items
+        }));
+    }
+    let mut got = 0;
+    for h in handles {
+        got += h.join().unwrap().len();
+    }
+    assert_eq!(got, 1, "exactly one claimant wins");
 }

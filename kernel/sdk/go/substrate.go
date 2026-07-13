@@ -60,7 +60,12 @@ type (
 	RunRef             = pb.RunRef
 	InjectInputRequest = pb.InjectInputRequest
 	ClaimRequest       = pb.ClaimRequest
+	ClaimResponse      = pb.ClaimResponse
 	WorkItem           = pb.WorkItem
+	HeartbeatRequest   = pb.HeartbeatRequest
+	HeartbeatResponse  = pb.HeartbeatResponse
+	FailWorkRequest    = pb.FailWorkRequest
+	WorkFailure        = pb.WorkFailure
 	Derivation         = pb.Derivation
 	DerivationList     = pb.DerivationList
 	ExecutionPolicy    = pb.ExecutionPolicy

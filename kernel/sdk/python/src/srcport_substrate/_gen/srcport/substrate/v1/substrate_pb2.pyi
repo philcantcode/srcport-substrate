@@ -350,10 +350,16 @@ class NodeOutput(_message.Message):
     def __init__(self, node: _Optional[str] = ..., port: _Optional[str] = ...) -> None: ...
 
 class Limits(_message.Message):
-    __slots__ = ("max_steps",)
+    __slots__ = ("max_steps", "max_in_flight", "default_lease_ms", "max_attempts")
     MAX_STEPS_FIELD_NUMBER: _ClassVar[int]
+    MAX_IN_FLIGHT_FIELD_NUMBER: _ClassVar[int]
+    DEFAULT_LEASE_MS_FIELD_NUMBER: _ClassVar[int]
+    MAX_ATTEMPTS_FIELD_NUMBER: _ClassVar[int]
     max_steps: int
-    def __init__(self, max_steps: _Optional[int] = ...) -> None: ...
+    max_in_flight: int
+    default_lease_ms: int
+    max_attempts: int
+    def __init__(self, max_steps: _Optional[int] = ..., max_in_flight: _Optional[int] = ..., default_lease_ms: _Optional[int] = ..., max_attempts: _Optional[int] = ...) -> None: ...
 
 class ExecutionPolicy(_message.Message):
     __slots__ = ("default", "by_node", "closure")
@@ -437,15 +443,27 @@ class InjectInputRequest(_message.Message):
     def __init__(self, run_id: _Optional[str] = ..., input: _Optional[_Union[NamedArtifact, _Mapping]] = ...) -> None: ...
 
 class ClaimRequest(_message.Message):
-    __slots__ = ("run_id", "module")
+    __slots__ = ("run_id", "module", "node_ids", "max_items", "modules")
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     MODULE_FIELD_NUMBER: _ClassVar[int]
+    NODE_IDS_FIELD_NUMBER: _ClassVar[int]
+    MAX_ITEMS_FIELD_NUMBER: _ClassVar[int]
+    MODULES_FIELD_NUMBER: _ClassVar[int]
     run_id: str
     module: str
-    def __init__(self, run_id: _Optional[str] = ..., module: _Optional[str] = ...) -> None: ...
+    node_ids: _containers.RepeatedScalarFieldContainer[str]
+    max_items: int
+    modules: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, run_id: _Optional[str] = ..., module: _Optional[str] = ..., node_ids: _Optional[_Iterable[str]] = ..., max_items: _Optional[int] = ..., modules: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class ClaimResponse(_message.Message):
+    __slots__ = ("items",)
+    ITEMS_FIELD_NUMBER: _ClassVar[int]
+    items: _containers.RepeatedCompositeFieldContainer[WorkItem]
+    def __init__(self, items: _Optional[_Iterable[_Union[WorkItem, _Mapping]]] = ...) -> None: ...
 
 class WorkItem(_message.Message):
-    __slots__ = ("id", "run_id", "node_id", "module", "module_version", "capability", "inputs")
+    __slots__ = ("id", "run_id", "node_id", "module", "module_version", "capability", "inputs", "unit_key", "attempt", "lease_until_unix_ms")
     ID_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     NODE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -453,6 +471,9 @@ class WorkItem(_message.Message):
     MODULE_VERSION_FIELD_NUMBER: _ClassVar[int]
     CAPABILITY_FIELD_NUMBER: _ClassVar[int]
     INPUTS_FIELD_NUMBER: _ClassVar[int]
+    UNIT_KEY_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    LEASE_UNTIL_UNIX_MS_FIELD_NUMBER: _ClassVar[int]
     id: str
     run_id: str
     node_id: str
@@ -460,7 +481,56 @@ class WorkItem(_message.Message):
     module_version: str
     capability: str
     inputs: _containers.RepeatedCompositeFieldContainer[NamedArtifact]
-    def __init__(self, id: _Optional[str] = ..., run_id: _Optional[str] = ..., node_id: _Optional[str] = ..., module: _Optional[str] = ..., module_version: _Optional[str] = ..., capability: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[NamedArtifact, _Mapping]]] = ...) -> None: ...
+    unit_key: str
+    attempt: int
+    lease_until_unix_ms: int
+    def __init__(self, id: _Optional[str] = ..., run_id: _Optional[str] = ..., node_id: _Optional[str] = ..., module: _Optional[str] = ..., module_version: _Optional[str] = ..., capability: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[NamedArtifact, _Mapping]]] = ..., unit_key: _Optional[str] = ..., attempt: _Optional[int] = ..., lease_until_unix_ms: _Optional[int] = ...) -> None: ...
+
+class HeartbeatRequest(_message.Message):
+    __slots__ = ("run_id", "work_ids", "extend_lease_ms")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    WORK_IDS_FIELD_NUMBER: _ClassVar[int]
+    EXTEND_LEASE_MS_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    work_ids: _containers.RepeatedScalarFieldContainer[str]
+    extend_lease_ms: int
+    def __init__(self, run_id: _Optional[str] = ..., work_ids: _Optional[_Iterable[str]] = ..., extend_lease_ms: _Optional[int] = ...) -> None: ...
+
+class HeartbeatResponse(_message.Message):
+    __slots__ = ("renewed_work_ids", "lost_work_ids")
+    RENEWED_WORK_IDS_FIELD_NUMBER: _ClassVar[int]
+    LOST_WORK_IDS_FIELD_NUMBER: _ClassVar[int]
+    renewed_work_ids: _containers.RepeatedScalarFieldContainer[str]
+    lost_work_ids: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, renewed_work_ids: _Optional[_Iterable[str]] = ..., lost_work_ids: _Optional[_Iterable[str]] = ...) -> None: ...
+
+class FailWorkRequest(_message.Message):
+    __slots__ = ("run_id", "work_id", "reason", "terminal")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    WORK_ID_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    TERMINAL_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    work_id: str
+    reason: str
+    terminal: bool
+    def __init__(self, run_id: _Optional[str] = ..., work_id: _Optional[str] = ..., reason: _Optional[str] = ..., terminal: bool = ...) -> None: ...
+
+class WorkFailure(_message.Message):
+    __slots__ = ("run_id", "work_id", "unit_key", "reason", "terminal", "attempt")
+    RUN_ID_FIELD_NUMBER: _ClassVar[int]
+    WORK_ID_FIELD_NUMBER: _ClassVar[int]
+    UNIT_KEY_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    TERMINAL_FIELD_NUMBER: _ClassVar[int]
+    ATTEMPT_FIELD_NUMBER: _ClassVar[int]
+    run_id: str
+    work_id: str
+    unit_key: str
+    reason: str
+    terminal: bool
+    attempt: int
+    def __init__(self, run_id: _Optional[str] = ..., work_id: _Optional[str] = ..., unit_key: _Optional[str] = ..., reason: _Optional[str] = ..., terminal: bool = ..., attempt: _Optional[int] = ...) -> None: ...
 
 class Derivation(_message.Message):
     __slots__ = ("id", "run_id", "work_id", "node_id", "module", "module_version", "capability", "inputs", "outputs")

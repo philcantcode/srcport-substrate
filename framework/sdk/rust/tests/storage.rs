@@ -45,7 +45,7 @@ impl ModulePlugin for Counter {
         )
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let body = step
             .inputs
             .get("seed")
@@ -109,7 +109,7 @@ fn assembly() -> Assembly {
 #[test]
 fn per_run_registers_table_and_writes_after_step() {
     let mut host = Host::new(MemoryKernel::new()).with_storage(MemoryStorage::new());
-    host.register_plugin(Box::new(Counter)).unwrap();
+    host.register_plugin(Counter).unwrap();
 
     let seed = put_seed(&host, b"42");
     let run = host
@@ -145,7 +145,7 @@ fn per_run_registers_table_and_writes_after_step() {
 #[test]
 fn per_run_drop_on_end_removes_tables() {
     let mut host = Host::new(MemoryKernel::new()).with_storage(MemoryStorage::new());
-    host.register_plugin(Box::new(Counter)).unwrap();
+    host.register_plugin(Counter).unwrap();
 
     let seed = put_seed(&host, b"7");
     host.start_pipeline(
@@ -166,7 +166,7 @@ fn per_run_drop_on_end_removes_tables() {
 #[test]
 fn shared_mode_table_survives_across_runs() {
     let mut host = Host::new(MemoryKernel::new()).with_storage(MemoryStorage::new());
-    host.register_plugin(Box::new(Counter)).unwrap();
+    host.register_plugin(Counter).unwrap();
 
     let table = "counter__counts";
 
@@ -199,7 +199,7 @@ fn shared_mode_table_survives_across_runs() {
 #[test]
 fn step_log_only_writes_audit_rows() {
     let mut host = Host::new(MemoryKernel::new()).with_storage(MemoryStorage::new());
-    host.register_plugin(Box::new(Counter)).unwrap();
+    host.register_plugin(Counter).unwrap();
 
     let seed = put_seed(&host, b"9");
     host.start_pipeline(
@@ -227,7 +227,7 @@ fn step_log_only_writes_audit_rows() {
 #[test]
 fn storage_plan_without_backend_errors() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Counter)).unwrap();
+    host.register_plugin(Counter).unwrap();
     let seed = put_seed(&host, b"1");
     let err = host
         .start_pipeline(
@@ -276,7 +276,7 @@ fn upsert_write_mode_across_shared_runs() {
             )
         }
 
-        fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+        fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
             let body = step
                 .inputs
                 .get("in")
@@ -304,7 +304,7 @@ fn upsert_write_mode_across_shared_runs() {
     }
 
     let mut host = Host::new(MemoryKernel::new()).with_storage(MemoryStorage::new());
-    host.register_plugin(Box::new(Upserter)).unwrap();
+    host.register_plugin(Upserter).unwrap();
 
     let asm = Assembly {
         id: "up-pipe".into(),
@@ -353,7 +353,7 @@ fn upsert_write_mode_across_shared_runs() {
 #[test]
 fn storage_off_by_default() {
     let mut host = Host::new(MemoryKernel::new()).with_storage(MemoryStorage::new());
-    host.register_plugin(Box::new(Counter)).unwrap();
+    host.register_plugin(Counter).unwrap();
     let seed = put_seed(&host, b"1");
     host.start_pipeline(
         "plain",
@@ -369,7 +369,7 @@ fn storage_off_by_default() {
 #[test]
 fn cancel_drops_per_run_tables() {
     let mut host = Host::new(MemoryKernel::new()).with_storage(MemoryStorage::new());
-    host.register_plugin(Box::new(Counter)).unwrap();
+    host.register_plugin(Counter).unwrap();
     let seed = put_seed(&host, b"1");
     host.start_pipeline(
         "c1",

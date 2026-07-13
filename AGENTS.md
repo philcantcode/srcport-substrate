@@ -127,7 +127,7 @@ The framework is an **application layer**, not a second kernel. Charter:
 |---------|------|
 | **Host** | Registers plugins; `start_pipeline` / `drive` / `inject` / `cancel` / `resume_after` |
 | **ModulePlugin** | Domain work (`execute`); optional UI / storage / memo hooks |
-| **FrameworkPolicy** | Product presets → kernel `ExecutionPolicy` + host drive rules |
+| **FrameworkPolicy** | Product presets → kernel `ExecutionPolicy` + host drive rules (concurrency / leases) |
 | **Step lifecycle** | Init → Progress\* → Final (presentation side channel; optional) |
 | **Cut / seed** | Skip or subset nodes; crossing edges become `__seed/…` inputs |
 | **StoragePlan** | Optional tabular side-channel (**not** the ledger) |
@@ -147,6 +147,7 @@ The framework is an **application layer**, not a second kernel. Charter:
 | `manual(closure)` | Escape hatch |
 
 Builders: `with_firing`, `with_nodes`, `with_drive`, `with_max_steps`,
+`with_concurrency`, `with_claim_batch`, `with_lease_ms`, `with_max_attempts`,
 `with_claim_modules`, `with_storage`, `with_memo`.
 
 ### Step lifecycle (presentation)
@@ -246,6 +247,7 @@ After kernel ABI changes that the framework uses, re-run **both** kernel and fra
 | How do modules work? | [`docs/Module.md`](docs/Module.md) |
 | How do artifacts / blobs work? | [`docs/Artifact.md`](docs/Artifact.md) |
 | How do host presets / storage / memo work? | [`docs/Framework.md`](docs/Framework.md) |
+| How does concurrency / leasing work? | [`docs/Concurrency.md`](docs/Concurrency.md) |
 | Wire format | `kernel/contracts/proto/.../substrate.proto` |
 | Framework quick start | [`framework/README.md`](framework/README.md) |
 | Rust host surface | [`framework/sdk/rust/README.md`](framework/sdk/rust/README.md) |

@@ -29,7 +29,7 @@ impl ModulePlugin for Extractor {
         }
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let q_body = step
             .inputs
             .get("question")
@@ -74,7 +74,7 @@ impl ModulePlugin for Retriever {
         }
     }
 
-    fn execute(&mut self, _step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, _step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         Ok(StepOutput {
             outputs: vec![PortBody::with_trait("sources", "demo.v1.Sources", b"SPEC.md".to_vec())],
         })
@@ -102,7 +102,7 @@ impl ModulePlugin for Writer {
         }
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let facts = step.inputs.get("facts").and_then(|a| a.traits.values().next().map(|f| f.body.clone())).unwrap_or_default();
         let sources = step.inputs.get("sources").and_then(|a| a.traits.values().next().map(|f| f.body.clone())).unwrap_or_default();
         let mut body = b"answer:".to_vec();
@@ -172,9 +172,9 @@ fn from_node(to_node: &str, to_port: &str, from_node: &str, from_port: &str) -> 
 fn host_drives_diamond_with_step_lifecycle() {
     let mut host = Host::new(MemoryKernel::new()).with_ui_persist(UiPersist::Artifacts);
 
-    host.register_plugin(Box::new(Extractor)).unwrap();
-    host.register_plugin(Box::new(Retriever)).unwrap();
-    host.register_plugin(Box::new(Writer)).unwrap();
+    host.register_plugin(Extractor).unwrap();
+    host.register_plugin(Retriever).unwrap();
+    host.register_plugin(Writer).unwrap();
 
     let question = host
         .kernel()
@@ -253,7 +253,7 @@ fn host_drives_diamond_with_step_lifecycle() {
 #[test]
 fn headless_plugins_need_no_presentation() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Retriever)).unwrap();
+    host.register_plugin(Retriever).unwrap();
 
     let question = host
         .kernel()

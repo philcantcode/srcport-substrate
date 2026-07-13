@@ -35,7 +35,7 @@ pub use memo::{
     MemoRecord, MemoStore, MemoryMemo,
 };
 pub use policy::{
-    DriveAfter, DrivePlan, FiringPlan, FrameworkPolicy, NodePlan, RunMode,
+    DriveAfter, DrivePlan, FiringPlan, FrameworkPolicy, NodePlan, RunMode, DEFAULT_CONCURRENCY,
 };
 pub use presentation::{
     Presentation, PresentationStatus, ProcessingStatus, ProcessingView, ResultStatus, ResultView,
@@ -50,12 +50,13 @@ pub use storage::{
 };
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::Serialize;
 use srcport_substrate::{
-    Artifact, ArtifactRef, Assembly, ClaimRequest, Derivation, InjectInputRequest, KernelApi,
-    KernelError, ModuleManifest, NamedArtifact, RequestContext, Run, RunRef, RunRequest, RunState,
-    WorkItem,
+    Artifact, ArtifactRef, Assembly, ClaimRequest, Derivation, FailWorkRequest, InjectInputRequest,
+    KernelApi, KernelError, ModuleManifest, NamedArtifact, RequestContext, Run, RunRef, RunRequest,
+    RunState, WorkItem,
 };
 
 // ── Plugin surface ──────────────────────────────────────────────────────────
@@ -197,7 +198,10 @@ impl From<KernelError> for FrameworkError {
 /// other; couple only through contract refs and assemblies. Never return real
 /// UI toolkits — only [`Presentation`] data. Storage writes are tabular data
 /// only — the host owns the backend.
-pub trait ModulePlugin: Send {
+///
+/// Plugins are **`Send + Sync`**: the host may run `execute` concurrently for
+/// independent work units. Use interior mutability for per-plugin counters.
+pub trait ModulePlugin: Send + Sync {
     /// Manifest passed to `Register`.
     fn manifest(&self) -> ModuleManifest;
 
@@ -216,7 +220,8 @@ pub trait ModulePlugin: Send {
     /// Perform domain work for a claimed unit.
     ///
     /// Call [`StepContext::emit_progress`] zero or more times for Progress stages.
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError>;
+    /// Shared `&self` so the host can execute independent units concurrently.
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError>;
 
     /// Optional **Init** presentation after claim, before `execute`.
     ///
@@ -280,7 +285,7 @@ pub enum UiPersist {
 /// Opinionated driver around any [`KernelApi`] backend.
 pub struct Host<K: KernelApi> {
     kernel: K,
-    plugins: HashMap<String, Box<dyn ModulePlugin>>,
+    plugins: HashMap<String, Arc<dyn ModulePlugin>>,
     ctx: RequestContext,
     ui_persist: UiPersist,
     step_events: Vec<StepEvent>,
@@ -412,8 +417,9 @@ impl<K: KernelApi> Host<K> {
     /// `ensure_table` when a run enables module storage.
     pub fn register_plugin(
         &mut self,
-        plugin: Box<dyn ModulePlugin>,
+        plugin: impl ModulePlugin + 'static,
     ) -> Result<(), FrameworkError> {
+        let plugin: Arc<dyn ModulePlugin> = Arc::new(plugin);
         let manifest = plugin.manifest();
         if manifest.name.is_empty() {
             return Err(FrameworkError::Invalid(
@@ -688,20 +694,7 @@ impl<K: KernelApi> Host<K> {
             if run.state() != RunState::Running {
                 return Ok(run);
             }
-
-            let module_names = self.claim_module_names(run_id);
-            let mut progressed = false;
-
-            for module in module_names {
-                let run = self.get_run(run_id)?;
-                if run.state() != RunState::Running {
-                    return Ok(run);
-                }
-                if self.try_step(run_id, &module)? {
-                    progressed = true;
-                }
-            }
-
+            let progressed = self.drive_claim_wave(run_id, /*one_pass*/ false)?;
             if !progressed {
                 return self.get_run(run_id);
             }
@@ -713,15 +706,70 @@ impl<K: KernelApi> Host<K> {
         if run.state() != RunState::Running {
             return Ok(run);
         }
-        let module_names = self.claim_module_names(run_id);
-        for module in module_names {
-            let run = self.get_run(run_id)?;
-            if run.state() != RunState::Running {
-                return Ok(run);
-            }
-            let _ = self.try_step(run_id, &module)?;
-        }
+        let _ = self.drive_claim_wave(run_id, /*one_pass*/ true)?;
         self.get_run(run_id)
+    }
+
+    /// One claim wave: batch-claim ready work (respecting concurrency), then
+    /// execute each unit. When concurrency > 1, domain `execute` runs in
+    /// parallel threads; put/commit/fail stay serial on the host.
+    fn drive_claim_wave(&mut self, run_id: &str, one_pass: bool) -> Result<bool, FrameworkError> {
+        let (batch, conc) = {
+            let policy = self.run_policies.get(run_id);
+            let conc = policy
+                .map(|p| p.effective_concurrency())
+                .unwrap_or(crate::DEFAULT_CONCURRENCY)
+                .max(1);
+            let claim_batch = policy
+                .map(|p| p.effective_claim_batch())
+                .unwrap_or(conc)
+                .max(1);
+            let max_items = if one_pass {
+                claim_batch
+            } else {
+                claim_batch.min(conc)
+            };
+            (max_items, conc)
+        };
+
+        let mut claim = ClaimRequest {
+            run_id: run_id.into(),
+            max_items: batch,
+            ..Default::default()
+        };
+        if let Some(mods) = self
+            .run_policies
+            .get(run_id)
+            .and_then(|p| p.claim_modules.clone())
+        {
+            if mods.len() == 1 {
+                claim.module = mods[0].clone();
+            } else if !mods.is_empty() {
+                claim.modules = mods;
+            }
+        } else {
+            // Prefer plugins we have; empty modules = any.
+            let names = self.claim_module_names(run_id);
+            if names.len() == 1 {
+                claim.module = names[0].clone();
+            } else if !names.is_empty() {
+                claim.modules = names;
+            }
+        }
+
+        let resp = self.kernel.claim_ready(claim, &self.ctx)?;
+        if resp.items.is_empty() {
+            return Ok(false);
+        }
+
+        if conc <= 1 || resp.items.len() <= 1 {
+            for work in resp.items {
+                self.finish_work_unit(run_id, work)?;
+            }
+        } else {
+            self.finish_work_units_parallel(run_id, resp.items)?;
+        }
+        Ok(true)
     }
 
     /// Claim → (memo hit | Init → execute → Final) → put/commit for `module`.
@@ -730,164 +778,253 @@ impl<K: KernelApi> Host<K> {
     /// `execute` is skipped and prior output artifact refs are committed.
     ///
     /// Returns whether a work unit ran (including memo hits). On domain execute
-    /// failure, emits Final (if any) and returns [`FrameworkError::StepFailed`]
-    /// without committing.
+    /// failure, emits Final (if any), calls kernel `FailWork`, and returns
+    /// [`FrameworkError::StepFailed`].
     pub fn try_step(&mut self, run_id: &str, module: &str) -> Result<bool, FrameworkError> {
-        let work = self.kernel.claim_ready(
+        let resp = self.kernel.claim_ready(
             ClaimRequest {
                 run_id: run_id.into(),
                 module: module.into(),
+                max_items: 1,
+                ..Default::default()
             },
             &self.ctx,
         )?;
-
-        if work.id.is_empty() {
+        let Some(work) = resp.items.into_iter().next() else {
             return Ok(false);
-        }
+        };
+        self.finish_work_unit(run_id, work)?;
+        Ok(true)
+    }
 
+    fn finish_work_unit(&mut self, run_id: &str, work: WorkItem) -> Result<(), FrameworkError> {
+        let module = work.module.clone();
         let mut step = self.load_step(run_id, &work)?;
 
-        // ── Memo lookup (optional) ────────────────────────────────────────
         if let Some((key, named_outputs, source_run)) =
-            self.try_memo_hit(run_id, module, &work)?
+            self.try_memo_hit(run_id, &module, &work)?
         {
-            return self.commit_memo_hit(
+            self.commit_memo_hit(
                 run_id,
-                module,
+                &module,
                 &work,
                 &step,
                 &key,
                 named_outputs,
                 &source_run,
-            );
+            )?;
+            return Ok(());
         }
 
-        // ── Init ──────────────────────────────────────────────────────────
-        let init = {
-            let plugin = self
-                .plugins
-                .get(module)
-                .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
-            plugin.on_init(&step)
-        };
+        let plugin = self
+            .plugins
+            .get(&module)
+            .ok_or_else(|| FrameworkError::NoPlugin(module.clone()))?
+            .clone();
+
+        let init = plugin.on_init(&step);
         if let Some(mut p) = init {
             p.stage = StepStage::Init;
             p.fill_identity(run_id, &work);
-            self.emit_presentation(module, p)?;
+            self.emit_presentation(&module, p)?;
         }
 
-        // ── Execute (+ buffered Progress) ─────────────────────────────────
-        let exec_result = {
-            let plugin = self
-                .plugins
-                .get_mut(module)
-                .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
-            plugin.execute(&mut step)
-        };
+        let exec_result = plugin.execute(&mut step);
         self.execute_count = self.execute_count.saturating_add(1);
 
         let progress = step.take_progress();
         for p in progress {
-            self.emit_presentation(module, p)?;
+            self.emit_presentation(&module, p)?;
         }
 
         match exec_result {
-            Ok(output) => {
-                let mut named_outputs = Vec::with_capacity(output.outputs.len());
-                for out in &output.outputs {
-                    let mut traits = std::collections::BTreeMap::new();
-                    for (contract, body) in &out.traits {
-                        traits.insert(
-                            contract.clone(),
-                            srcport_substrate::Trait {
-                                body: body.clone(),
-                                object: None,
-                            },
-                        );
-                    }
-                    let r = self.kernel.put_artifact(
-                        Artifact {
-                            traits,
-                            produced_by: module.into(),
-                            entity_id: out.entity_id.clone(),
-                            ..Default::default()
-                        },
-                        &self.ctx,
-                    )?;
-                    named_outputs.push(NamedArtifact {
-                        name: out.port.clone(),
-                        artifact: Some(r),
-                    });
-                }
+            Ok(output) => self.commit_step_success(run_id, &module, &work, &step, output),
+            Err(e) => self.fail_step(run_id, &module, &work, &step, e),
+        }
+    }
 
-                let step_result = StepResult {
-                    ok: true,
-                    outputs: named_outputs.clone(),
-                    error: None,
-                };
-                let final_p = {
-                    let plugin = self
-                        .plugins
-                        .get(module)
-                        .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
-                    plugin.on_final(&step, &step_result)
-                };
-                if let Some(mut p) = final_p {
-                    p.stage = StepStage::Final;
-                    p.fill_identity(run_id, &work);
-                    if p.output_ports.is_empty() {
-                        p.output_ports = named_outputs.iter().map(|o| o.name.clone()).collect();
-                    }
-                    self.emit_presentation(module, p)?;
-                }
-
-                self.kernel.commit(
-                    Derivation {
-                        run_id: run_id.into(),
-                        work_id: work.id.clone(),
-                        node_id: work.node_id.clone(),
-                        outputs: named_outputs.clone(),
-                        ..Default::default()
-                    },
-                    &self.ctx,
+    fn finish_work_units_parallel(
+        &mut self,
+        run_id: &str,
+        items: Vec<WorkItem>,
+    ) -> Result<(), FrameworkError> {
+        // Memo hits and presentation still go through serial finish when possible.
+        // Parallel path: execute domain work concurrently, then serialise commits.
+        let mut deferred = Vec::new();
+        for work in items {
+            let module = work.module.clone();
+            if let Some((key, named_outputs, source_run)) =
+                self.try_memo_hit(run_id, &module, &work)?
+            {
+                let step = self.load_step(run_id, &work)?;
+                self.commit_memo_hit(
+                    run_id,
+                    &module,
+                    &work,
+                    &step,
+                    &key,
+                    named_outputs,
+                    &source_run,
                 )?;
-
-                self.store_memo_after_success(run_id, module, &work, &named_outputs)?;
-
-                // ── Storage (after successful commit) ─────────────────────
-                self.apply_step_storage(run_id, module, &step, &step_result)?;
-
-                Ok(true)
+                continue;
             }
-            Err(e) => {
-                let msg = e.to_string();
-                let step_result = StepResult {
-                    ok: false,
-                    outputs: Vec::new(),
-                    error: Some(msg.clone()),
-                };
-                let final_p = {
-                    let plugin = self
-                        .plugins
-                        .get(module)
-                        .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
-                    plugin
-                        .on_final(&step, &step_result)
-                        .or_else(|| Some(Presentation::final_failed("Step failed", msg.clone())))
-                };
-                if let Some(mut p) = final_p {
-                    p.stage = StepStage::Final;
-                    p.status = PresentationStatus::Failed;
-                    p.fill_identity(run_id, &work);
-                    let _ = self.emit_presentation(module, p);
-                }
-                // Best-effort storage / step_log on failure (no commit).
-                let _ = self.apply_step_storage(run_id, module, &step, &step_result);
-                // Do not commit; work unit may remain claimed depending on kernel —
-                // MemoryKernel leaves claimed work; product may cancel run.
-                Err(FrameworkError::StepFailed(msg))
+            let plugin = self
+                .plugins
+                .get(&module)
+                .ok_or_else(|| FrameworkError::NoPlugin(module.clone()))?
+                .clone();
+            let step = self.load_step(run_id, &work)?;
+            let init = plugin.on_init(&step);
+            deferred.push((work, module, plugin, step, init));
+        }
+
+        let mut outcomes = Vec::with_capacity(deferred.len());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (work, module, plugin, step, init) in deferred {
+                handles.push(scope.spawn(move || {
+                    let mut step = step;
+                    let exec_result = plugin.execute(&mut step);
+                    let progress = step.take_progress();
+                    (work, module, step, init, progress, exec_result)
+                }));
+            }
+            for h in handles {
+                outcomes.push(h.join().expect("worker thread panicked"));
+            }
+        });
+
+        for (work, module, step, init, progress, exec_result) in outcomes {
+            self.execute_count = self.execute_count.saturating_add(1);
+            if let Some(mut p) = init {
+                p.stage = StepStage::Init;
+                p.fill_identity(run_id, &work);
+                self.emit_presentation(&module, p)?;
+            }
+            for p in progress {
+                self.emit_presentation(&module, p)?;
+            }
+            match exec_result {
+                Ok(output) => self.commit_step_success(run_id, &module, &work, &step, output)?,
+                Err(e) => self.fail_step(run_id, &module, &work, &step, e)?,
             }
         }
+        Ok(())
+    }
+
+    fn commit_step_success(
+        &mut self,
+        run_id: &str,
+        module: &str,
+        work: &WorkItem,
+        step: &StepContext,
+        output: StepOutput,
+    ) -> Result<(), FrameworkError> {
+        let mut named_outputs = Vec::with_capacity(output.outputs.len());
+        for out in &output.outputs {
+            let mut traits = std::collections::BTreeMap::new();
+            for (contract, body) in &out.traits {
+                traits.insert(
+                    contract.clone(),
+                    srcport_substrate::Trait {
+                        body: body.clone(),
+                        object: None,
+                    },
+                );
+            }
+            let r = self.kernel.put_artifact(
+                Artifact {
+                    traits,
+                    produced_by: module.into(),
+                    entity_id: out.entity_id.clone(),
+                    ..Default::default()
+                },
+                &self.ctx,
+            )?;
+            named_outputs.push(NamedArtifact {
+                name: out.port.clone(),
+                artifact: Some(r),
+            });
+        }
+
+        let step_result = StepResult {
+            ok: true,
+            outputs: named_outputs.clone(),
+            error: None,
+        };
+        let final_p = {
+            let plugin = self
+                .plugins
+                .get(module)
+                .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
+            plugin.on_final(step, &step_result)
+        };
+        if let Some(mut p) = final_p {
+            p.stage = StepStage::Final;
+            p.fill_identity(run_id, work);
+            if p.output_ports.is_empty() {
+                p.output_ports = named_outputs.iter().map(|o| o.name.clone()).collect();
+            }
+            self.emit_presentation(module, p)?;
+        }
+
+        self.kernel.commit(
+            Derivation {
+                run_id: run_id.into(),
+                work_id: work.id.clone(),
+                node_id: work.node_id.clone(),
+                outputs: named_outputs.clone(),
+                ..Default::default()
+            },
+            &self.ctx,
+        )?;
+
+        self.store_memo_after_success(run_id, module, work, &named_outputs)?;
+        self.apply_step_storage(run_id, module, step, &step_result)?;
+        Ok(())
+    }
+
+    fn fail_step(
+        &mut self,
+        run_id: &str,
+        module: &str,
+        work: &WorkItem,
+        step: &StepContext,
+        e: FrameworkError,
+    ) -> Result<(), FrameworkError> {
+        let msg = e.to_string();
+        let step_result = StepResult {
+            ok: false,
+            outputs: Vec::new(),
+            error: Some(msg.clone()),
+        };
+        let final_p = {
+            let plugin = self
+                .plugins
+                .get(module)
+                .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
+            plugin
+                .on_final(step, &step_result)
+                .or_else(|| Some(Presentation::final_failed("Step failed", msg.clone())))
+        };
+        if let Some(mut p) = final_p {
+            p.stage = StepStage::Final;
+            p.status = PresentationStatus::Failed;
+            p.fill_identity(run_id, work);
+            let _ = self.emit_presentation(module, p);
+        }
+        let _ = self.apply_step_storage(run_id, module, step, &step_result);
+        // Release lease: retryable fail (kernel may terminal after max_attempts).
+        let _ = self.kernel.fail_work(
+            FailWorkRequest {
+                run_id: run_id.into(),
+                work_id: work.id.clone(),
+                reason: msg.clone(),
+                terminal: false,
+            },
+            &self.ctx,
+        );
+        Err(FrameworkError::StepFailed(msg))
     }
 
     /// Attempt a memo hit. Returns `(key, outputs, source_run_id)` when valid.

@@ -26,9 +26,9 @@ type Host struct {
 // NewHost creates a host over a kernel backend.
 func NewHost(k Kernel) *Host {
 	return &Host{
-		kernel: k,
-		plugins: make(map[string]ModulePlugin),
-		ctx: &substrate.RequestContext{Caller: "srcport-framework"},
+		kernel:         k,
+		plugins:        make(map[string]ModulePlugin),
+		ctx:            &substrate.RequestContext{Caller: "srcport-framework"},
 		uiPersist:      UiLocalOnly,
 		runPolicies:    make(map[string]FrameworkPolicy),
 		storageSchemas: make(map[string]TableSchema),
@@ -53,11 +53,13 @@ func (h *Host) WithMemo(s MemoStore) *Host {
 	return h
 }
 
-func (h *Host) Kernel() Kernel                  { return h.kernel }
-func (h *Host) MemoStore() MemoStore            { return h.memo }
-func (h *Host) Storage() StorageBackend         { return h.storage }
-func (h *Host) ExecuteCount() uint64            { return h.executeCount }
-func (h *Host) MemoHitCount() uint64            { return h.memoHitCount }
+func (h *Host) Kernel() Kernel       { return h.kernel }
+func (h *Host) MemoStore() MemoStore { return h.memo }
+func (h *Host) Storage() StorageBackend {
+	return h.storage
+}
+func (h *Host) ExecuteCount() uint64 { return h.executeCount }
+func (h *Host) MemoHitCount() uint64 { return h.memoHitCount }
 func (h *Host) Policy(runID string) (FrameworkPolicy, bool) {
 	p, ok := h.runPolicies[runID]
 	return p, ok
@@ -267,22 +269,9 @@ func (h *Host) driveUntilIdle(runID string) (*substrate.Run, error) {
 		if run.State != substrate.RunStateRunning {
 			return run, nil
 		}
-		progressed := false
-		for _, module := range h.claimModuleNames(runID) {
-			run, err = h.GetRun(runID)
-			if err != nil {
-				return nil, err
-			}
-			if run.State != substrate.RunStateRunning {
-				return run, nil
-			}
-			ok, err := h.TryStep(runID, module)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				progressed = true
-			}
+		progressed, err := h.driveClaimWave(runID, false)
+		if err != nil {
+			return nil, err
 		}
 		if !progressed {
 			return h.GetRun(runID)
@@ -298,49 +287,108 @@ func (h *Host) driveOnePass(runID string) (*substrate.Run, error) {
 	if run.State != substrate.RunStateRunning {
 		return run, nil
 	}
-	for _, module := range h.claimModuleNames(runID) {
-		run, err = h.GetRun(runID)
-		if err != nil {
-			return nil, err
-		}
-		if run.State != substrate.RunStateRunning {
-			return run, nil
-		}
-		if _, err := h.TryStep(runID, module); err != nil {
-			return nil, err
-		}
+	if _, err := h.driveClaimWave(runID, true); err != nil {
+		return nil, err
 	}
 	return h.GetRun(runID)
 }
 
-// TryStep claims → (memo hit | init → execute → final) → put/commit.
-func (h *Host) TryStep(runID, module string) (bool, error) {
-	work, err := h.kernel.ClaimReady(&substrate.ClaimRequest{RunId: runID, Module: module}, h.ctx)
+// driveClaimWave batch-claims ready work then finishes each unit serially.
+// onePass uses full claim_batch; until-idle caps at min(claim_batch, concurrency).
+func (h *Host) driveClaimWave(runID string, onePass bool) (bool, error) {
+	batch := DEFAULT_CONCURRENCY
+	if p, ok := h.runPolicies[runID]; ok {
+		conc := p.EffectiveConcurrency()
+		claimBatch := p.EffectiveClaimBatch()
+		if onePass {
+			batch = claimBatch
+		} else if claimBatch < conc {
+			batch = claimBatch
+		} else {
+			batch = conc
+		}
+	}
+
+	req := &substrate.ClaimRequest{
+		RunId:    runID,
+		MaxItems: batch,
+	}
+	if p, ok := h.runPolicies[runID]; ok && p.ClaimModules != nil {
+		if len(p.ClaimModules) == 1 {
+			req.Module = p.ClaimModules[0]
+		} else if len(p.ClaimModules) > 0 {
+			req.Modules = append([]string{}, p.ClaimModules...)
+		}
+	} else {
+		names := h.claimModuleNames(runID)
+		if len(names) == 1 {
+			req.Module = names[0]
+		} else if len(names) > 0 {
+			req.Modules = names
+		}
+	}
+
+	resp, err := h.kernel.ClaimReady(req, h.ctx)
 	if err != nil {
 		return false, kernelErr(err)
 	}
+	if resp == nil || len(resp.Items) == 0 {
+		return false, nil
+	}
+	for _, work := range resp.Items {
+		if err := h.finishWorkUnit(runID, work); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// TryStep claims one work unit for module → (memo hit | init → execute → final) → put/commit.
+//
+// On domain execute failure, emits Final (if any), calls kernel FailWork
+// (terminal=false), and returns a step_failed error.
+func (h *Host) TryStep(runID, module string) (bool, error) {
+	resp, err := h.kernel.ClaimReady(&substrate.ClaimRequest{
+		RunId: runID, Module: module, MaxItems: 1,
+	}, h.ctx)
+	if err != nil {
+		return false, kernelErr(err)
+	}
+	if resp == nil || len(resp.Items) == 0 {
+		return false, nil
+	}
+	work := resp.Items[0]
 	if work == nil || work.Id == "" {
 		return false, nil
 	}
+	if err := h.finishWorkUnit(runID, work); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (h *Host) finishWorkUnit(runID string, work *substrate.WorkItem) error {
+	module := work.Module
 	step, err := h.loadStep(runID, work)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	if key, named, sourceRun, hit := h.tryMemoHit(runID, module, work); hit {
-		return h.commitMemoHit(runID, module, work, step, key, named, sourceRun)
+		_, err := h.commitMemoHit(runID, module, work, step, key, named, sourceRun)
+		return err
 	}
 
 	plugin, ok := h.plugins[module]
 	if !ok {
-		return false, noPlugin(module)
+		return noPlugin(module)
 	}
 	if init := plugin.OnInit(step); init != nil {
 		p := *init
 		p.Stage = StageInit
 		p.FillIdentity(runID, work)
 		if err := h.emitPresentation(module, p); err != nil {
-			return false, err
+			return err
 		}
 	}
 
@@ -348,27 +396,18 @@ func (h *Host) TryStep(runID, module string) (bool, error) {
 	h.executeCount++
 	for _, p := range step.takeProgress() {
 		if err := h.emitPresentation(module, p); err != nil {
-			return false, err
+			return err
 		}
 	}
 
 	if execErr != nil {
-		msg := execErr.Error()
-		sr := &StepResult{OK: false, Error: msg}
-		final := plugin.OnFinal(step, sr)
-		if final == nil {
-			f := PresentationFinalFailed("Step failed", msg)
-			final = &f
-		}
-		p := *final
-		p.Stage = StageFinal
-		p.Status = StatusFailed
-		p.FillIdentity(runID, work)
-		_ = h.emitPresentation(module, p)
-		_ = h.applyStepStorage(runID, module, step, sr)
-		return false, stepFailed(msg)
+		return h.failStep(runID, module, work, step, plugin, execErr)
 	}
 
+	return h.commitStepSuccess(runID, module, work, step, plugin, out)
+}
+
+func (h *Host) commitStepSuccess(runID, module string, work *substrate.WorkItem, step *StepContext, plugin ModulePlugin, out *StepOutput) error {
 	var named []*substrate.NamedArtifact
 	for _, pb := range out.Outputs {
 		traits := map[string]*substrate.Trait{}
@@ -379,7 +418,7 @@ func (h *Host) TryStep(runID, module string) (bool, error) {
 			Traits: traits, ProducedBy: module, EntityId: pb.EntityID,
 		}, h.ctx)
 		if err != nil {
-			return false, kernelErr(err)
+			return kernelErr(err)
 		}
 		named = append(named, &substrate.NamedArtifact{Name: pb.Port, Artifact: ref})
 	}
@@ -395,22 +434,43 @@ func (h *Host) TryStep(runID, module string) (bool, error) {
 			}
 		}
 		if err := h.emitPresentation(module, p); err != nil {
-			return false, err
+			return err
 		}
 	}
 
 	if _, err := h.kernel.Commit(&substrate.Derivation{
 		RunId: runID, WorkId: work.Id, NodeId: work.NodeId, Outputs: named,
 	}, h.ctx); err != nil {
-		return false, kernelErr(err)
+		return kernelErr(err)
 	}
 	if err := h.storeMemoAfterSuccess(runID, module, work, named); err != nil {
-		return false, err
+		return err
 	}
 	if err := h.applyStepStorage(runID, module, step, sr); err != nil {
-		return false, err
+		return err
 	}
-	return true, nil
+	return nil
+}
+
+func (h *Host) failStep(runID, module string, work *substrate.WorkItem, step *StepContext, plugin ModulePlugin, execErr error) error {
+	msg := execErr.Error()
+	sr := &StepResult{OK: false, Error: msg}
+	final := plugin.OnFinal(step, sr)
+	if final == nil {
+		f := PresentationFinalFailed("Step failed", msg)
+		final = &f
+	}
+	p := *final
+	p.Stage = StageFinal
+	p.Status = StatusFailed
+	p.FillIdentity(runID, work)
+	_ = h.emitPresentation(module, p)
+	_ = h.applyStepStorage(runID, module, step, sr)
+	// Release lease: retryable fail (kernel may terminal after max_attempts).
+	_, _ = h.kernel.FailWork(&substrate.FailWorkRequest{
+		RunId: runID, WorkId: work.Id, Reason: msg, Terminal: false,
+	}, h.ctx)
+	return stepFailed(msg)
 }
 
 func (h *Host) tryMemoHit(runID, module string, work *substrate.WorkItem) (string, []*substrate.NamedArtifact, string, bool) {

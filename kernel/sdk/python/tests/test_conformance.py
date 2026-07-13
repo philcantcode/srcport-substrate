@@ -23,15 +23,21 @@ from srcport_substrate import (
     BlobRef,
     Capability,
     ClaimRequest,
+    Closure,
     Conflict,
     Contract,
     Derivation,
     Event,
+    ExecutionPolicy,
+    FailWorkRequest,
     FailedPrecondition,
+    Firing,
     GetBlobRequest,
     HasBlobRequest,
+    HeartbeatRequest,
     Invalid,
     Lifecycle,
+    Limits,
     MAX_INLINE_ARTIFACT_BYTES,
     MemoryKernel,
     ModuleManifest,
@@ -42,6 +48,7 @@ from srcport_substrate import (
     Port,
     PutBlobRequest,
     ResourceExhausted,
+    RunClosed,
     StoreDurability,
     RequestContext,
     RunRequest,
@@ -55,6 +62,16 @@ from srcport_substrate import (
     object_ref_bytes,
     verify_chain,
 )
+
+
+def _claim_one(k, run_id, module):
+    """First claimed item, or empty WorkItem when none."""
+    resp = k.claim_ready(ClaimRequest(run_id=run_id, module=module))
+    if resp.items:
+        return resp.items[0]
+    from srcport_substrate import WorkItem
+    return WorkItem()
+
 
 def _art(contract, body, produced_by="", meta=None):
     a = artifact_with_trait(contract, body)
@@ -452,11 +469,9 @@ class Conformance(unittest.TestCase):
         )
         self.assertEqual(run.state, RunState.RUN_STATE_RUNNING)
         self.assertFalse(
-            k.claim_ready(ClaimRequest(run_id="run-1", module="writer")).id
+            _claim_one(k, "run-1", "writer").id
         )
-        extract = k.claim_ready(
-            ClaimRequest(run_id="run-1", module="extractor")
-        )
+        extract = _claim_one(k, "run-1", "extractor")
         facts = k.put_artifact(artifact_with_trait("demo.Facts", b"typed flow"))
         k.commit(
             Derivation(
@@ -466,7 +481,7 @@ class Conformance(unittest.TestCase):
                 outputs=[NamedArtifact(name="facts", artifact=facts)],
             )
         )
-        write = k.claim_ready(ClaimRequest(run_id="run-1", module="writer"))
+        write = _claim_one(k, "run-1", "writer")
         self.assertEqual(len(write.inputs), 2, "fan-in supplies both inputs")
         answer = k.put_artifact(
             artifact_with_trait("demo.Answer", b"Modules converge.")
@@ -541,7 +556,7 @@ class Conformance(unittest.TestCase):
         k.register(ModuleManifest(name="sink", version="1", provides=[Capability(name="sink.answer", inputs=[Port(name="value", traits=["demo.Value"])], outputs=[Port(name="answer", traits=["demo.Answer"])])]))
         assembly = Assembly(id="stall@1", nodes=[AssemblyNode(id="source", module="source", module_version="1", capability="source.maybe"), AssemblyNode(id="sink", module="sink", module_version="1", capability="sink.answer")], bindings=[Binding(to_node="sink", to_port="value", from_node="source", from_port="value")], terminal=NodeOutput(node="sink", port="answer"))
         k.start_run(RunRequest(id="stall", assembly=assembly))
-        work = k.claim_ready(ClaimRequest(run_id="stall", module="source"))
+        work = _claim_one(k, "stall", "source")
         run = k.commit(Derivation(run_id="stall", work_id=work.id, node_id=work.node_id))
         self.assertEqual(run.state, RunState.RUN_STATE_STALLED)
 
@@ -549,11 +564,11 @@ class Conformance(unittest.TestCase):
         k = MemoryKernel()
         k.register(ModuleManifest(name="answerer", version="1.0.0", provides=[Capability(name="answer.write", outputs=[Port(name="answer", traits=["demo.Answer"])])]))
         k.start_run(RunRequest(id="parity", assembly=Assembly(id="single@1", nodes=[AssemblyNode(id="answer", module="answerer", module_version="1.0.0", capability="answer.write")], terminal=NodeOutput(node="answer", port="answer"))))
-        work = k.claim_ready(ClaimRequest(run_id="parity", module="answerer"))
+        work = _claim_one(k, "parity", "answerer")
         answer = k.put_artifact(artifact_with_trait("demo.Answer", b"yes"))
         k.commit(Derivation(run_id="parity", work_id=work.id, node_id=work.node_id, outputs=[NamedArtifact(name="answer", artifact=answer)]))
         self.assertEqual(k.derivations()[0].id, "sha256:8f7f99a396dbf79c7f2287d2f9fca7f4167343831a9283cdfbeb2fe010c8414c")
-        self.assertEqual(k.ledger()[-1].hash, "283106692aba4aa72f5eecfda3adc53db7ef606e2a83266fefe772a6b9c6587d")
+        self.assertEqual(k.ledger()[-1].hash, "faa944642933bb3b1b2d3789fb940a3ed8eb9802d06bf17444677f72fe974335")
 
     # 12. PRODUCTION ARTIFACT BOUNDARY — inline small; external verified ObjectRef.
     def test_blob_store_is_content_addressed_and_immutable(self):
@@ -761,6 +776,259 @@ class Conformance(unittest.TestCase):
         k.put_blob(PutBlobRequest(namespace="n", data=b"fifteen-bytes!"))
         with self.assertRaises(ResourceExhausted):
             k.put_blob(PutBlobRequest(namespace="n", data=b"seventeen-bytes!!!"))
+
+
+    # 12b. LEASED CONCURRENCY — batch claim, max_in_flight, fail/retry, lease reclaim.
+    def test_batch_claim_and_max_in_flight(self):
+        k = MemoryKernel()
+        k.register(
+            ModuleManifest(
+                name="worker",
+                version="1",
+                provides=[
+                    Capability(
+                        name="work.item",
+                        firing=Firing.FIRING_ONCE_PER_KEY,
+                        inputs=[
+                            Port(
+                                name="key",
+                                traits=["demo.Key"],
+                                key=True,
+                            )
+                        ],
+                        outputs=[Port(name="out", traits=["demo.Out"])],
+                    )
+                ],
+            )
+        )
+        a = k.put_artifact(artifact_with_trait("demo.Key", b"a"))
+        b = k.put_artifact(artifact_with_trait("demo.Key", b"b"))
+        k.start_run(
+            RunRequest(
+                id="batch",
+                assembly=Assembly(
+                    id="batch@1",
+                    nodes=[
+                        AssemblyNode(
+                            id="w1",
+                            module="worker",
+                            module_version="1",
+                            capability="work.item",
+                        ),
+                        AssemblyNode(
+                            id="w2",
+                            module="worker",
+                            module_version="1",
+                            capability="work.item",
+                        ),
+                    ],
+                    bindings=[
+                        Binding(to_node="w1", to_port="key", input="k1"),
+                        Binding(to_node="w2", to_port="key", input="k2"),
+                    ],
+                    terminal=NodeOutput(node="w1", port="out"),
+                ),
+                inputs=[
+                    NamedArtifact(name="k1", artifact=a),
+                    NamedArtifact(name="k2", artifact=b),
+                ],
+                limits=Limits(max_steps=10, max_in_flight=1),
+                policy=ExecutionPolicy(closure=Closure.CLOSURE_OPEN),
+            )
+        )
+
+        first = k.claim_ready(ClaimRequest(run_id="batch", max_items=2))
+        self.assertEqual(len(first.items), 1, "max_in_flight=1")
+        self.assertEqual(first.items[0].attempt, 1)
+        self.assertTrue(first.items[0].unit_key)
+        self.assertGreater(first.items[0].lease_until_unix_ms, 0)
+
+        blocked = k.claim_ready(ClaimRequest(run_id="batch", max_items=2))
+        self.assertEqual(len(blocked.items), 0, "at capacity")
+
+        out = k.put_artifact(artifact_with_trait("demo.Out", b"1"))
+        k.commit(
+            Derivation(
+                run_id="batch",
+                work_id=first.items[0].id,
+                node_id=first.items[0].node_id,
+                outputs=[NamedArtifact(name="out", artifact=out)],
+            )
+        )
+
+        second = k.claim_ready(ClaimRequest(run_id="batch", max_items=2))
+        self.assertEqual(len(second.items), 1)
+
+    def test_fail_work_retries_then_terminals(self):
+        k = MemoryKernel()
+        k.register(
+            ModuleManifest(
+                name="flaky",
+                version="1",
+                provides=[
+                    Capability(
+                        name="flaky.run",
+                        outputs=[Port(name="out", traits=["demo.Out"])],
+                    )
+                ],
+            )
+        )
+        k.start_run(
+            RunRequest(
+                id="fail",
+                assembly=Assembly(
+                    id="fail@1",
+                    nodes=[
+                        AssemblyNode(
+                            id="n",
+                            module="flaky",
+                            module_version="1",
+                            capability="flaky.run",
+                        )
+                    ],
+                    terminal=NodeOutput(node="n", port="out"),
+                ),
+                limits=Limits(max_steps=10, max_attempts=2),
+            )
+        )
+
+        w1 = _claim_one(k, "fail", "flaky")
+        self.assertEqual(w1.attempt, 1)
+        k.fail_work(
+            FailWorkRequest(
+                run_id="fail",
+                work_id=w1.id,
+                reason="boom",
+                terminal=False,
+            )
+        )
+
+        w2 = _claim_one(k, "fail", "flaky")
+        self.assertEqual(w2.attempt, 2)
+        self.assertEqual(w2.id, w1.id)
+        stalled = k.fail_work(
+            FailWorkRequest(
+                run_id="fail",
+                work_id=w2.id,
+                reason="boom again",
+                terminal=False,
+            )
+        )
+        # attempts exhausted → DONE; no READY/CLAIMED → STALLED under FIRST_TERMINAL.
+        self.assertEqual(stalled.state, RunState.RUN_STATE_STALLED)
+        with self.assertRaises(RunClosed):
+            k.claim_ready(ClaimRequest(run_id="fail", module="flaky"))
+
+    def test_lease_expiry_returns_unit_to_ready(self):
+        import time
+
+        k = MemoryKernel()
+        k.register(
+            ModuleManifest(
+                name="slow",
+                version="1",
+                provides=[
+                    Capability(
+                        name="slow.run",
+                        outputs=[Port(name="out", traits=["demo.Out"])],
+                    )
+                ],
+            )
+        )
+        k.start_run(
+            RunRequest(
+                id="lease",
+                assembly=Assembly(
+                    id="lease@1",
+                    nodes=[
+                        AssemblyNode(
+                            id="n",
+                            module="slow",
+                            module_version="1",
+                            capability="slow.run",
+                        )
+                    ],
+                    terminal=NodeOutput(node="n", port="out"),
+                ),
+                limits=Limits(
+                    max_steps=10, default_lease_ms=1, max_attempts=3
+                ),
+                policy=ExecutionPolicy(closure=Closure.CLOSURE_OPEN),
+            )
+        )
+
+        w1 = _claim_one(k, "lease", "slow")
+        self.assertTrue(w1.id)
+        # Second claim while leased → empty.
+        self.assertFalse(_claim_one(k, "lease", "slow").id)
+        time.sleep(0.005)
+        w2 = _claim_one(k, "lease", "slow")
+        self.assertTrue(w2.id, "reclaimed after lease expiry")
+        self.assertEqual(w2.attempt, 2)
+
+        # Heartbeat keeps lease alive.
+        k.heartbeat(
+            HeartbeatRequest(
+                run_id="lease",
+                work_ids=[w2.id],
+                extend_lease_ms=60_000,
+            )
+        )
+        time.sleep(0.005)
+        self.assertFalse(
+            _claim_one(k, "lease", "slow").id,
+            "still leased after heartbeat",
+        )
+
+    def test_concurrent_claimants_do_not_double_claim(self):
+        import threading
+
+        k = MemoryKernel()
+        k.register(
+            ModuleManifest(
+                name="solo",
+                version="1",
+                provides=[
+                    Capability(
+                        name="solo.run",
+                        outputs=[Port(name="out", traits=["demo.Out"])],
+                    )
+                ],
+            )
+        )
+        k.start_run(
+            RunRequest(
+                id="race",
+                assembly=Assembly(
+                    id="race@1",
+                    nodes=[
+                        AssemblyNode(
+                            id="n",
+                            module="solo",
+                            module_version="1",
+                            capability="solo.run",
+                        )
+                    ],
+                    terminal=NodeOutput(node="n", port="out"),
+                ),
+            )
+        )
+
+        results = []
+
+        def worker():
+            resp = k.claim_ready(
+                ClaimRequest(run_id="race", module="solo", max_items=1)
+            )
+            results.append(len(resp.items))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(results), 1, "exactly one claimant wins")
+
 
 
 if __name__ == "__main__":

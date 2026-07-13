@@ -233,7 +233,9 @@ because `detail` is folded into the entry hash.
 | `event.published` | `Event` (artifact refs are the data plane; no domain value body) |
 | `run.started`, `run.{progressed,completed,stalled,failed,cancelled}` | `Run` |
 | `run.input_injected` | `NamedArtifact` |
-| `work.claimed` | `WorkItem` |
+| `work.claimed` | `WorkItem` (`lease_until_unix_ms` zeroed for chain stability) |
+| `work.expired` | `WorkItem` (lease reaped; `lease_until` zeroed) |
+| `work.failed` | `WorkFailure` |
 | `derivation.committed` | `Derivation` |
 | module `Append` | opaque, module-owned bytes (the kernel never interprets them) |
 
@@ -276,8 +278,8 @@ change to chain verification.
 - Bindings use **trait set inclusion**: source guarantees ⊇ target requires (port-to-port), or the actual input artifact has all required traits. The kernel never parses domain bodies.
 - Assemblies are acyclic. Multi-fire is a **work-unit** schedule over time, never
   a cycle edge in the assembly graph.
-- **Work units, not bare nodes.** A work unit is claimed and committed at most
-  once per run. Identity depends on effective `Firing`:
+- **Work units, not bare nodes.** A work unit is **committed at most once** per
+  run (terminal success). Identity depends on effective `Firing`:
   - `ONCE` (default): one unit per node.
   - `ONCE_PER_KEY`: one unit per `(node, input_key)` where
     `input_key = H(port_name ‖ artifact_id…)` over input ports with `key=true`
@@ -289,6 +291,21 @@ change to chain verification.
 - Effective firing for a node: `ExecutionPolicy.by_node[node]` if set, else the
   capability's `firing` from `Register`, else `ExecutionPolicy.default`, else
   `ONCE`.
+- **Leased claims (concurrency).** Work units move
+  `READY → CLAIMED(leased) → DONE` (or back to READY on expiry / retryable fail):
+  - `ClaimReady` takes up to `max_items` units (filters: optional module(s),
+    node ids). Each claim sets `attempt` (1-based) and `lease_until_unix_ms`.
+  - While CLAIMED, the unit is not claimable by others. `Commit` → DONE with a
+    `Derivation`. `FailWork(terminal)` → DONE without derivation.
+    `FailWork` retryable, or **lease expiry**, → READY again unless
+    `attempt >= max_attempts` (then terminal DONE; ledger `work.failed`).
+  - `Heartbeat` extends leases on in-flight work (long `execute`).
+  - `Limits.max_in_flight` caps concurrent CLAIMED units (0 = unbounded).
+  - `Limits.default_lease_ms` / `max_attempts`: 0 → SDK defaults (60s / 3).
+  - Ledger `work.claimed` encodes `WorkItem` with **`lease_until_unix_ms` zeroed**
+    so chain hashes stay deterministic; live lease state is kernel-local.
+  - Expiry is reaped on claim / heartbeat / fail / stall checks (no background
+    thread required).
 - `include_nodes` (optional on `RunRequest`): if non-empty, only those nodes and
   bindings wholly within them remain; the terminal must remain. Validated as a
   normal assembly after filtering.
@@ -304,12 +321,12 @@ change to chain verification.
   the blob store.
 - **Closure** (`ExecutionPolicy.closure`):
   - `FIRST_TERMINAL` (default / unspecified): terminal output → `COMPLETED`;
-    no ready or in-flight work unit → `STALLED`; `max_steps` exhausted →
-    `FAILED`.
+    no READY and no CLAIMED work (after reaping expired leases) → `STALLED`;
+    `max_steps` exhausted → `FAILED`.
   - `OPEN`: terminal output records `answer` but the run stays `RUNNING`; no
     auto-stall when idle (wait for inject/cancel); `max_steps` → `FAILED`;
     `CancelRun` → `CANCELLED`.
-- Terminal runs accept no further claims, commits, or injects.
+- Terminal runs accept no further claims, commits, injects, heartbeats, or fails.
 
 ---
 
@@ -348,6 +365,7 @@ Within a major version, evolution is by **addition**, never by mutation:
   and upgrade deliberately.
 - **`v2.0.0`** — product/SDK major: **trait bags** as the sole artifact model (formerly drafted as v1.2). Breaking vs v1.x single-type artifacts. Proto package path remains `srcport.substrate.v1` (reserved fields); SDK crates and tags are **2.0.0**.
 - **`v2.1.0`** — additive: **`ArtifactStorePolicy`** (frozen store law: max inline/blob sizes, `COPY_VERIFY` ingest, durability class), exposed on `RegistrySnapshot.store_policy`; hard enforcement via `RESOURCE_EXHAUSTED`.
+- **`v2.2.0`** — additive **leased concurrency**: batch `ClaimReady` → `ClaimResponse`, `Heartbeat`, `FailWork`, `Limits.{max_in_flight,default_lease_ms,max_attempts}`, work-unit lease lifecycle (READY/CLAIMED/DONE).
 - **`v1.2.0`** (draft line, superseded by v2.0.0) — **trait bags** replace single-type artifacts. `Artifact` is
   a map of contract ref → `Trait`; `Port.traits` declares required/guaranteed
   sets; matching is set inclusion; projection helpers isolate traits. No
@@ -396,11 +414,15 @@ The minimal conformance suite (each SDK ships it) is:
 9. **Structural termination** — cycles and invalid bindings are rejected;
     exhausted work becomes `STALLED` (unless `CLOSURE_OPEN`), and `max_steps`
     bounds committed work units.
-12. **Work-unit firing** — default `ONCE` matches v1.0 (one claim/commit per
+12. **Work-unit firing** — default `ONCE` matches v1.0 (one successful commit per
     node). `ONCE_PER_KEY` suppresses duplicate keys within a run. `ALWAYS`
     re-fires when delivery generation changes (including re-inject of the same
     artifact). Module `Capability.firing` + `Port.key` are honoured; run policy
     may override. `include_nodes` materialises a valid subset assembly.
+12b. **Leased concurrency** — `ClaimReady` returns a batch under leases;
+    `Heartbeat` renews; `FailWork` retries or terminals; lease expiry reclaims
+    unless `max_attempts` is exhausted. `max_in_flight` bounds CLAIMED units.
+    Concurrent claimants never both hold the same `unit_key`.
 10. **Derivation preservation** — value-equal artifacts share an address while
     distinct production paths remain separately committed and observable.
 11. **Production artifact boundary** — each trait is small inline (`Trait.body`)

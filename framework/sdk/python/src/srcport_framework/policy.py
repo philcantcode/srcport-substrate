@@ -10,6 +10,9 @@ from srcport_substrate import Assembly, Closure, ExecutionPolicy, Firing, RunReq
 from .memo import MemoPlan
 from .storage import StoragePlan
 
+# Default host concurrency when policy leaves it unset.
+DEFAULT_CONCURRENCY = 8
+
 
 class RunMode(Enum):
     CONVERGE = auto()
@@ -81,6 +84,14 @@ class FrameworkPolicy:
     storage: StoragePlan = field(default_factory=StoragePlan.off)
     memo: MemoPlan = field(default_factory=MemoPlan.off)
     manual_closure: Closure = Closure.CLOSURE_FIRST_TERMINAL
+    # Max parallel host workers (and kernel max_in_flight). None → DEFAULT_CONCURRENCY.
+    concurrency: int | None = None
+    # Items per ClaimReady. None → effective concurrency.
+    claim_batch: int | None = None
+    # Kernel lease duration ms. None → kernel default (60s).
+    lease_ms: int | None = None
+    # Kernel max claim attempts. None → kernel default (3).
+    max_attempts: int | None = None
 
     @staticmethod
     def converge() -> FrameworkPolicy:
@@ -148,6 +159,30 @@ class FrameworkPolicy:
     def with_memo(self, memo: MemoPlan) -> FrameworkPolicy:
         return replace(self, memo=memo)
 
+    def with_concurrency(self, n: int) -> FrameworkPolicy:
+        return replace(self, concurrency=max(1, n))
+
+    def with_claim_batch(self, n: int) -> FrameworkPolicy:
+        return replace(self, claim_batch=max(1, n))
+
+    def with_lease_ms(self, ms: int) -> FrameworkPolicy:
+        return replace(self, lease_ms=ms)
+
+    def with_max_attempts(self, n: int) -> FrameworkPolicy:
+        return replace(self, max_attempts=max(1, n))
+
+    def effective_concurrency(self) -> int:
+        n = self.concurrency if self.concurrency is not None else DEFAULT_CONCURRENCY
+        return max(1, n)
+
+    def effective_claim_batch(self) -> int:
+        n = (
+            self.claim_batch
+            if self.claim_batch is not None
+            else self.effective_concurrency()
+        )
+        return max(1, n)
+
     def closure(self) -> Closure:
         if self.mode in (RunMode.STREAM, RunMode.DEDUPE_STREAM):
             return Closure.CLOSURE_OPEN
@@ -197,4 +232,9 @@ class FrameworkPolicy:
         del req.include_nodes[:]
         req.include_nodes.extend(self.include_nodes())
         req.limits.max_steps = self.resolve_max_steps(node_count)
+        req.limits.max_in_flight = self.effective_concurrency()
+        req.limits.default_lease_ms = self.lease_ms if self.lease_ms is not None else 0
+        req.limits.max_attempts = (
+            self.max_attempts if self.max_attempts is not None else 0
+        )
         return req

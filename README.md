@@ -46,6 +46,7 @@ flowchart TB
 | Wire format | [`kernel/contracts/proto/.../substrate.proto`](kernel/contracts/proto/srcport/substrate/v1/substrate.proto) |
 | Framework charter | [`framework/SPEC.md`](framework/SPEC.md) |
 | Framework usage | [`framework/README.md`](framework/README.md) |
+| Concurrency / leases | [`docs/Concurrency.md`](docs/Concurrency.md) |
 | Agent / contributor guide | [`AGENTS.md`](AGENTS.md) |
 | Test the framework | `cargo test --manifest-path framework/sdk/rust/Cargo.toml` |
 

@@ -112,6 +112,12 @@ func DefaultStorePolicy() *ArtifactStorePolicy {
 // that falls this far behind is shed rather than allowed to OOM the kernel.
 const SubscriberBuffer = 1024
 
+// DefaultLeaseMs is the lease duration when Limits.default_lease_ms is 0.
+const DefaultLeaseMs = 60_000
+
+// DefaultMaxAttempts is applied when Limits.max_attempts is 0.
+const DefaultMaxAttempts = 3
+
 
 // ─── MemoryKernel (in-memory KernelApi) ─────────────────────────────────────
 
@@ -120,13 +126,26 @@ type moduleSlot struct {
 	lifecycle Lifecycle
 }
 
+// claimedSlot is an in-flight leased claim (kernel-local; live lease wall-clock
+// is not ledgered as non-zero so chain hashes stay deterministic).
+type claimedSlot struct {
+	work         *WorkItem
+	unitKey      string
+	leaseUntilMs int64
+	attempt      uint32
+}
+
 type runSlot struct {
-	run         *Run
-	claimed     map[string]*WorkItem // keyed by WorkItem.Id
-	latest      map[string]*Derivation
-	doneUnits   map[string]bool
-	inputEpochs map[string]uint64
-	nodeCommits map[string]uint64
+	run            *Run
+	claimed        map[string]*claimedSlot // keyed by WorkItem.Id
+	latest         map[string]*Derivation
+	doneUnits      map[string]bool // terminal DONE only (commit success or terminal fail)
+	claimAttempts  map[string]uint32
+	inputEpochs    map[string]uint64
+	nodeCommits    map[string]uint64
+	maxInFlight    uint64 // 0 = unbounded
+	defaultLeaseMs uint64
+	maxAttempts    uint32
 }
 
 // blobKey is the blob store address: namespace + digest. Digest is content
@@ -227,7 +246,9 @@ type KernelApi interface {
 	Append(r *AppendRequest, ctx ...*RequestContext) *LedgerEntry
 	Snapshot(ctx ...*RequestContext) *RegistrySnapshot
 	StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, error)
-	ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*WorkItem, error)
+	ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*ClaimResponse, error)
+	Heartbeat(req *HeartbeatRequest, ctx ...*RequestContext) (*HeartbeatResponse, error)
+	FailWork(req *FailWorkRequest, ctx ...*RequestContext) (*Run, error)
 	Commit(submitted *Derivation, ctx ...*RequestContext) (*Run, error)
 	GetRun(ref *RunRef, ctx ...*RequestContext) (*Run, error)
 	CancelRun(ref *RunRef, ctx ...*RequestContext) (*Run, error)
@@ -776,13 +797,27 @@ func (k *MemoryKernel) StartRun(req *RunRequest, ctx ...*RequestContext) (*Run, 
 	for _, in := range req.Inputs {
 		epochs[in.Name] = 0
 	}
+	maxInFlight := uint64(0)
+	defaultLeaseMs := uint64(DefaultLeaseMs)
+	maxAttempts := uint32(DefaultMaxAttempts)
+	if req.Limits != nil {
+		maxInFlight = req.Limits.MaxInFlight
+		if req.Limits.DefaultLeaseMs != 0 {
+			defaultLeaseMs = req.Limits.DefaultLeaseMs
+		}
+		if req.Limits.MaxAttempts != 0 {
+			maxAttempts = req.Limits.MaxAttempts
+		}
+	}
 	run := &Run{
 		Id: req.Id, Assembly: assembly, Inputs: req.Inputs,
 		State: RunStateRunning, MaxSteps: max, Policy: req.Policy,
 	}
 	k.runs[run.Id] = &runSlot{
-		run: run, claimed: map[string]*WorkItem{}, latest: map[string]*Derivation{},
-		doneUnits: map[string]bool{}, inputEpochs: epochs, nodeCommits: map[string]uint64{},
+		run: run, claimed: map[string]*claimedSlot{}, latest: map[string]*Derivation{},
+		doneUnits: map[string]bool{}, claimAttempts: map[string]uint32{},
+		inputEpochs: epochs, nodeCommits: map[string]uint64{},
+		maxInFlight: maxInFlight, defaultLeaseMs: defaultLeaseMs, maxAttempts: maxAttempts,
 	}
 	k.appendLocked("run.started", run.Id, marshalCanonical(run))
 	out := clone(run)
@@ -844,9 +879,11 @@ func (k *MemoryKernel) InjectInput(req *InjectInputRequest, ctx ...*RequestConte
 	return clone(slot.run), nil
 }
 
-// ClaimReady atomically claims one ready work unit for module. An empty WorkItem
-// means this module has no ready unit. Under default closure, idle graphs stall.
-func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*WorkItem, error) {
+// ClaimReady atomically claims up to max_items ready work units under leases.
+// Empty items means nothing was claimable (not ready, filtered out, or at
+// max_in_flight). Under default closure, if the graph has neither READY nor
+// CLAIMED work after reaping, the run closes as STALLED.
+func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*ClaimResponse, error) {
 	if err := checkDeadline(firstCtx(ctx)); err != nil {
 		return nil, err
 	}
@@ -859,49 +896,211 @@ func (k *MemoryKernel) ClaimReady(req *ClaimRequest, ctx ...*RequestContext) (*W
 	if slot.run.State != RunStateRunning {
 		return nil, &RunClosedError{State: slot.run.State}
 	}
-	var selected *AssemblyNode
-	var selectedInputs []*NamedArtifact
-	var unitKey string
-	anyReady := false
-	for _, node := range slot.run.Assembly.Nodes {
-		inputs, ready := resolveInputs(slot, node)
-		if !ready {
-			continue
-		}
-		cap, err := k.capabilityFor(node.Module, node.ModuleVersion, node.Capability)
-		if err != nil {
-			continue
-		}
-		firing := effectiveFiring(slot, node, cap)
-		key, ok := workUnitKey(slot, node, cap, firing, inputs)
-		if !ok || slot.doneUnits[key] {
-			continue
-		}
-		anyReady = true
-		if selected == nil && node.Module == req.Module {
-			selected, selectedInputs, unitKey = node, inputs, key
-		}
+	now := time.Now().UnixMilli()
+	k.reapExpiredLocked(req.RunId, now)
+	slot = k.runs[req.RunId]
+
+	maxItems := int(req.MaxItems)
+	if maxItems == 0 {
+		maxItems = 1
 	}
-	if selected != nil {
-		workID := "work:" + req.RunId + "/" + selected.Id
-		if !(len(unitKey) >= 5 && unitKey[:5] == "once:") {
-			workID = "work:" + req.RunId + "/" + unitKey
-		}
-		work := &WorkItem{
-			Id: workID, RunId: req.RunId, NodeId: selected.Id, Module: selected.Module,
-			ModuleVersion: selected.ModuleVersion, Capability: selected.Capability, Inputs: selectedInputs,
-		}
-		slot.doneUnits[unitKey] = true
-		slot.claimed[work.Id] = work
-		k.appendLocked("work.claimed", work.Id, marshalCanonical(work))
-		return clone(work), nil
+	capacity := inFlightCapacity(slot)
+	want := maxItems
+	if capacity < want {
+		want = capacity
 	}
-	if !anyReady && len(slot.claimed) == 0 && !isOpenClosure(slot) {
+
+	var items []*WorkItem
+	if want > 0 {
+		type cand struct {
+			node    *AssemblyNode
+			inputs  []*NamedArtifact
+			unitKey string
+		}
+		var ready []cand
+		for _, node := range slot.run.Assembly.Nodes {
+			if !nodeMatchesClaimFilter(req, node) {
+				continue
+			}
+			inputs, ok := resolveInputs(slot, node)
+			if !ok {
+				continue
+			}
+			cap, err := k.capabilityFor(node.Module, node.ModuleVersion, node.Capability)
+			if err != nil {
+				continue
+			}
+			firing := effectiveFiring(slot, node, cap)
+			unitKey, ok := workUnitKey(slot, node, cap, firing, inputs)
+			if !ok || slot.doneUnits[unitKey] || unitIsClaimed(slot, unitKey) {
+				continue
+			}
+			ready = append(ready, cand{node: node, inputs: inputs, unitKey: unitKey})
+		}
+		var claimedNow []*WorkItem
+		for i := 0; i < len(ready) && i < want; i++ {
+			c := ready[i]
+			attempt := slot.claimAttempts[c.unitKey] + 1
+			slot.claimAttempts[c.unitKey] = attempt
+			// ONCE keeps the v1.0 work id shape so known-answer ledger fixtures
+			// stay stable; multi-fire modes embed the unit key. Reclaims reuse
+			// the same id (unit is not DONE).
+			workID := "work:" + req.RunId + "/" + c.node.Id
+			if !(len(c.unitKey) >= 5 && c.unitKey[:5] == "once:") {
+				workID = "work:" + req.RunId + "/" + c.unitKey
+			}
+			leaseUntil := now + int64(slot.defaultLeaseMs)
+			work := &WorkItem{
+				Id: workID, RunId: req.RunId, NodeId: c.node.Id, Module: c.node.Module,
+				ModuleVersion: c.node.ModuleVersion, Capability: c.node.Capability, Inputs: c.inputs,
+				UnitKey: c.unitKey, Attempt: attempt, LeaseUntilUnixMs: leaseUntil,
+			}
+			slot.claimed[workID] = &claimedSlot{
+				work: work, unitKey: c.unitKey, leaseUntilMs: leaseUntil, attempt: attempt,
+			}
+			claimedNow = append(claimedNow, work)
+		}
+		for _, work := range claimedNow {
+			k.appendLocked("work.claimed", work.Id, marshalCanonical(ledgerWorkItem(work)))
+		}
+		items = claimedNow
+	}
+
+	slot = k.runs[req.RunId]
+	anyReady := k.assemblyAnyReady(slot)
+	if len(items) == 0 && !anyReady && len(slot.claimed) == 0 && !isOpenClosure(slot) {
 		slot.run.State = RunStateStalled
 		slot.run.Reason = "no node is ready and no work is in flight"
 		k.appendLocked("run.stalled", slot.run.Id, marshalCanonical(slot.run))
 	}
-	return &WorkItem{}, nil
+	out := make([]*WorkItem, len(items))
+	for i, w := range items {
+		out[i] = clone(w)
+	}
+	return &ClaimResponse{Items: out}, nil
+}
+
+// Heartbeat extends leases on in-flight work. Expired or unknown ids appear in
+// lost_work_ids.
+func (k *MemoryKernel) Heartbeat(req *HeartbeatRequest, ctx ...*RequestContext) (*HeartbeatResponse, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	slot, ok := k.runs[req.RunId]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, req.RunId)
+	}
+	if slot.run.State != RunStateRunning {
+		return nil, &RunClosedError{State: slot.run.State}
+	}
+	now := time.Now().UnixMilli()
+	k.reapExpiredLocked(req.RunId, now)
+	slot = k.runs[req.RunId]
+	extend := slot.defaultLeaseMs
+	if req.ExtendLeaseMs != 0 {
+		extend = req.ExtendLeaseMs
+	}
+	until := now + int64(extend)
+	var renewed, lost []string
+	for _, id := range req.WorkIds {
+		if c, ok := slot.claimed[id]; ok {
+			c.leaseUntilMs = until
+			c.work.LeaseUntilUnixMs = until
+			renewed = append(renewed, id)
+		} else {
+			lost = append(lost, id)
+		}
+	}
+	return &HeartbeatResponse{RenewedWorkIds: renewed, LostWorkIds: lost}, nil
+}
+
+// FailWork releases a claimed unit without a derivation. terminal=true or
+// exhausted attempts → DONE; otherwise the unit returns to READY.
+func (k *MemoryKernel) FailWork(req *FailWorkRequest, ctx ...*RequestContext) (*Run, error) {
+	if err := checkDeadline(firstCtx(ctx)); err != nil {
+		return nil, err
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	slot, ok := k.runs[req.RunId]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, req.RunId)
+	}
+	if slot.run.State != RunStateRunning {
+		return nil, &RunClosedError{State: slot.run.State}
+	}
+	now := time.Now().UnixMilli()
+	k.reapExpiredLocked(req.RunId, now)
+	slot = k.runs[req.RunId]
+	claimed, ok := slot.claimed[req.WorkId]
+	if !ok {
+		return nil, fmt.Errorf("%w: work was not claimed", ErrConflict)
+	}
+	delete(slot.claimed, req.WorkId)
+	terminal := req.Terminal || claimed.attempt >= slot.maxAttempts
+	reason := req.Reason
+	if reason == "" {
+		reason = "failed"
+	}
+	failure := &WorkFailure{
+		RunId: req.RunId, WorkId: req.WorkId, UnitKey: claimed.unitKey,
+		Reason: reason, Terminal: terminal, Attempt: claimed.attempt,
+	}
+	if terminal {
+		slot.doneUnits[claimed.unitKey] = true
+	}
+	k.appendLocked("work.failed", req.WorkId, marshalCanonical(failure))
+
+	slot = k.runs[req.RunId]
+	if !isOpenClosure(slot) && len(slot.claimed) == 0 && !k.assemblyAnyReady(slot) {
+		slot.run.State = RunStateStalled
+		slot.run.Reason = "no node is ready and no work is in flight"
+		k.appendLocked("run.stalled", slot.run.Id, marshalCanonical(slot.run))
+		return clone(slot.run), nil
+	}
+	return clone(slot.run), nil
+}
+
+// reapExpiredLocked reaps expired leases for one run. Caller holds k.mu.
+func (k *MemoryKernel) reapExpiredLocked(runID string, now int64) {
+	slot := k.runs[runID]
+	if slot == nil {
+		return
+	}
+	maxAttempts := slot.maxAttempts
+	type expired struct {
+		id      string
+		claimed *claimedSlot
+	}
+	var exp []expired
+	for id, c := range slot.claimed {
+		if c.leaseUntilMs > 0 && c.leaseUntilMs <= now {
+			exp = append(exp, expired{id: id, claimed: c})
+		}
+	}
+	type ledgerEv struct {
+		kind, subject string
+		detail        []byte
+	}
+	var events []ledgerEv
+	for _, e := range exp {
+		delete(slot.claimed, e.id)
+		ledgerItem := ledgerWorkItem(e.claimed.work)
+		events = append(events, ledgerEv{"work.expired", e.id, marshalCanonical(ledgerItem)})
+		if e.claimed.attempt >= maxAttempts {
+			slot.doneUnits[e.claimed.unitKey] = true
+			failure := &WorkFailure{
+				RunId: runID, WorkId: e.id, UnitKey: e.claimed.unitKey,
+				Reason: "lease expired; max_attempts exhausted", Terminal: true, Attempt: e.claimed.attempt,
+			}
+			events = append(events, ledgerEv{"work.failed", e.id, marshalCanonical(failure)})
+		}
+	}
+	for _, ev := range events {
+		k.appendLocked(ev.kind, ev.subject, ev.detail)
+	}
 }
 
 // Commit validates and records one production path, then releases downstream
@@ -927,10 +1126,13 @@ func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*R
 	if slot.run.State != RunStateRunning {
 		return nil, &RunClosedError{State: slot.run.State}
 	}
-	work := slot.claimed[submitted.WorkId]
-	if work == nil {
+	k.reapExpiredLocked(submitted.RunId, time.Now().UnixMilli())
+	slot = k.runs[submitted.RunId]
+	claimed := slot.claimed[submitted.WorkId]
+	if claimed == nil {
 		return nil, fmt.Errorf("%w: work was not claimed", ErrConflict)
 	}
+	work := claimed.work
 	if submitted.NodeId != "" && submitted.NodeId != work.NodeId {
 		return nil, fmt.Errorf("%w: node_id does not match the claim", ErrInvalid)
 	}
@@ -948,6 +1150,7 @@ func (k *MemoryKernel) Commit(submitted *Derivation, ctx ...*RequestContext) (*R
 	}
 	d.Id = derivationID(d)
 	delete(slot.claimed, work.Id)
+	slot.doneUnits[claimed.unitKey] = true
 	slot.latest[work.NodeId] = d
 	slot.nodeCommits[work.NodeId]++
 	slot.run.Steps++
@@ -1025,7 +1228,7 @@ func (k *MemoryKernel) CancelRun(ref *RunRef, ctx ...*RequestContext) (*Run, err
 	}
 	slot.run.State = RunStateCancelled
 	slot.run.Reason = "cancelled"
-	slot.claimed = map[string]*WorkItem{}
+	slot.claimed = map[string]*claimedSlot{}
 	k.appendLocked("run.cancelled", slot.run.Id, marshalCanonical(slot.run))
 	return clone(slot.run), nil
 }
@@ -1399,11 +1602,71 @@ func (k *MemoryKernel) assemblyAnyReady(slot *runSlot) bool {
 		}
 		firing := effectiveFiring(slot, node, cap)
 		key, ok := workUnitKey(slot, node, cap, firing, inputs)
-		if ok && !slot.doneUnits[key] {
+		if !ok || slot.doneUnits[key] || unitIsClaimed(slot, key) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// ledgerWorkItem returns a WorkItem with wall-clock lease zeroed so chain
+// hashes cross-verify across SDKs.
+func ledgerWorkItem(work *WorkItem) *WorkItem {
+	w := clone(work)
+	w.LeaseUntilUnixMs = 0
+	return w
+}
+
+func inFlightCapacity(slot *runSlot) int {
+	if slot.maxInFlight == 0 {
+		return int(^uint(0) >> 1) // MaxInt
+	}
+	used := uint64(len(slot.claimed))
+	if used >= slot.maxInFlight {
+		return 0
+	}
+	return int(slot.maxInFlight - used)
+}
+
+func unitIsClaimed(slot *runSlot, unitKey string) bool {
+	for _, c := range slot.claimed {
+		if c.unitKey == unitKey {
 			return true
 		}
 	}
 	return false
+}
+
+func nodeMatchesClaimFilter(req *ClaimRequest, node *AssemblyNode) bool {
+	if req.Module != "" && node.Module != req.Module {
+		return false
+	}
+	if len(req.Modules) > 0 {
+		found := false
+		for _, m := range req.Modules {
+			if m == node.Module {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if len(req.NodeIds) > 0 {
+		found := false
+		for _, n := range req.NodeIds {
+			if n == node.Id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveInputs(slot *runSlot, node *AssemblyNode) ([]*NamedArtifact, bool) {

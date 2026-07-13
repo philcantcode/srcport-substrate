@@ -61,6 +61,10 @@ prior run), `drive` / `drive_with`, `inject(…, DriveAfter)`, `cancel`.
 | `with_nodes(NodePlan)` | Which assembly nodes run | `All` · `Only` · `After` · `From` (non-`All` → host cut) |
 | `with_drive(DrivePlan)` | Claim loop style | `UntilIdle` · `OnePass` · `UntilIdleThenWait` |
 | `with_max_steps(n)` | Cap committed work units | Kernel `Limits.max_steps` |
+| `with_concurrency(n)` | Parallel host workers | Also sets kernel `Limits.max_in_flight` (default 8) |
+| `with_claim_batch(n)` | Items per `ClaimReady` | Default = concurrency |
+| `with_lease_ms(ms)` | Work-unit lease duration | Kernel `Limits.default_lease_ms` |
+| `with_max_attempts(n)` | Claim retries after fail/expiry | Kernel `Limits.max_attempts` |
 | `with_claim_modules(…)` | Soft host claim allow-list | Module names; does **not** remove assembly nodes |
 | `with_storage(StoragePlan)` | Tabular side-channel | Requires `Host::with_storage(…)` |
 | `with_memo(MemoPlan)` | Cross-run memo | Requires `Host::with_memo(…)` |
@@ -110,8 +114,14 @@ On hit: emit `StepStage::Cached`, commit prior output refs, skip `execute`.
 Per work unit (not module lifecycle):
 
 ```text
-ClaimReady → on_init → execute { emit_progress* } → on_final → Put/Commit → on_store
+ClaimReady(batch) → [parallel execute when concurrency > 1] →
+  on_init → execute { emit_progress* } → on_final → Put/Commit → on_store
+  on failure → FailWork (retryable; kernel may terminal after max_attempts)
 ```
+
+Work units are **leased** on the kernel: dead workers release via lease expiry;
+the host heartbeats long steps when needed. Prefer `with_concurrency(n)` over
+hand-rolling worker pools.
 
 | Stage | Contract ref |
 |-------|--------------|
@@ -129,5 +139,6 @@ UI is optional. Omitting hooks never changes run completion.
 - Usage / quick start: [`framework/README.md`](../framework/README.md)
 - UI schemas: [`framework/profiles/ui/`](../framework/profiles/ui/)
 - Rust SDK: [`framework/sdk/rust/`](../framework/sdk/rust/)
+- Concurrency / leases: [`Concurrency.md`](Concurrency.md)
 - Siblings: [`Module.md`](Module.md), [`Artifact.md`](Artifact.md)
 - Kernel: [`kernel/SPEC.md`](../kernel/SPEC.md)

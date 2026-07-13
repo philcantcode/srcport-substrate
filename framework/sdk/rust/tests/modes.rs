@@ -1,5 +1,7 @@
 //! Framework modes: converge, stream (loop on inject), selective, start_after / from_node cut+seed.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use srcport_framework::{
     seed_input_name, seeds_from_run, DriveAfter, FrameworkError, FrameworkPolicy, Host,
     ModulePlugin, PortBody, PresentationStatus, StepContext, StepOutput, StepStage,
@@ -10,7 +12,7 @@ use srcport_substrate::{
 };
 
 struct Echo {
-    hits: u32,
+    hits: AtomicU64,
 }
 
 impl ModulePlugin for Echo {
@@ -37,8 +39,8 @@ impl ModulePlugin for Echo {
         }
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
-        self.hits += 1;
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+        self.hits.fetch_add(1, Ordering::SeqCst);
         let body = step
             .inputs
             .get("in")
@@ -72,7 +74,7 @@ impl ModulePlugin for Extractor {
         }
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let q = step.inputs.get("question").and_then(|a| a.traits.values().next().map(|f| f.body.as_slice())).unwrap_or(b"");
         Ok(StepOutput {
             outputs: vec![PortBody::with_trait(
@@ -99,7 +101,7 @@ impl ModulePlugin for Retriever {
         }
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let q = step
             .inputs
             .get("question")
@@ -137,7 +139,7 @@ impl ModulePlugin for Writer {
         }
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let mut body = b"answer:".to_vec();
         if let Some(f) = step.inputs.get("facts") {
             if let Some(tr) = f.traits.values().next() {
@@ -173,7 +175,7 @@ fn put_in(host: &Host<MemoryKernel>, body: &[u8]) -> srcport_substrate::Artifact
 #[test]
 fn stream_mode_loops_on_inject() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Echo { hits: 0 })).unwrap();
+    host.register_plugin(Echo { hits: AtomicU64::new(0) }).unwrap();
 
     let first = put_in(&host, b"one");
     host.start_pipeline(
@@ -232,10 +234,10 @@ fn stream_mode_loops_on_inject() {
 #[test]
 fn selective_mode_runs_subset_assembly() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Extractor)).unwrap();
-    host.register_plugin(Box::new(Writer {
+    host.register_plugin(Extractor).unwrap();
+    host.register_plugin(Writer {
         with_sources: false,
-    }))
+    })
     .unwrap();
     // retriever deliberately not registered / not in include_nodes
 
@@ -403,11 +405,11 @@ fn put_question(host: &Host<MemoryKernel>, body: &[u8]) -> srcport_substrate::Ar
 #[test]
 fn start_after_requires_seed_and_runs_rest() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Extractor)).unwrap();
-    host.register_plugin(Box::new(Retriever)).unwrap();
-    host.register_plugin(Box::new(Writer {
+    host.register_plugin(Extractor).unwrap();
+    host.register_plugin(Retriever).unwrap();
+    host.register_plugin(Writer {
         with_sources: true,
-    }))
+    })
     .unwrap();
 
     let question = put_question(&host, b"q");
@@ -486,9 +488,9 @@ fn start_after_requires_seed_and_runs_rest() {
 #[test]
 fn from_node_write_seeds_both_producers() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Writer {
+    host.register_plugin(Writer {
         with_sources: true,
-    }))
+    })
     .unwrap();
 
     let question = put_question(&host, b"q");
@@ -553,11 +555,11 @@ fn from_node_write_seeds_both_producers() {
 #[test]
 fn resume_after_seeds_from_prior_run() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Extractor)).unwrap();
-    host.register_plugin(Box::new(Retriever)).unwrap();
-    host.register_plugin(Box::new(Writer {
+    host.register_plugin(Extractor).unwrap();
+    host.register_plugin(Retriever).unwrap();
+    host.register_plugin(Writer {
         with_sources: true,
-    }))
+    })
     .unwrap();
 
     let question = put_question(&host, b"hello");

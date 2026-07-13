@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srcport-framework"
-version = "2.2.0"
+version = "2.3.0"
 description = "Opinionated application framework on srcport-substrate: host loop, module plugins, optional UI profiles."
 readme = "README.md"
 requires-python = ">=3.9"

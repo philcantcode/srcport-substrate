@@ -1,4 +1,4 @@
-//! # srcport-substrate — Rust SDK (v2.1.0, in-process)
+//! # srcport-substrate — Rust SDK (v2.2.0, in-process)
 //!
 //! One pluggable core: **seven primitives** (Module · Artifact · Contract ·
 //! Event · Ledger · Registry · Run) and **one ABI** (the [`KernelApi`] trait).
@@ -25,8 +25,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+
+/// Default lease when `Limits.default_lease_ms` is 0.
+pub const DEFAULT_LEASE_MS: u64 = 60_000;
+/// Default max claim attempts when `Limits.max_attempts` is 0.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
 /// The generated protobuf types. These ARE the contract — do not hand-edit;
 /// change `substrate.proto` and rebuild.
@@ -498,19 +504,34 @@ struct ModuleSlot {
     lifecycle: Lifecycle,
 }
 
+/// In-flight leased claim (kernel-local; live lease is not ledgered as wall clock).
+#[derive(Clone)]
+struct ClaimedSlot {
+    work: WorkItem,
+    unit_key: String,
+    lease_until_ms: i64,
+    attempt: u32,
+}
+
 #[derive(Clone)]
 struct RunSlot {
     run: Run,
-    /// In-flight work, keyed by `WorkItem.id`.
-    claimed: HashMap<String, WorkItem>,
+    /// In-flight leased work, keyed by `WorkItem.id`.
+    claimed: HashMap<String, ClaimedSlot>,
     /// Latest committed derivation per assembly node (for downstream resolve).
     latest: HashMap<String, Derivation>,
-    /// Work-unit keys already claimed or committed (at most once each).
+    /// Work-unit keys that are terminally DONE (commit success or terminal fail).
     done_units: HashSet<String>,
+    /// How many times each unit_key has been claimed (for attempt numbers).
+    claim_attempts: HashMap<String, u32>,
     /// Delivery generation per named run input (bumped by InjectInput).
     input_epochs: HashMap<String, u64>,
     /// Commit count per node (source generation for ALWAYS fingerprints).
     node_commits: HashMap<String, u64>,
+    /// Frozen from StartRun Limits (0 max_in_flight = unbounded).
+    max_in_flight: u64,
+    default_lease_ms: u64,
+    max_attempts: u32,
 }
 
 #[derive(Clone)]
@@ -1029,7 +1050,8 @@ impl MemoryKernel {
             .ok_or_else(|| KernelError::Invalid("assembly is required".into()))?;
         let assembly = materialize_assembly(&assembly, &req.include_nodes)?;
         validate_assembly(&state, &assembly, &req.inputs)?;
-        let requested_max = req.limits.as_ref().map(|l| l.max_steps).unwrap_or(0);
+        let limits = req.limits.as_ref();
+        let requested_max = limits.map(|l| l.max_steps).unwrap_or(0);
         let max_steps = if requested_max == 0 {
             assembly.nodes.len() as u64
         } else {
@@ -1038,6 +1060,23 @@ impl MemoryKernel {
         if max_steps == 0 {
             return Err(KernelError::Invalid("max_steps must be positive".into()));
         }
+        let max_in_flight = limits.map(|l| l.max_in_flight).unwrap_or(0);
+        let default_lease_ms = {
+            let v = limits.map(|l| l.default_lease_ms).unwrap_or(0);
+            if v == 0 {
+                DEFAULT_LEASE_MS
+            } else {
+                v
+            }
+        };
+        let max_attempts = {
+            let v = limits.map(|l| l.max_attempts).unwrap_or(0);
+            if v == 0 {
+                DEFAULT_MAX_ATTEMPTS
+            } else {
+                v
+            }
+        };
         let mut input_epochs = HashMap::new();
         for input in &req.inputs {
             input_epochs.insert(input.name.clone(), 0);
@@ -1060,8 +1099,12 @@ impl MemoryKernel {
                 claimed: HashMap::new(),
                 latest: HashMap::new(),
                 done_units: HashSet::new(),
+                claim_attempts: HashMap::new(),
                 input_epochs,
                 node_commits: HashMap::new(),
+                max_in_flight,
+                default_lease_ms,
+                max_attempts,
             },
         );
         Self::append_locked(&mut state, "run.started", &run.id, run.encode_to_vec());
@@ -1136,70 +1179,110 @@ impl MemoryKernel {
         Ok(run)
     }
 
-    /// Atomically claim the first ready work unit for a module. An empty
-    /// WorkItem means that this module has no ready unit. Under default
-    /// closure, if the whole graph has neither ready nor in-flight work, the
-    /// run closes as STALLED.
-    pub fn claim_ready(&self, req: ClaimRequest) -> Result<WorkItem> {
+    /// Atomically claim up to `max_items` ready work units under leases.
+    /// Empty `items` means nothing was claimable (not ready, filtered out, or
+    /// at `max_in_flight`). Under default closure, if the graph has neither
+    /// READY nor CLAIMED work after reaping, the run closes as STALLED.
+    pub fn claim_ready(&self, req: ClaimRequest) -> Result<ClaimResponse> {
         let mut state = self.state.lock().unwrap();
-        let slot = state
+        let now = now_unix_ms();
+        let run_state = state
             .runs
             .get(&req.run_id)
-            .ok_or_else(|| KernelError::NotFound(req.run_id.clone()))?;
-        let run_state = slot.run.state();
+            .ok_or_else(|| KernelError::NotFound(req.run_id.clone()))?
+            .run
+            .state();
         if run_state != RunState::Running {
             return Err(KernelError::RunClosed(run_state));
         }
+        Self::reap_expired_locked(&mut state, &req.run_id, now);
 
+        let slot = state.runs.get(&req.run_id).unwrap();
         let assembly = slot.run.assembly.as_ref().unwrap().clone();
-        let mut selected = None;
-        let mut any_ready = false;
-        for node in &assembly.nodes {
-            let Some(inputs) = resolve_inputs(slot, node) else {
-                continue;
-            };
-            let Ok(cap) = capability_for_node(&state, node) else {
-                continue;
-            };
-            let firing = effective_firing(slot, node, cap);
-            let Some(unit_key) = work_unit_key(slot, node, cap, firing, &inputs) else {
-                continue;
-            };
-            if slot.done_units.contains(&unit_key) {
-                continue;
+        let max_items = if req.max_items == 0 { 1 } else { req.max_items as usize };
+        let capacity = in_flight_capacity(slot);
+        let want = max_items.min(capacity);
+        let mut items = Vec::new();
+
+        if want > 0 {
+            let mut ready_candidates = Vec::new();
+            for node in &assembly.nodes {
+                if !node_matches_claim_filter(&req, node) {
+                    continue;
+                }
+                let Some(inputs) = resolve_inputs(slot, node) else {
+                    continue;
+                };
+                let Ok(cap) = capability_for_node(&state, node) else {
+                    continue;
+                };
+                let firing = effective_firing(slot, node, cap);
+                let Some(unit_key) = work_unit_key(slot, node, cap, firing, &inputs) else {
+                    continue;
+                };
+                if slot.done_units.contains(&unit_key) {
+                    continue;
+                }
+                if unit_is_claimed(slot, &unit_key) {
+                    continue;
+                }
+                ready_candidates.push((node.clone(), inputs, unit_key));
             }
-            any_ready = true;
-            if selected.is_none() && node.module == req.module {
-                selected = Some((node.clone(), inputs, unit_key));
+
+            let mut claimed_now: Vec<WorkItem> = Vec::new();
+            {
+                let slot = state.runs.get_mut(&req.run_id).unwrap();
+                for (node, inputs, unit_key) in ready_candidates.into_iter().take(want) {
+                    let attempt = slot.claim_attempts.get(&unit_key).copied().unwrap_or(0) + 1;
+                    slot.claim_attempts.insert(unit_key.clone(), attempt);
+                    // ONCE keeps the v1.0 work id shape so known-answer ledger fixtures
+                    // stay stable; multi-fire modes embed the unit key. Reclaims reuse
+                    // the same id (unit is not DONE).
+                    let work_id = if unit_key.starts_with("once:") {
+                        format!("work:{}/{}", req.run_id, node.id)
+                    } else {
+                        format!("work:{}/{}", req.run_id, unit_key)
+                    };
+                    let lease_until = now.saturating_add(slot.default_lease_ms as i64);
+                    let work = WorkItem {
+                        id: work_id.clone(),
+                        run_id: req.run_id.clone(),
+                        node_id: node.id.clone(),
+                        module: node.module,
+                        module_version: node.module_version,
+                        capability: node.capability,
+                        inputs,
+                        unit_key: unit_key.clone(),
+                        attempt,
+                        lease_until_unix_ms: lease_until,
+                    };
+                    slot.claimed.insert(
+                        work_id,
+                        ClaimedSlot {
+                            work: work.clone(),
+                            unit_key,
+                            lease_until_ms: lease_until,
+                            attempt,
+                        },
+                    );
+                    claimed_now.push(work);
+                }
             }
+            for work in &claimed_now {
+                Self::append_locked(
+                    &mut state,
+                    "work.claimed",
+                    &work.id,
+                    ledger_work_item(work).encode_to_vec(),
+                );
+            }
+            items = claimed_now;
         }
 
-        if let Some((node, inputs, unit_key)) = selected {
-            // ONCE keeps the v1.0 work id shape so known-answer ledger fixtures
-            // stay stable; multi-fire modes embed the unit key.
-            let work_id = if unit_key.starts_with("once:") {
-                format!("work:{}/{}", req.run_id, node.id)
-            } else {
-                format!("work:{}/{}", req.run_id, unit_key)
-            };
-            let work = WorkItem {
-                id: work_id,
-                run_id: req.run_id.clone(),
-                node_id: node.id.clone(),
-                module: node.module,
-                module_version: node.module_version,
-                capability: node.capability,
-                inputs,
-            };
-            let slot = state.runs.get_mut(&req.run_id).unwrap();
-            slot.done_units.insert(unit_key);
-            slot.claimed.insert(work.id.clone(), work.clone());
-            Self::append_locked(&mut state, "work.claimed", &work.id, work.encode_to_vec());
-            return Ok(work);
-        }
-
+        let slot = state.runs.get(&req.run_id).unwrap();
+        let any_ready = assembly_any_ready(&state, slot);
         let open = is_open_closure(slot);
-        if !any_ready && slot.claimed.is_empty() && !open {
+        if items.is_empty() && !any_ready && slot.claimed.is_empty() && !open {
             let run = &mut state.runs.get_mut(&req.run_id).unwrap().run;
             run.state = RunState::Stalled as i32;
             run.reason = "no node is ready and no work is in flight".into();
@@ -1211,7 +1294,159 @@ impl MemoryKernel {
                 closed.encode_to_vec(),
             );
         }
-        Ok(WorkItem::default())
+        Ok(ClaimResponse { items })
+    }
+
+    /// Extend leases on in-flight work. Expired or unknown ids appear in
+    /// `lost_work_ids`.
+    pub fn heartbeat(&self, req: HeartbeatRequest) -> Result<HeartbeatResponse> {
+        let mut state = self.state.lock().unwrap();
+        let now = now_unix_ms();
+        let run_state = state
+            .runs
+            .get(&req.run_id)
+            .ok_or_else(|| KernelError::NotFound(req.run_id.clone()))?
+            .run
+            .state();
+        if run_state != RunState::Running {
+            return Err(KernelError::RunClosed(run_state));
+        }
+        // Renew first (including barely-expired leases still in `claimed`), then
+        // reap any other expired units not covered by this heartbeat.
+        let slot = state.runs.get_mut(&req.run_id).unwrap();
+        let extend = if req.extend_lease_ms == 0 {
+            slot.default_lease_ms
+        } else {
+            req.extend_lease_ms
+        };
+        let mut renewed = Vec::new();
+        let mut lost = Vec::new();
+        let until = now.saturating_add(extend as i64);
+        for id in &req.work_ids {
+            match slot.claimed.get_mut(id) {
+                Some(c) => {
+                    c.lease_until_ms = until;
+                    c.work.lease_until_unix_ms = until;
+                    renewed.push(id.clone());
+                }
+                None => lost.push(id.clone()),
+            }
+        }
+        Self::reap_expired_locked(&mut state, &req.run_id, now);
+        Ok(HeartbeatResponse {
+            renewed_work_ids: renewed,
+            lost_work_ids: lost,
+        })
+    }
+
+    /// Fail a claimed unit without a derivation. `terminal` or exhausted
+    /// attempts → DONE; otherwise the unit returns to READY.
+    pub fn fail_work(&self, req: FailWorkRequest) -> Result<Run> {
+        let mut state = self.state.lock().unwrap();
+        let now = now_unix_ms();
+        let run_state = state
+            .runs
+            .get(&req.run_id)
+            .ok_or_else(|| KernelError::NotFound(req.run_id.clone()))?
+            .run
+            .state();
+        if run_state != RunState::Running {
+            return Err(KernelError::RunClosed(run_state));
+        }
+        Self::reap_expired_locked(&mut state, &req.run_id, now);
+        let (claimed, max_attempts) = {
+            let slot = state.runs.get_mut(&req.run_id).unwrap();
+            let claimed = slot
+                .claimed
+                .remove(&req.work_id)
+                .ok_or_else(|| KernelError::Conflict("work was not claimed".into()))?;
+            (claimed, slot.max_attempts)
+        };
+        let terminal = req.terminal || claimed.attempt >= max_attempts;
+        let failure = WorkFailure {
+            run_id: req.run_id.clone(),
+            work_id: req.work_id.clone(),
+            unit_key: claimed.unit_key.clone(),
+            reason: if req.reason.is_empty() {
+                "failed".into()
+            } else {
+                req.reason.clone()
+            },
+            terminal,
+            attempt: claimed.attempt,
+        };
+        if terminal {
+            state
+                .runs
+                .get_mut(&req.run_id)
+                .unwrap()
+                .done_units
+                .insert(claimed.unit_key);
+        }
+        Self::append_locked(
+            &mut state,
+            "work.failed",
+            &req.work_id,
+            failure.encode_to_vec(),
+        );
+
+        // Stall check when nothing left in flight.
+        let slot = state.runs.get(&req.run_id).unwrap();
+        let open = is_open_closure(slot);
+        let should_check = !open && slot.claimed.is_empty();
+        if should_check {
+            let snap = slot.clone();
+            if !assembly_any_ready(&state, &snap) {
+                let run = &mut state.runs.get_mut(&req.run_id).unwrap().run;
+                run.state = RunState::Stalled as i32;
+                run.reason = "no node is ready and no work is in flight".into();
+                let closed = run.clone();
+                Self::append_locked(
+                    &mut state,
+                    "run.stalled",
+                    &closed.id,
+                    closed.encode_to_vec(),
+                );
+                return Ok(closed);
+            }
+        }
+        Ok(state.runs.get(&req.run_id).unwrap().run.clone())
+    }
+
+    /// Reap expired leases for one run. Caller holds the state lock.
+    fn reap_expired_locked(state: &mut State, run_id: &str, now: i64) {
+        let Some(slot) = state.runs.get_mut(run_id) else {
+            return;
+        };
+        let max_attempts = slot.max_attempts;
+        let expired: Vec<(String, ClaimedSlot)> = slot
+            .claimed
+            .iter()
+            .filter(|(_, c)| c.lease_until_ms > 0 && c.lease_until_ms <= now)
+            .map(|(id, c)| (id.clone(), c.clone()))
+            .collect();
+        let mut ledger_events: Vec<(String, String, Vec<u8>)> = Vec::new();
+        for (id, claimed) in expired {
+            slot.claimed.remove(&id);
+            let mut ledger_item = claimed.work.clone();
+            ledger_item.lease_until_unix_ms = 0;
+            ledger_events.push(("work.expired".into(), id.clone(), ledger_item.encode_to_vec()));
+            if claimed.attempt >= max_attempts {
+                slot.done_units.insert(claimed.unit_key.clone());
+                let failure = WorkFailure {
+                    run_id: run_id.into(),
+                    work_id: id.clone(),
+                    unit_key: claimed.unit_key,
+                    reason: "lease expired; max_attempts exhausted".into(),
+                    terminal: true,
+                    attempt: claimed.attempt,
+                };
+                ledger_events.push(("work.failed".into(), id, failure.encode_to_vec()));
+            }
+        }
+        for (kind, subject, detail) in ledger_events {
+            Self::append_locked(state, &kind, &subject, detail);
+        }
     }
 
     /// Commit one claimed transformation. The kernel validates every output
@@ -1229,19 +1464,23 @@ impl MemoryKernel {
         if let Some(IdempotentResult::Run(r)) = idempotent_get(&state, "commit", ctx) {
             return Ok(*r);
         }
-        let slot = state
+        let run_state = state
             .runs
             .get(&submitted.run_id)
-            .ok_or_else(|| KernelError::NotFound(submitted.run_id.clone()))?;
-        let run_state = slot.run.state();
+            .ok_or_else(|| KernelError::NotFound(submitted.run_id.clone()))?
+            .run
+            .state();
         if run_state != RunState::Running {
             return Err(KernelError::RunClosed(run_state));
         }
-        let work = slot
+        Self::reap_expired_locked(&mut state, &submitted.run_id, now_unix_ms());
+        let slot = state.runs.get(&submitted.run_id).unwrap();
+        let claimed = slot
             .claimed
             .get(&submitted.work_id)
             .cloned()
             .ok_or_else(|| KernelError::Conflict("work was not claimed".into()))?;
+        let work = &claimed.work;
         if !submitted.node_id.is_empty() && submitted.node_id != work.node_id {
             return Err(KernelError::Invalid(
                 "node_id does not match the claim".into(),
@@ -1250,7 +1489,7 @@ impl MemoryKernel {
         if slot.run.steps >= slot.run.max_steps {
             return Err(KernelError::RunClosed(RunState::Failed));
         }
-        let cap = capability_for_work(&state, &work)?;
+        let cap = capability_for_work(&state, work)?;
         validate_outputs(&state, &cap, &submitted.outputs)?;
 
         let mut derivation = Derivation {
@@ -1269,6 +1508,7 @@ impl MemoryKernel {
         let run_now = {
             let slot = state.runs.get_mut(&work.run_id).unwrap();
             slot.claimed.remove(&work.id);
+            slot.done_units.insert(claimed.unit_key.clone());
             slot.latest
                 .insert(work.node_id.clone(), derivation.clone());
             *slot.node_commits.entry(work.node_id.clone()).or_insert(0) += 1;
@@ -1431,7 +1671,9 @@ pub trait KernelApi {
     fn snapshot(&self, req: SnapshotRequest, ctx: &RequestContext) -> RegistrySnapshot;
     fn start_run(&self, req: RunRequest, ctx: &RequestContext) -> Result<Run>;
     fn inject_input(&self, req: InjectInputRequest, ctx: &RequestContext) -> Result<Run>;
-    fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<WorkItem>;
+    fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<ClaimResponse>;
+    fn heartbeat(&self, req: HeartbeatRequest, ctx: &RequestContext) -> Result<HeartbeatResponse>;
+    fn fail_work(&self, req: FailWorkRequest, ctx: &RequestContext) -> Result<Run>;
     fn commit(&self, submitted: Derivation, ctx: &RequestContext) -> Result<Run>;
     fn get_run(&self, r: &RunRef, ctx: &RequestContext) -> Result<Run>;
     fn cancel_run(&self, r: &RunRef, ctx: &RequestContext) -> Result<Run>;
@@ -1481,9 +1723,17 @@ impl KernelApi for MemoryKernel {
     fn inject_input(&self, req: InjectInputRequest, ctx: &RequestContext) -> Result<Run> {
         MemoryKernel::inject_input_ctx(self, req, ctx)
     }
-    fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<WorkItem> {
+    fn claim_ready(&self, req: ClaimRequest, ctx: &RequestContext) -> Result<ClaimResponse> {
         check_deadline(ctx)?;
         MemoryKernel::claim_ready(self, req)
+    }
+    fn heartbeat(&self, req: HeartbeatRequest, ctx: &RequestContext) -> Result<HeartbeatResponse> {
+        check_deadline(ctx)?;
+        MemoryKernel::heartbeat(self, req)
+    }
+    fn fail_work(&self, req: FailWorkRequest, ctx: &RequestContext) -> Result<Run> {
+        check_deadline(ctx)?;
+        MemoryKernel::fail_work(self, req)
     }
     fn commit(&self, submitted: Derivation, ctx: &RequestContext) -> Result<Run> {
         MemoryKernel::commit_ctx(self, submitted, ctx)
@@ -2036,11 +2286,55 @@ fn assembly_any_ready(state: &State, slot: &RunSlot) -> bool {
         let Some(unit_key) = work_unit_key(slot, node, cap, firing, &inputs) else {
             continue;
         };
-        if !slot.done_units.contains(&unit_key) {
-            return true;
+        if slot.done_units.contains(&unit_key) {
+            continue;
         }
+        if unit_is_claimed(slot, &unit_key) {
+            continue;
+        }
+        return true;
     }
     false
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Ledger-stable WorkItem: wall-clock lease zeroed so chain hashes cross-verify.
+fn ledger_work_item(work: &WorkItem) -> WorkItem {
+    let mut w = work.clone();
+    w.lease_until_unix_ms = 0;
+    w
+}
+
+fn in_flight_capacity(slot: &RunSlot) -> usize {
+    if slot.max_in_flight == 0 {
+        usize::MAX
+    } else {
+        let used = slot.claimed.len() as u64;
+        slot.max_in_flight.saturating_sub(used) as usize
+    }
+}
+
+fn unit_is_claimed(slot: &RunSlot, unit_key: &str) -> bool {
+    slot.claimed.values().any(|c| c.unit_key == unit_key)
+}
+
+fn node_matches_claim_filter(req: &ClaimRequest, node: &AssemblyNode) -> bool {
+    if !req.module.is_empty() && node.module != req.module {
+        return false;
+    }
+    if !req.modules.is_empty() && !req.modules.iter().any(|m| m == &node.module) {
+        return false;
+    }
+    if !req.node_ids.is_empty() && !req.node_ids.iter().any(|n| n == &node.id) {
+        return false;
+    }
+    true
 }
 
 fn validate_outputs(state: &State, cap: &Capability, outputs: &[NamedArtifact]) -> Result<()> {

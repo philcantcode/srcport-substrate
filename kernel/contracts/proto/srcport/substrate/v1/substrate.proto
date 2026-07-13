@@ -356,6 +356,13 @@ message Limits {
   // Zero means the number of nodes. A run never commits more derivations than
   // this value, which bounds multi-fire (ALWAYS / ONCE_PER_KEY) work units.
   uint64 max_steps = 1;
+  // Max concurrently CLAIMED (leased) work units. Zero = unbounded.
+  uint64 max_in_flight = 2;
+  // Lease duration applied on ClaimReady / Heartbeat. Zero → SDK default (60s).
+  uint64 default_lease_ms = 3;
+  // Max claim attempts per work unit (including the first). Zero → SDK default (3).
+  // After this many claims, expiry or retryable FailWork becomes terminal.
+  uint32 max_attempts = 4;
 }
 
 // When a RUNNING run may become COMPLETED. Unspecified = FIRST_TERMINAL.
@@ -423,9 +430,27 @@ message InjectInputRequest {
   NamedArtifact input   = 2;
 }
 
+// Claim one or more ready work units under a lease. Units are CLAIMED until
+// Commit, FailWork, or lease expiry (then READY again unless attempts exhausted).
 message ClaimRequest {
   string run_id = 1;
+  // Soft filter: empty = any module; non-empty = only this module.
+  // Prefer `modules` when filtering several names.
   string module = 2;
+  // Soft filter: empty = any node; else only listed assembly node ids.
+  repeated string node_ids = 3;
+  // How many units to claim this call. Zero is treated as 1.
+  uint32 max_items = 4;
+  // Soft allow-list of module names. Empty = all (subject to `module` if set).
+  // When both `module` and `modules` are set, the unit must match `module` and
+  // appear in `modules` (typically leave one empty).
+  repeated string modules = 5;
+}
+
+message ClaimResponse {
+  // Claimed units (may be fewer than max_items). Empty = nothing ready or at
+  // max_in_flight capacity.
+  repeated WorkItem items = 1;
 }
 
 message WorkItem {
@@ -436,6 +461,46 @@ message WorkItem {
   string module_version        = 5;
   string capability            = 6;
   repeated NamedArtifact inputs = 7;
+  // Stable work-unit identity from firing policy (once: / key: / always: …).
+  string unit_key = 8;
+  // 1-based claim attempt for this unit_key within the run.
+  uint32 attempt = 9;
+  // Absolute lease deadline (unix epoch ms). Wall-clock; zeroed in ledger detail
+  // so chain hashes stay deterministic across SDKs.
+  int64 lease_until_unix_ms = 10;
+}
+
+// Extend leases on in-flight work (long execute). Lost ids were already expired
+// or never claimed by this run.
+message HeartbeatRequest {
+  string run_id = 1;
+  repeated string work_ids = 2;
+  // Lease extension from now. Zero → run default_lease_ms.
+  uint64 extend_lease_ms = 3;
+}
+
+message HeartbeatResponse {
+  repeated string renewed_work_ids = 1;
+  repeated string lost_work_ids = 2;
+}
+
+// Release a claimed unit without a derivation. terminal=true → unit DONE (no
+// retry). terminal=false → READY again if attempts remain, else DONE.
+message FailWorkRequest {
+  string run_id = 1;
+  string work_id = 2;
+  string reason = 3;
+  bool terminal = 4;
+}
+
+// Ledger detail for work.failed / terminal attempt exhaustion.
+message WorkFailure {
+  string run_id = 1;
+  string work_id = 2;
+  string unit_key = 3;
+  string reason = 4;
+  bool terminal = 5;
+  uint32 attempt = 6;
 }
 
 // Provenance is separate from Artifact identity: equal trait bags converge to
@@ -551,7 +616,12 @@ service Kernel {
   rpc StartRun    (RunRequest)      returns (Run);
   // Admit or replace a named input on a RUNNING run (open / multi-fire modes).
   rpc InjectInput (InjectInputRequest) returns (Run);
-  rpc ClaimReady  (ClaimRequest)    returns (WorkItem);
+  // Claim up to max_items ready units under leases. Empty items = none ready.
+  rpc ClaimReady  (ClaimRequest)    returns (ClaimResponse);
+  // Renew leases on claimed work (long-running execute).
+  rpc Heartbeat   (HeartbeatRequest) returns (HeartbeatResponse);
+  // Fail a claimed unit: retry (READY) or terminal (DONE).
+  rpc FailWork    (FailWorkRequest) returns (Run);
   rpc Commit      (Derivation)      returns (Run);
   rpc GetRun      (RunRef)          returns (Run);
   rpc CancelRun   (RunRef)          returns (Run);

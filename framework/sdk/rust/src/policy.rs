@@ -97,7 +97,8 @@ pub enum DriveAfter {
 /// Opinionated framework policy for one pipeline run.
 ///
 /// Compiles to kernel `ExecutionPolicy`, `include_nodes`, and `Limits`. Host-only
-/// fields (`drive`, `claim_modules`, `storage`, `memo`) never enter the kernel.
+/// fields (`drive`, `claim_modules`, `storage`, `memo`, `concurrency`) never
+/// enter the kernel except where mapped into `Limits` (in-flight / lease).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameworkPolicy {
     /// Named product mode.
@@ -117,7 +118,19 @@ pub struct FrameworkPolicy {
     pub storage: StoragePlan,
     /// Optional cross-run work memoisation (requires [`crate::Host::with_memo`]).
     pub memo: MemoPlan,
+    /// Max parallel host workers (and default kernel `max_in_flight`).
+    /// `None` → [`DEFAULT_CONCURRENCY`]. Use `Some(1)` for strict serial drive.
+    pub concurrency: Option<u32>,
+    /// Items per `ClaimReady` call. `None` → same as effective concurrency.
+    pub claim_batch: Option<u32>,
+    /// Kernel lease duration ms. `None` → kernel default (60s).
+    pub lease_ms: Option<u64>,
+    /// Kernel max claim attempts. `None` → kernel default (3).
+    pub max_attempts: Option<u32>,
 }
+
+/// Default host concurrency when policy leaves it unset.
+pub const DEFAULT_CONCURRENCY: u32 = 8;
 
 impl Default for FrameworkPolicy {
     fn default() -> Self {
@@ -141,6 +154,10 @@ impl FrameworkPolicy {
             claim_modules: None,
             storage: StoragePlan::off(),
             memo: MemoPlan::off(),
+            concurrency: None,
+            claim_batch: None,
+            lease_ms: None,
+            max_attempts: None,
         }
     }
 
@@ -277,6 +294,43 @@ impl FrameworkPolicy {
         self
     }
 
+    /// Max parallel workers for [`crate::Host::drive`] (also sets kernel
+    /// `Limits.max_in_flight` unless you need a separate cap later).
+    pub fn with_concurrency(mut self, n: u32) -> Self {
+        self.concurrency = Some(n.max(1));
+        self
+    }
+
+    /// `ClaimReady.max_items` per host claim wave (`None` → concurrency).
+    pub fn with_claim_batch(mut self, n: u32) -> Self {
+        self.claim_batch = Some(n.max(1));
+        self
+    }
+
+    /// Kernel work-unit lease duration in milliseconds.
+    pub fn with_lease_ms(mut self, ms: u64) -> Self {
+        self.lease_ms = Some(ms);
+        self
+    }
+
+    /// Kernel max claim attempts per work unit.
+    pub fn with_max_attempts(mut self, n: u32) -> Self {
+        self.max_attempts = Some(n.max(1));
+        self
+    }
+
+    /// Effective host concurrency (≥ 1).
+    pub fn effective_concurrency(&self) -> u32 {
+        self.concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1)
+    }
+
+    /// Effective claim batch size (≥ 1).
+    pub fn effective_claim_batch(&self) -> u32 {
+        self.claim_batch
+            .unwrap_or_else(|| self.effective_concurrency())
+            .max(1)
+    }
+
     /// Kernel closure for this mode.
     pub fn closure(&self) -> Closure {
         match &self.mode {
@@ -378,7 +432,13 @@ impl FrameworkPolicy {
             .unwrap_or_else(|| self.default_max_steps(node_count));
         req.policy = Some(self.execution_policy_for(req.assembly.as_ref()));
         req.include_nodes = self.include_nodes();
-        req.limits = Some(Limits { max_steps });
+        let conc = self.effective_concurrency() as u64;
+        req.limits = Some(Limits {
+            max_steps,
+            max_in_flight: conc,
+            default_lease_ms: self.lease_ms.unwrap_or(0),
+            max_attempts: self.max_attempts.unwrap_or(0),
+        });
         req
     }
 

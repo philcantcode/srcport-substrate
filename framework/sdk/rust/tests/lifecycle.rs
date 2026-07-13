@@ -38,7 +38,7 @@ impl ModulePlugin for Scanner {
         Some(Presentation::init("Scan").with_detail("Warming up").with_phase("init"))
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         step.emit_progress(
             Presentation::progress("Scan", Some(0.25))
                 .with_detail("phase A")
@@ -102,7 +102,7 @@ impl ModulePlugin for Boom {
         Some(Presentation::init("Boom"))
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         step.emit_progress(Presentation::progress("Boom", Some(0.1)));
         Err(FrameworkError::Invalid("kaboom".into()))
     }
@@ -140,7 +140,7 @@ fn assembly_one(module: &str, cap: &str, in_port: &str, out_port: &str) -> Assem
 #[test]
 fn init_progress_final_sequence_and_artifacts() {
     let mut host = Host::new(MemoryKernel::new()).with_ui_persist(UiPersist::Artifacts);
-    host.register_plugin(Box::new(Scanner)).unwrap();
+    host.register_plugin(Scanner).unwrap();
 
     let target = host
         .kernel()
@@ -183,7 +183,7 @@ fn init_progress_final_sequence_and_artifacts() {
 #[test]
 fn failure_emits_final_failed_without_commit() {
     let mut host = Host::new(MemoryKernel::new());
-    host.register_plugin(Box::new(Boom)).unwrap();
+    host.register_plugin(Boom).unwrap();
 
     let inp = host
         .kernel()

@@ -81,6 +81,9 @@ Modules never call each other. Data and control stay separate:
 - **Events** only notify; the bus never carries domain value bytes.
 - In a **Run**, a node is claimable only when every bound input artifact
   exists (fan-in waits; it does not race).
+- Claims are **leased**: `ClaimReady` may return a batch; `Commit` or terminal
+  `FailWork` completes the unit; lease expiry / retryable fail returns it to
+  READY (until `max_attempts`). See kernel SPEC run-closure / leased concurrency.
 
 ## Further reading
 
@@ -88,4 +91,5 @@ Modules never call each other. Data and control stay separate:
   lifecycle + seven primitives
 - Contract: [`kernel/SPEC.md`](../kernel/SPEC.md) — Module primitive + Run
 - Wire types: [`kernel/contracts/proto/.../substrate.proto`](../kernel/contracts/proto/srcport/substrate/v1/substrate.proto)
+- Concurrency / leases: [`Concurrency.md`](Concurrency.md)
 - Sibling: [`Artifact.md`](Artifact.md)

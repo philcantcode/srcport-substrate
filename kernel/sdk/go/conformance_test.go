@@ -30,6 +30,19 @@ func mustPut(t *testing.T, k *MemoryKernel, a *Artifact) *ArtifactRef {
 	return r
 }
 
+// claimOne returns the first claimed item, or an empty WorkItem when none.
+func claimOne(t *testing.T, k *MemoryKernel, runID, module string) *WorkItem {
+	t.Helper()
+	resp, err := k.ClaimReady(&ClaimRequest{RunId: runID, Module: module})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Items) == 0 {
+		return &WorkItem{}
+	}
+	return resp.Items[0]
+}
+
 // 1. ADDRESSING — same (type, body) ⇒ same id; a one-byte change ⇒ a new id.
 func TestAddressingIsContentDerivedAndMetamorphic(t *testing.T) {
 	k := NewMemoryKernel()
@@ -317,21 +330,23 @@ func TestRunFeedsForwardAndClosesOnTerminalAnswer(t *testing.T) {
 	if err != nil || run.State != RunStateRunning {
 		t.Fatalf("start: run=%v err=%v", run, err)
 	}
-	if work, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "writer"}); err != nil || work.Id != "" {
+	if work, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "writer"}); err != nil || len(work.Items) != 0 {
 		t.Fatalf("writer must wait for fan-in: work=%v err=%v", work, err)
 	}
-	extract, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "extractor"})
-	if err != nil || extract.Id == "" {
-		t.Fatalf("extract claim: %v %v", extract, err)
+	extractResp, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "extractor"})
+	if err != nil || len(extractResp.Items) == 0 || extractResp.Items[0].Id == "" {
+		t.Fatalf("extract claim: %v %v", extractResp, err)
 	}
+	extract := extractResp.Items[0]
 	facts := mustPut(t, k, ArtifactWithTrait("demo.Facts", []byte("typed flow")))
 	if _, err := k.Commit(&Derivation{RunId: "run-1", WorkId: extract.Id, NodeId: extract.NodeId, Outputs: []*NamedArtifact{{Name: "facts", Artifact: facts}}}); err != nil {
 		t.Fatal(err)
 	}
-	write, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "writer"})
-	if err != nil || len(write.Inputs) != 2 {
-		t.Fatalf("fan-in: work=%v err=%v", write, err)
+	writeResp, err := k.ClaimReady(&ClaimRequest{RunId: "run-1", Module: "writer"})
+	if err != nil || len(writeResp.Items) == 0 || len(writeResp.Items[0].Inputs) != 2 {
+		t.Fatalf("fan-in: work=%v err=%v", writeResp, err)
 	}
+	write := writeResp.Items[0]
 	answer := mustPut(t, k, ArtifactWithTrait("demo.Answer", []byte("Modules converge.")))
 	completed, err := k.Commit(&Derivation{RunId: "run-1", WorkId: write.Id, NodeId: write.NodeId, Outputs: []*NamedArtifact{{Name: "answer", Artifact: answer}}})
 	if err != nil {
@@ -370,10 +385,7 @@ func TestRunStallsWhenNoNodeCanBecomeReady(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	work, err := k.ClaimReady(&ClaimRequest{RunId: "stall", Module: "source"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	work := claimOne(t, k, "stall", "source")
 	run, err := k.Commit(&Derivation{RunId: "stall", WorkId: work.Id, NodeId: work.NodeId})
 	if err != nil || run.State != RunStateStalled {
 		t.Fatalf("run must stall: run=%v err=%v", run, err)
@@ -387,7 +399,7 @@ func TestConvergentRunHashesMatchEverySDK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	work, _ := k.ClaimReady(&ClaimRequest{RunId: "parity", Module: "answerer"})
+	work := claimOne(t, k, "parity", "answerer")
 	answer := mustPut(t, k, ArtifactWithTrait("demo.Answer", []byte("yes")))
 	if _, err := k.Commit(&Derivation{RunId: "parity", WorkId: work.Id, NodeId: work.NodeId, Outputs: []*NamedArtifact{{Name: "answer", Artifact: answer}}}); err != nil {
 		t.Fatal(err)
@@ -395,7 +407,8 @@ func TestConvergentRunHashesMatchEverySDK(t *testing.T) {
 	if got := k.Derivations()[0].Id; got != "sha256:8f7f99a396dbf79c7f2287d2f9fca7f4167343831a9283cdfbeb2fe010c8414c" {
 		t.Fatalf("derivation parity: %s", got)
 	}
-	if got := k.Ledger()[len(k.Ledger())-1].Hash; got != "283106692aba4aa72f5eecfda3adc53db7ef606e2a83266fefe772a6b9c6587d" {
+	const LEDGER = "faa944642933bb3b1b2d3789fb940a3ed8eb9802d06bf17444677f72fe974335"
+	if got := k.Ledger()[len(k.Ledger())-1].Hash; got != LEDGER {
 		t.Fatalf("ledger parity: %s", got)
 	}
 }
@@ -835,3 +848,229 @@ func firstTraitBody(a *Artifact) []byte {
 	return nil
 }
 func traitBodyLen(a *Artifact) int { return len(firstTraitBody(a)) }
+
+
+// 12b. LEASED CONCURRENCY — batch claim, max_in_flight, fail/retry, lease reclaim.
+
+func TestBatchClaimAndMaxInFlight(t *testing.T) {
+	k := NewMemoryKernel()
+	k.Register(&ModuleManifest{
+		Name: "worker", Version: "1",
+		Provides: []*Capability{{
+			Name: "work.item", Firing: FiringOncePerKey,
+			Inputs:  []*Port{{Name: "key", Traits: []string{"demo.Key"}, Key: true}},
+			Outputs: []*Port{{Name: "out", Traits: []string{"demo.Out"}}},
+		}},
+	})
+	a := mustPut(t, k, ArtifactWithTrait("demo.Key", []byte("a")))
+	b := mustPut(t, k, ArtifactWithTrait("demo.Key", []byte("b")))
+	_, err := k.StartRun(&RunRequest{
+		Id: "batch",
+		Assembly: &Assembly{
+			Id: "batch@1",
+			Nodes: []*AssemblyNode{
+				{Id: "w1", Module: "worker", ModuleVersion: "1", Capability: "work.item"},
+				{Id: "w2", Module: "worker", ModuleVersion: "1", Capability: "work.item"},
+			},
+			Bindings: []*Binding{
+				{ToNode: "w1", ToPort: "key", Input: "k1"},
+				{ToNode: "w2", ToPort: "key", Input: "k2"},
+			},
+			Terminal: &NodeOutput{Node: "w1", Port: "out"},
+		},
+		Inputs: []*NamedArtifact{
+			{Name: "k1", Artifact: a},
+			{Name: "k2", Artifact: b},
+		},
+		Limits: &Limits{MaxSteps: 10, MaxInFlight: 1},
+		Policy: &ExecutionPolicy{Closure: ClosureOpen},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := k.ClaimReady(&ClaimRequest{RunId: "batch", MaxItems: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Items) != 1 {
+		t.Fatalf("max_in_flight=1, got %d items", len(first.Items))
+	}
+	if first.Items[0].Attempt != 1 {
+		t.Fatalf("attempt: %d", first.Items[0].Attempt)
+	}
+	if first.Items[0].UnitKey == "" {
+		t.Fatal("unit_key required")
+	}
+	if first.Items[0].LeaseUntilUnixMs <= 0 {
+		t.Fatal("lease_until required")
+	}
+
+	blocked, err := k.ClaimReady(&ClaimRequest{RunId: "batch", MaxItems: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocked.Items) != 0 {
+		t.Fatal("at capacity")
+	}
+
+	out := mustPut(t, k, ArtifactWithTrait("demo.Out", []byte("1")))
+	if _, err := k.Commit(&Derivation{
+		RunId: "batch", WorkId: first.Items[0].Id, NodeId: first.Items[0].NodeId,
+		Outputs: []*NamedArtifact{{Name: "out", Artifact: out}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := k.ClaimReady(&ClaimRequest{RunId: "batch", MaxItems: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Items) != 1 {
+		t.Fatalf("expected second claim, got %d", len(second.Items))
+	}
+}
+
+func TestFailWorkRetriesThenTerminals(t *testing.T) {
+	k := NewMemoryKernel()
+	k.Register(&ModuleManifest{
+		Name: "flaky", Version: "1",
+		Provides: []*Capability{{
+			Name: "flaky.run",
+			Outputs: []*Port{{Name: "out", Traits: []string{"demo.Out"}}},
+		}},
+	})
+	if _, err := k.StartRun(&RunRequest{
+		Id: "fail",
+		Assembly: &Assembly{
+			Id:       "fail@1",
+			Nodes:    []*AssemblyNode{{Id: "n", Module: "flaky", ModuleVersion: "1", Capability: "flaky.run"}},
+			Terminal: &NodeOutput{Node: "n", Port: "out"},
+		},
+		Limits: &Limits{MaxSteps: 10, MaxAttempts: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	w1 := claimOne(t, k, "fail", "flaky")
+	if w1.Attempt != 1 {
+		t.Fatalf("attempt: %d", w1.Attempt)
+	}
+	if _, err := k.FailWork(&FailWorkRequest{RunId: "fail", WorkId: w1.Id, Reason: "boom", Terminal: false}); err != nil {
+		t.Fatal(err)
+	}
+
+	w2 := claimOne(t, k, "fail", "flaky")
+	if w2.Attempt != 2 {
+		t.Fatalf("attempt: %d", w2.Attempt)
+	}
+	if w2.Id != w1.Id {
+		t.Fatalf("reclaim must reuse work id: %s vs %s", w2.Id, w1.Id)
+	}
+	stalled, err := k.FailWork(&FailWorkRequest{RunId: "fail", WorkId: w2.Id, Reason: "boom again", Terminal: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// attempts exhausted → DONE; no READY/CLAIMED → STALLED under FIRST_TERMINAL.
+	if stalled.State != RunStateStalled {
+		t.Fatalf("want STALLED, got %v", stalled.State)
+	}
+	if _, err := k.ClaimReady(&ClaimRequest{RunId: "fail", Module: "flaky"}); err == nil {
+		t.Fatal("stalled run must reject claim")
+	} else {
+		var closed *RunClosedError
+		if !errors.As(err, &closed) || closed.State != RunStateStalled {
+			t.Fatalf("want RunClosed STALLED, got %v", err)
+		}
+	}
+}
+
+func TestLeaseExpiryReturnsUnitToReady(t *testing.T) {
+	k := NewMemoryKernel()
+	k.Register(&ModuleManifest{
+		Name: "slow", Version: "1",
+		Provides: []*Capability{{
+			Name: "slow.run",
+			Outputs: []*Port{{Name: "out", Traits: []string{"demo.Out"}}},
+		}},
+	})
+	if _, err := k.StartRun(&RunRequest{
+		Id: "lease",
+		Assembly: &Assembly{
+			Id:       "lease@1",
+			Nodes:    []*AssemblyNode{{Id: "n", Module: "slow", ModuleVersion: "1", Capability: "slow.run"}},
+			Terminal: &NodeOutput{Node: "n", Port: "out"},
+		},
+		Limits: &Limits{MaxSteps: 10, DefaultLeaseMs: 1, MaxAttempts: 3},
+		Policy: &ExecutionPolicy{Closure: ClosureOpen},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	w1 := claimOne(t, k, "lease", "slow")
+	if w1.Id == "" {
+		t.Fatal("expected claim")
+	}
+	if claimOne(t, k, "lease", "slow").Id != "" {
+		t.Fatal("second claim while leased → empty")
+	}
+	time.Sleep(5 * time.Millisecond)
+	w2 := claimOne(t, k, "lease", "slow")
+	if w2.Id == "" {
+		t.Fatal("reclaimed after lease expiry")
+	}
+	if w2.Attempt != 2 {
+		t.Fatalf("attempt after reclaim: %d", w2.Attempt)
+	}
+
+	if _, err := k.Heartbeat(&HeartbeatRequest{
+		RunId: "lease", WorkIds: []string{w2.Id}, ExtendLeaseMs: 60_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if claimOne(t, k, "lease", "slow").Id != "" {
+		t.Fatal("still leased after heartbeat")
+	}
+}
+
+func TestConcurrentClaimantsDoNotDoubleClaim(t *testing.T) {
+	k := NewMemoryKernel()
+	k.Register(&ModuleManifest{
+		Name: "solo", Version: "1",
+		Provides: []*Capability{{
+			Name: "solo.run",
+			Outputs: []*Port{{Name: "out", Traits: []string{"demo.Out"}}},
+		}},
+	})
+	if _, err := k.StartRun(&RunRequest{
+		Id: "race",
+		Assembly: &Assembly{
+			Id:       "race@1",
+			Nodes:    []*AssemblyNode{{Id: "n", Module: "solo", ModuleVersion: "1", Capability: "solo.run"}},
+			Terminal: &NodeOutput{Node: "n", Port: "out"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 8
+	results := make(chan int, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			resp, err := k.ClaimReady(&ClaimRequest{RunId: "race", Module: "solo", MaxItems: 1})
+			if err != nil {
+				results <- 0
+				return
+			}
+			results <- len(resp.Items)
+		}()
+	}
+	got := 0
+	for i := 0; i < n; i++ {
+		got += <-results
+	}
+	if got != 1 {
+		t.Fatalf("exactly one claimant wins, got %d", got)
+	}
+}

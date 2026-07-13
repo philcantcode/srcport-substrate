@@ -32,6 +32,7 @@ from .memo import (
 )
 from .plugin import ModulePlugin, PortBody, StepContext, StepOutput
 from .policy import (
+    DEFAULT_CONCURRENCY,
     DriveAfter,
     DrivePlan,
     FiringPlan,
@@ -82,6 +83,7 @@ __all__ = [
     "CONTRACT_STEP_INIT",
     "CONTRACT_STEP_PROGRESS",
     "CONTRACT_STEP_SKIPPED",
+    "DEFAULT_CONCURRENCY",
     "DriveAfter",
     "DrivePlan",
     "FiringPlan",

@@ -64,11 +64,11 @@ type ModulePlugin interface {
 // BasePlugin provides no-op defaults for optional ModulePlugin methods.
 type BasePlugin struct{}
 
-func (BasePlugin) ModuleDigest() string                                      { return "" }
-func (BasePlugin) OnInit(*StepContext) *Presentation                         { return nil }
-func (BasePlugin) OnFinal(*StepContext, *StepResult) *Presentation           { return nil }
-func (BasePlugin) StorageSchema() *TableSchema                               { return nil }
-func (BasePlugin) OnStore(*StepContext, *StepResult) *StoreWrite             { return nil }
+func (BasePlugin) ModuleDigest() string                            { return "" }
+func (BasePlugin) OnInit(*StepContext) *Presentation               { return nil }
+func (BasePlugin) OnFinal(*StepContext, *StepResult) *Presentation { return nil }
+func (BasePlugin) StorageSchema() *TableSchema                     { return nil }
+func (BasePlugin) OnStore(*StepContext, *StepResult) *StoreWrite   { return nil }
 
 // UiPersist controls whether presentations are PutArtifact'd onto the kernel.
 type UiPersist int
@@ -86,7 +86,8 @@ type Kernel interface {
 	GetArtifact(ref *substrate.ArtifactRef, ctx ...*substrate.RequestContext) (*substrate.Artifact, error)
 	StartRun(req *substrate.RunRequest, ctx ...*substrate.RequestContext) (*substrate.Run, error)
 	InjectInput(req *substrate.InjectInputRequest, ctx ...*substrate.RequestContext) (*substrate.Run, error)
-	ClaimReady(req *substrate.ClaimRequest, ctx ...*substrate.RequestContext) (*substrate.WorkItem, error)
+	ClaimReady(req *substrate.ClaimRequest, ctx ...*substrate.RequestContext) (*substrate.ClaimResponse, error)
+	FailWork(req *substrate.FailWorkRequest, ctx ...*substrate.RequestContext) (*substrate.Run, error)
 	Commit(submitted *substrate.Derivation, ctx ...*substrate.RequestContext) (*substrate.Run, error)
 	GetRun(ref *substrate.RunRef, ctx ...*substrate.RequestContext) (*substrate.Run, error)
 	CancelRun(ref *substrate.RunRef, ctx ...*substrate.RequestContext) (*substrate.Run, error)

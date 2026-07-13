@@ -10,6 +10,7 @@ from srcport_substrate import (
     Artifact,
     ClaimRequest,
     Derivation,
+    FailWorkRequest,
     InjectInputRequest,
     KernelApi,
     ModuleManifest,
@@ -40,7 +41,7 @@ from .memo import (
     record_to_named_outputs,
 )
 from .plugin import ModulePlugin, StepContext
-from .policy import DriveAfter, DrivePlan, FrameworkPolicy, NodePlan, RunMode
+from .policy import DEFAULT_CONCURRENCY, DriveAfter, DrivePlan, FrameworkPolicy, NodePlan, RunMode
 from .presentation import (
     Presentation,
     PresentationStatus,
@@ -159,6 +160,10 @@ class Host:
             storage=policy.storage,
             memo=policy.memo,
             manual_closure=policy.manual_closure,
+            concurrency=policy.concurrency,
+            claim_batch=policy.claim_batch,
+            lease_ms=policy.lease_ms,
+            max_attempts=policy.max_attempts,
         )
         req = kernel_policy.apply_to_run_request(
             RunRequest(id=run_id, assembly=cut.assembly, inputs=inputs)
@@ -250,42 +255,74 @@ class Host:
             run = self.get_run(run_id)
             if run.state != RunState.RUN_STATE_RUNNING:
                 return run
-            progressed = False
-            for module in self._claim_module_names(run_id):
-                run = self.get_run(run_id)
-                if run.state != RunState.RUN_STATE_RUNNING:
-                    return run
-                if self.try_step(run_id, module):
-                    progressed = True
-            if not progressed:
+            if not self._drive_claim_wave(run_id, one_pass=False):
                 return self.get_run(run_id)
 
     def _drive_one_pass(self, run_id: str) -> Run:
         run = self.get_run(run_id)
         if run.state != RunState.RUN_STATE_RUNNING:
             return run
-        for module in self._claim_module_names(run_id):
-            run = self.get_run(run_id)
-            if run.state != RunState.RUN_STATE_RUNNING:
-                return run
-            self.try_step(run_id, module)
+        self._drive_claim_wave(run_id, one_pass=True)
         return self.get_run(run_id)
 
-    def try_step(self, run_id: str, module: str) -> bool:
+    def _drive_claim_wave(self, run_id: str, one_pass: bool) -> bool:
+        """Batch-claim ready work then finish each unit serially."""
+        policy = self._run_policies.get(run_id)
+        if policy is not None:
+            conc = policy.effective_concurrency()
+            claim_batch = policy.effective_claim_batch()
+            batch = claim_batch if one_pass else min(claim_batch, conc)
+        else:
+            batch = DEFAULT_CONCURRENCY
+
+        req = ClaimRequest(run_id=run_id, max_items=batch)
+        if policy is not None and policy.claim_modules is not None:
+            mods = list(policy.claim_modules)
+        else:
+            mods = self._claim_module_names(run_id)
+        if len(mods) == 1:
+            req.module = mods[0]
+        elif mods:
+            req.modules[:] = mods
+
         try:
-            work = self._kernel.claim_ready(
-                ClaimRequest(run_id=run_id, module=module), self._ctx
+            resp = self._kernel.claim_ready(req, self._ctx)
+        except Exception as e:  # noqa: BLE001
+            raise kernel_err(e) from e
+        if not resp.items:
+            return False
+        for work in resp.items:
+            self._finish_work_unit(run_id, work)
+        return True
+
+    def try_step(self, run_id: str, module: str) -> bool:
+        """Claim one unit for *module* and finish it.
+
+        On domain execute failure, emits Final (if any), calls kernel
+        ``FailWork(terminal=False)``, and raises step_failed.
+        """
+        try:
+            resp = self._kernel.claim_ready(
+                ClaimRequest(run_id=run_id, module=module, max_items=1), self._ctx
             )
         except Exception as e:  # noqa: BLE001
             raise kernel_err(e) from e
+        if not resp.items:
+            return False
+        work = resp.items[0]
         if not work.id:
             return False
+        self._finish_work_unit(run_id, work)
+        return True
 
+    def _finish_work_unit(self, run_id: str, work: WorkItem) -> None:
+        module = work.module
         step = self._load_step(run_id, work)
         hit = self._try_memo_hit(run_id, module, work)
         if hit is not None:
             key, named, source_run = hit
-            return self._commit_memo_hit(run_id, module, work, step, key, named, source_run)
+            self._commit_memo_hit(run_id, module, work, step, key, named, source_run)
+            return
 
         plugin = self._plugins.get(module)
         if plugin is None:
@@ -322,6 +359,18 @@ class Host:
             try:
                 self._apply_step_storage(run_id, module, step, sr)
             except FrameworkError:
+                pass
+            try:
+                self._kernel.fail_work(
+                    FailWorkRequest(
+                        run_id=run_id,
+                        work_id=work.id,
+                        reason=msg,
+                        terminal=False,
+                    ),
+                    self._ctx,
+                )
+            except Exception:
                 pass
             raise step_failed(msg)
 
@@ -364,7 +413,6 @@ class Host:
 
         self._store_memo_after_success(run_id, module, work, named)
         self._apply_step_storage(run_id, module, step, sr)
-        return True
 
     def _try_memo_hit(
         self, run_id: str, module: str, work: WorkItem

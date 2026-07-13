@@ -30,6 +30,7 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     BlobRef,
     Capability,
     ClaimRequest,
+    ClaimResponse,
     Closure,
     Contract,
     Derivation,
@@ -38,10 +39,13 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     ErrorCode,
     Event,
     ExecutionPolicy,
+    FailWorkRequest,
     Firing,
     GetBlobRequest,
     HasBlobRequest,
     HasBlobResponse,
+    HeartbeatRequest,
+    HeartbeatResponse,
     InjectInputRequest,
     LedgerEntry,
     Lifecycle,
@@ -65,6 +69,7 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     Subscription,
     TransitionAck,
     TransitionRequest,
+    WorkFailure,
     WorkItem,
 )
 
@@ -75,6 +80,10 @@ _SEP = b"\x00"
 # Default hard max for a single Trait.body when ArtifactStorePolicy.max_inline_bytes
 # is 0 at construction. Larger payloads must put_blob + ObjectRef.
 MAX_INLINE_ARTIFACT_BYTES = 1 << 20  # 1 MiB
+
+# Defaults when Limits.default_lease_ms / max_attempts are 0 at StartRun.
+DEFAULT_LEASE_MS = 60_000
+DEFAULT_MAX_ATTEMPTS = 3
 
 
 def normalize_store_policy(policy: ArtifactStorePolicy | None = None) -> ArtifactStorePolicy:

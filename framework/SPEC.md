@@ -178,6 +178,8 @@ the escape hatch** (`RunMode::Manual`, `Host::start_run`).
 | **`manual(closure)`** | Escape hatch | caller closure | defaults; override with builders |
 
 Builders: `with_firing`, `with_nodes`, `with_drive`, `with_max_steps`,
+`with_concurrency` / `with_claim_batch` / `with_lease_ms` / `with_max_attempts`
+(leased parallel drive; maps into kernel `Limits`),
 `with_claim_modules` (soft host claim allow-list), `with_storage(StoragePlan)`,
 `with_memo(MemoPlan)`.
 
@@ -303,6 +305,7 @@ under PerRun it truncates the whole (already run-scoped) table.
 | `2.0.0` (+storage) | Optional `StoragePlan` (Off / PerRun / Shared + step_log); `storage_schema` / `on_store`; `MemoryStorage` |
 | **`2.1.0`** | **Cut/seed** (`start_after` / `from_node` / `resume_after`, `__seed/…` inputs, `StepStage::Skipped`) and **memo** (`MemoPlan` / `MemoryMemo`, `module_digest`, `memoized()`, `StepStage::Cached`, cascade invalidation). Substrate unchanged at v2.0.0. |
 | **`2.2.0`** | **Multi-language SDKs** under `framework/sdk/{rust,go,python}` (path move from `framework/rust/`). Go and Python host + `ModulePlugin` parity with Rust (policy, cut/seed, memo, storage, presentation). CI covers all three. |
+| **`2.3.0`** | **Leased concurrency**: `with_concurrency` / claim batch / lease / max_attempts map to kernel `Limits`; host batch-claims and may parallel-`execute`; step failure calls `FailWork`. Requires substrate leased-claim ABI. |
 
 ---
 

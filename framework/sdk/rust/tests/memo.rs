@@ -43,7 +43,7 @@ impl ModulePlugin for Extractor {
         Some((*self.digest).clone())
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         self.executes.fetch_add(1, Ordering::SeqCst);
         let q = step
             .inputs
@@ -88,7 +88,7 @@ impl ModulePlugin for Writer {
         Some((*self.digest).clone())
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         self.executes.fetch_add(1, Ordering::SeqCst);
         let mut body = b"answer:".to_vec();
         if let Some(f) = step.inputs.get("facts") {
@@ -122,7 +122,7 @@ impl ModulePlugin for NoDigestEcho {
         }
     }
 
-    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         self.executes.fetch_add(1, Ordering::SeqCst);
         let body = step
             .inputs
@@ -205,15 +205,15 @@ fn register_pair(
     extract_exec: Arc<AtomicU32>,
     write_exec: Arc<AtomicU32>,
 ) {
-    host.register_plugin(Box::new(Extractor {
+    host.register_plugin(Extractor {
         digest: extract_digest,
         executes: extract_exec,
-    }))
+    })
     .unwrap();
-    host.register_plugin(Box::new(Writer {
+    host.register_plugin(Writer {
         digest: write_digest,
         executes: write_exec,
-    }))
+    })
     .unwrap();
 }
 
@@ -397,7 +397,7 @@ fn digest_change_invalidates_node_and_cascades() {
         fn module_digest(&self) -> Option<String> {
             Some(self.digest.read().unwrap().clone())
         }
-        fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+        fn execute(&self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
             self.executes.fetch_add(1, Ordering::SeqCst);
             let q = step
                 .inputs
@@ -416,15 +416,15 @@ fn digest_change_invalidates_node_and_cascades() {
     }
 
     let mut host = Host::new(MemoryKernel::new()).with_memo(MemoryMemo::new());
-    host.register_plugin(Box::new(DynExtract {
+    host.register_plugin(DynExtract {
         digest: extract_digest.clone(),
         executes: extract_exec.clone(),
-    }))
+    })
     .unwrap();
-    host.register_plugin(Box::new(Writer {
+    host.register_plugin(Writer {
         digest: write_digest,
         executes: write_exec.clone(),
-    }))
+    })
     .unwrap();
 
     let q = put_q(&host, b"q");
@@ -507,9 +507,9 @@ fn input_change_invalidates_from_first_dirty_node() {
 fn missing_digest_never_caches() {
     let executes = Arc::new(AtomicU32::new(0));
     let mut host = Host::new(MemoryKernel::new()).with_memo(MemoryMemo::new());
-    host.register_plugin(Box::new(NoDigestEcho {
+    host.register_plugin(NoDigestEcho {
         executes: executes.clone(),
-    }))
+    })
     .unwrap();
 
     let put = |host: &Host<MemoryKernel>, b: &[u8]| {

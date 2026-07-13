@@ -21,17 +21,23 @@ from ._types import (
     BlobRef,
     Capability,
     ClaimRequest,
+    ClaimResponse,
     Closure,
     Contract,
+    DEFAULT_LEASE_MS,
+    DEFAULT_MAX_ATTEMPTS,
     Derivation,
     DerivationList,
     Error,
     ErrorCode,
     Event,
+    FailWorkRequest,
     Firing,
     GetBlobRequest,
     HasBlobRequest,
     HasBlobResponse,
+    HeartbeatRequest,
+    HeartbeatResponse,
     InjectInputRequest,
     LedgerEntry,
     Lifecycle,
@@ -51,6 +57,7 @@ from ._types import (
     Subscription,
     TransitionAck,
     TransitionRequest,
+    WorkFailure,
     WorkItem,
     _ledger_hash,
     artifact_id_of,
@@ -260,7 +267,13 @@ class KernelApi(Protocol):
     ) -> Run: ...
     def claim_ready(
         self, req: ClaimRequest, ctx: RequestContext | None = None
-    ) -> WorkItem: ...
+    ) -> ClaimResponse: ...
+    def heartbeat(
+        self, req: HeartbeatRequest, ctx: RequestContext | None = None
+    ) -> HeartbeatResponse: ...
+    def fail_work(
+        self, req: FailWorkRequest, ctx: RequestContext | None = None
+    ) -> Run: ...
     def commit(
         self, submitted: Derivation, ctx: RequestContext | None = None
     ) -> Run: ...
@@ -683,10 +696,18 @@ class MemoryKernel:
                 raise Invalid("assembly is required")
             assembly = _materialize_assembly(req.assembly, list(req.include_nodes))
             self._validate_assembly(assembly, req.inputs)
-            max_steps = req.limits.max_steps if req.HasField("limits") else 0
+            limits = req.limits if req.HasField("limits") else None
+            max_steps = limits.max_steps if limits is not None else 0
             max_steps = max_steps or len(assembly.nodes)
             if not max_steps:
                 raise Invalid("max_steps must be positive")
+            max_in_flight = limits.max_in_flight if limits is not None else 0
+            default_lease_ms = (
+                limits.default_lease_ms if limits is not None else 0
+            ) or DEFAULT_LEASE_MS
+            max_attempts = (
+                limits.max_attempts if limits is not None else 0
+            ) or DEFAULT_MAX_ATTEMPTS
             run = Run(
                 id=req.id,
                 assembly=assembly,
@@ -699,11 +720,16 @@ class MemoryKernel:
             epochs = {item.name: 0 for item in req.inputs}
             self._runs[run.id] = {
                 "run": run,
+                # work_id -> {work, unit_key, lease_until_ms, attempt}
                 "claimed": {},
                 "latest": {},
                 "done_units": set(),
+                "claim_attempts": {},
                 "input_epochs": epochs,
                 "node_commits": {},
+                "max_in_flight": max_in_flight,
+                "default_lease_ms": default_lease_ms,
+                "max_attempts": max_attempts,
             }
             self._append_locked("run.started", run.id, _canonical(run))
             out = copy.deepcopy(run)
@@ -750,8 +776,15 @@ class MemoryKernel:
             )
             return copy.deepcopy(run)
 
-    def claim_ready(self, req: ClaimRequest, ctx: RequestContext | None = None) -> WorkItem:
-        """Atomically claim one ready work unit for a module, or return empty."""
+    def claim_ready(
+        self, req: ClaimRequest, ctx: RequestContext | None = None
+    ) -> ClaimResponse:
+        """Atomically claim up to ``max_items`` ready work units under leases.
+
+        Empty ``items`` means nothing was claimable (not ready, filtered out, or
+        at ``max_in_flight``). Under default closure, if the graph has neither
+        READY nor CLAIMED work after reaping, the run closes as STALLED.
+        """
         _check_deadline(ctx)
         with self._lock:
             slot = self._runs.get(req.run_id)
@@ -760,54 +793,212 @@ class MemoryKernel:
             run = slot["run"]
             if run.state != RunState.RUN_STATE_RUNNING:
                 raise RunClosed(run.state)
-            selected = None
-            selected_inputs = None
-            unit_key = None
-            any_ready = False
-            for node in run.assembly.nodes:
-                inputs = self._resolve_inputs(slot, node)
-                if inputs is None:
-                    continue
-                try:
-                    cap = self._capability_for(
-                        node.module, node.module_version, node.capability
+            now = _now_unix_ms()
+            self._reap_expired_locked(req.run_id, now)
+
+            slot = self._runs[req.run_id]
+            max_items = 1 if req.max_items == 0 else int(req.max_items)
+            capacity = _in_flight_capacity(slot)
+            want = min(max_items, capacity)
+            items: list[WorkItem] = []
+
+            if want > 0:
+                ready_candidates = []
+                for node in run.assembly.nodes:
+                    if not _node_matches_claim_filter(req, node):
+                        continue
+                    inputs = self._resolve_inputs(slot, node)
+                    if inputs is None:
+                        continue
+                    try:
+                        cap = self._capability_for(
+                            node.module, node.module_version, node.capability
+                        )
+                    except Invalid:
+                        continue
+                    firing = _effective_firing(slot, node, cap)
+                    unit_key = _work_unit_key(slot, node, cap, firing, inputs)
+                    if unit_key is None or unit_key in slot["done_units"]:
+                        continue
+                    if _unit_is_claimed(slot, unit_key):
+                        continue
+                    ready_candidates.append((node, inputs, unit_key))
+
+                claimed_now: list[WorkItem] = []
+                for node, inputs, unit_key in ready_candidates[:want]:
+                    attempt = slot["claim_attempts"].get(unit_key, 0) + 1
+                    slot["claim_attempts"][unit_key] = attempt
+                    # ONCE keeps the v1.0 work id shape so known-answer ledger
+                    # fixtures stay stable; multi-fire modes embed the unit key.
+                    if unit_key.startswith("once:"):
+                        work_id = f"work:{req.run_id}/{node.id}"
+                    else:
+                        work_id = f"work:{req.run_id}/{unit_key}"
+                    lease_until = now + int(slot["default_lease_ms"])
+                    work = WorkItem(
+                        id=work_id,
+                        run_id=req.run_id,
+                        node_id=node.id,
+                        module=node.module,
+                        module_version=node.module_version,
+                        capability=node.capability,
+                        inputs=inputs,
+                        unit_key=unit_key,
+                        attempt=attempt,
+                        lease_until_unix_ms=lease_until,
                     )
-                except Invalid:
-                    continue
-                firing = _effective_firing(slot, node, cap)
-                key = _work_unit_key(slot, node, cap, firing, inputs)
-                if key is None or key in slot["done_units"]:
-                    continue
-                any_ready = True
-                if selected is None and node.module == req.module:
-                    selected, selected_inputs, unit_key = node, inputs, key
-            if selected is not None and unit_key is not None:
-                if unit_key.startswith("once:"):
-                    work_id = f"work:{req.run_id}/{selected.id}"
-                else:
-                    work_id = f"work:{req.run_id}/{unit_key}"
-                work = WorkItem(
-                    id=work_id,
-                    run_id=req.run_id,
-                    node_id=selected.id,
-                    module=selected.module,
-                    module_version=selected.module_version,
-                    capability=selected.capability,
-                    inputs=selected_inputs,
-                )
-                slot["done_units"].add(unit_key)
-                slot["claimed"][work.id] = work
-                self._append_locked("work.claimed", work.id, _canonical(work))
-                return copy.deepcopy(work)
+                    slot["claimed"][work_id] = {
+                        "work": copy.deepcopy(work),
+                        "unit_key": unit_key,
+                        "lease_until_ms": lease_until,
+                        "attempt": attempt,
+                    }
+                    claimed_now.append(work)
+                for work in claimed_now:
+                    self._append_locked(
+                        "work.claimed",
+                        work.id,
+                        _canonical(_ledger_work_item(work)),
+                    )
+                items = claimed_now
+
+            slot = self._runs[req.run_id]
+            any_ready = self._assembly_any_ready(slot)
+            open_run = _is_open_closure(slot)
             if (
-                not any_ready
+                not items
+                and not any_ready
                 and not slot["claimed"]
-                and not _is_open_closure(slot)
+                and not open_run
             ):
+                run = slot["run"]
                 run.state = RunState.RUN_STATE_STALLED
                 run.reason = "no node is ready and no work is in flight"
                 self._append_locked("run.stalled", run.id, _canonical(run))
-            return WorkItem()
+            return ClaimResponse(items=copy.deepcopy(items))
+
+    def heartbeat(
+        self, req: HeartbeatRequest, ctx: RequestContext | None = None
+    ) -> HeartbeatResponse:
+        """Extend leases on in-flight work. Expired or unknown ids appear in
+        ``lost_work_ids``.
+        """
+        _check_deadline(ctx)
+        with self._lock:
+            slot = self._runs.get(req.run_id)
+            if slot is None:
+                raise NotFound(req.run_id)
+            run = slot["run"]
+            if run.state != RunState.RUN_STATE_RUNNING:
+                raise RunClosed(run.state)
+            now = _now_unix_ms()
+            self._reap_expired_locked(req.run_id, now)
+            slot = self._runs[req.run_id]
+            extend = (
+                slot["default_lease_ms"]
+                if req.extend_lease_ms == 0
+                else req.extend_lease_ms
+            )
+            until = now + int(extend)
+            renewed: list[str] = []
+            lost: list[str] = []
+            for work_id in req.work_ids:
+                claimed = slot["claimed"].get(work_id)
+                if claimed is None:
+                    lost.append(work_id)
+                else:
+                    claimed["lease_until_ms"] = until
+                    claimed["work"].lease_until_unix_ms = until
+                    renewed.append(work_id)
+            return HeartbeatResponse(
+                renewed_work_ids=renewed, lost_work_ids=lost
+            )
+
+    def fail_work(
+        self, req: FailWorkRequest, ctx: RequestContext | None = None
+    ) -> Run:
+        """Fail a claimed unit without a derivation.
+
+        ``terminal`` or exhausted attempts → DONE; otherwise the unit returns
+        to READY.
+        """
+        _check_deadline(ctx)
+        with self._lock:
+            slot = self._runs.get(req.run_id)
+            if slot is None:
+                raise NotFound(req.run_id)
+            run = slot["run"]
+            if run.state != RunState.RUN_STATE_RUNNING:
+                raise RunClosed(run.state)
+            now = _now_unix_ms()
+            self._reap_expired_locked(req.run_id, now)
+            slot = self._runs[req.run_id]
+            claimed = slot["claimed"].pop(req.work_id, None)
+            if claimed is None:
+                raise Conflict("work was not claimed")
+            max_attempts = slot["max_attempts"]
+            terminal = req.terminal or claimed["attempt"] >= max_attempts
+            reason = req.reason if req.reason else "failed"
+            failure = WorkFailure(
+                run_id=req.run_id,
+                work_id=req.work_id,
+                unit_key=claimed["unit_key"],
+                reason=reason,
+                terminal=terminal,
+                attempt=claimed["attempt"],
+            )
+            if terminal:
+                slot["done_units"].add(claimed["unit_key"])
+            self._append_locked(
+                "work.failed", req.work_id, _canonical(failure)
+            )
+
+            # Stall check when nothing left in flight.
+            open_run = _is_open_closure(slot)
+            if not open_run and not slot["claimed"]:
+                if not self._assembly_any_ready(slot):
+                    run.state = RunState.RUN_STATE_STALLED
+                    run.reason = "no node is ready and no work is in flight"
+                    self._append_locked(
+                        "run.stalled", run.id, _canonical(run)
+                    )
+                    return copy.deepcopy(run)
+            return copy.deepcopy(run)
+
+    def _reap_expired_locked(self, run_id: str, now: int) -> None:
+        """Reap expired leases for one run. Caller holds the lock."""
+        slot = self._runs.get(run_id)
+        if slot is None:
+            return
+        max_attempts = slot["max_attempts"]
+        expired = [
+            (work_id, claimed)
+            for work_id, claimed in list(slot["claimed"].items())
+            if claimed["lease_until_ms"] > 0
+            and claimed["lease_until_ms"] <= now
+        ]
+        ledger_events: list[tuple[str, str, bytes]] = []
+        for work_id, claimed in expired:
+            del slot["claimed"][work_id]
+            ledger_item = _ledger_work_item(claimed["work"])
+            ledger_events.append(
+                ("work.expired", work_id, _canonical(ledger_item))
+            )
+            if claimed["attempt"] >= max_attempts:
+                slot["done_units"].add(claimed["unit_key"])
+                failure = WorkFailure(
+                    run_id=run_id,
+                    work_id=work_id,
+                    unit_key=claimed["unit_key"],
+                    reason="lease expired; max_attempts exhausted",
+                    terminal=True,
+                    attempt=claimed["attempt"],
+                )
+                ledger_events.append(
+                    ("work.failed", work_id, _canonical(failure))
+                )
+        for kind, subject, detail in ledger_events:
+            self._append_locked(kind, subject, detail)
 
     def commit(self, submitted: Derivation, ctx: RequestContext | None = None) -> Run:
         """Commit one claimed transformation and release its downstream work.
@@ -825,9 +1016,12 @@ class MemoryKernel:
             run = slot["run"]
             if run.state != RunState.RUN_STATE_RUNNING:
                 raise RunClosed(run.state)
-            work = slot["claimed"].get(submitted.work_id)
-            if work is None:
+            self._reap_expired_locked(submitted.run_id, _now_unix_ms())
+            slot = self._runs[submitted.run_id]
+            claimed = slot["claimed"].get(submitted.work_id)
+            if claimed is None:
                 raise Conflict("work was not claimed")
+            work = claimed["work"]
             if submitted.node_id and submitted.node_id != work.node_id:
                 raise Invalid("node_id does not match the claim")
             cap = self._capability_for(
@@ -846,6 +1040,7 @@ class MemoryKernel:
             )
             derivation.id = _derivation_id(derivation)
             del slot["claimed"][work.id]
+            slot["done_units"].add(claimed["unit_key"])
             slot["latest"][work.node_id] = derivation
             slot["node_commits"][work.node_id] = (
                 slot["node_commits"].get(work.node_id, 0) + 1
@@ -1086,8 +1281,11 @@ class MemoryKernel:
                 continue
             firing = _effective_firing(slot, node, cap)
             key = _work_unit_key(slot, node, cap, firing, inputs)
-            if key is not None and key not in slot["done_units"]:
-                return True
+            if key is None or key in slot["done_units"]:
+                continue
+            if _unit_is_claimed(slot, key):
+                continue
+            return True
         return False
 
     def _validate_outputs(self, cap, outputs) -> None:
@@ -1143,6 +1341,39 @@ class MemoryKernel:
                 return None
             resolved.append(NamedArtifact(name=binding.to_port, artifact=ref))
         return resolved
+
+
+
+def _now_unix_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _ledger_work_item(work: WorkItem) -> WorkItem:
+    """Ledger-stable WorkItem: wall-clock lease zeroed so chain hashes cross-verify."""
+    w = copy.deepcopy(work)
+    w.lease_until_unix_ms = 0
+    return w
+
+
+def _in_flight_capacity(slot) -> int:
+    if slot["max_in_flight"] == 0:
+        return 2**63  # unbounded
+    used = len(slot["claimed"])
+    return max(0, int(slot["max_in_flight"]) - used)
+
+
+def _unit_is_claimed(slot, unit_key: str) -> bool:
+    return any(c["unit_key"] == unit_key for c in slot["claimed"].values())
+
+
+def _node_matches_claim_filter(req: ClaimRequest, node: AssemblyNode) -> bool:
+    if req.module and node.module != req.module:
+        return False
+    if req.modules and node.module not in req.modules:
+        return False
+    if req.node_ids and node.id not in req.node_ids:
+        return False
+    return True
 
 
 def _materialize_assembly(assembly: Assembly, include: list[str]) -> Assembly:
