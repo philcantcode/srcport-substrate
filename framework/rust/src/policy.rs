@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use srcport_substrate::{Assembly, Closure, ExecutionPolicy, Firing, Limits, RunRequest};
 
+use crate::storage::StoragePlan;
+
 /// Product-facing run mode. Maps to kernel [`Closure`] (and default firing for some presets).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunMode {
@@ -81,7 +83,7 @@ pub enum DriveAfter {
 /// Opinionated framework policy for one pipeline run.
 ///
 /// Compiles to kernel `ExecutionPolicy`, `include_nodes`, and `Limits`. Host-only
-/// fields (`drive`, `claim_modules`) never enter the kernel.
+/// fields (`drive`, `claim_modules`, `storage`) never enter the kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameworkPolicy {
     /// Named product mode.
@@ -97,6 +99,8 @@ pub struct FrameworkPolicy {
     /// Soft allow-list of **module names** the host will claim.
     /// `None` = all registered plugins. Does not remove nodes from the assembly.
     pub claim_modules: Option<Vec<String>>,
+    /// Optional tabular storage phase (module tables + optional step log).
+    pub storage: StoragePlan,
 }
 
 impl Default for FrameworkPolicy {
@@ -115,6 +119,7 @@ impl FrameworkPolicy {
             max_steps: None,
             drive: DrivePlan::UntilIdle,
             claim_modules: None,
+            storage: StoragePlan::off(),
         }
     }
 
@@ -127,6 +132,7 @@ impl FrameworkPolicy {
             max_steps: None,
             drive: DrivePlan::UntilIdleThenWait,
             claim_modules: None,
+            storage: StoragePlan::off(),
         }
     }
 
@@ -139,6 +145,7 @@ impl FrameworkPolicy {
             max_steps: None,
             drive: DrivePlan::UntilIdleThenWait,
             claim_modules: None,
+            storage: StoragePlan::off(),
         }
     }
 
@@ -151,6 +158,7 @@ impl FrameworkPolicy {
             max_steps: None,
             drive: DrivePlan::UntilIdle,
             claim_modules: None,
+            storage: StoragePlan::off(),
         }
     }
 
@@ -163,6 +171,7 @@ impl FrameworkPolicy {
             max_steps: None,
             drive: DrivePlan::UntilIdle,
             claim_modules: None,
+            storage: StoragePlan::off(),
         }
     }
 
@@ -196,6 +205,14 @@ impl FrameworkPolicy {
         modules: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.claim_modules = Some(modules.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Optional tabular storage phase ([`StoragePlan`]).
+    ///
+    /// Requires a [`crate::StorageBackend`] on the host (`Host::with_storage`).
+    pub fn with_storage(mut self, storage: StoragePlan) -> Self {
+        self.storage = storage;
         self
     }
 

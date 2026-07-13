@@ -1,22 +1,24 @@
 //! # srcport-framework — Rust host + module plugins (v0.1.0)
 //!
 //! Opinionated application layer on [`srcport_substrate`]. The kernel never
-//! loads plugins or calls presentation hooks — only a [`Host`] does.
+//! loads plugins or calls presentation / storage hooks — only a [`Host`] does.
 //!
 //! ```text
-//! start_pipeline(policy)
-//! Host::drive → ClaimReady → on_init → execute (emit_progress*) → on_final → Put/Commit
-//!                  │              │              │                    │
-//!                  └──────── KernelApi ──────────┴── presentation side-channel ──┘
+//! start_pipeline(policy)  → ensure storage tables (if StoragePlan)
+//! Host::drive → ClaimReady → on_init → execute → on_final → Put/Commit → on_store
+//!                  │              │         │         │                    │
+//!                  └──────── KernelApi ─────┴── presentation ──┘    storage side-channel
 //! ```
 //!
 //! **Modes** ([`FrameworkPolicy`]): converge / stream / stream_dedupe / selective.  
-//! **Step lifecycle**: Init → Progress\* → Final ([`Presentation`], [`StepEvent`]).
+//! **Step lifecycle**: Init → Progress\* → Final ([`Presentation`], [`StepEvent`]).  
+//! **Storage** (optional): [`StoragePlan`] + module [`TableSchema`] / [`StoreWrite`].
 
 #![deny(missing_docs)]
 
 mod policy;
 mod presentation;
+mod storage;
 
 pub use policy::{
     DriveAfter, DrivePlan, FiringPlan, FrameworkPolicy, NodePlan, RunMode,
@@ -25,6 +27,11 @@ pub use presentation::{
     Presentation, PresentationStatus, ProcessingStatus, ProcessingView, ResultStatus, ResultView,
     StepEvent, StepResult, StepStage, UiEvent, CONTRACT_PROCESSING_VIEW, CONTRACT_RESULT_VIEW,
     CONTRACT_STEP_FINAL, CONTRACT_STEP_INIT, CONTRACT_STEP_PROGRESS,
+};
+pub use storage::{
+    store_row, ColumnDef, ColumnType, MemoryStorage, QualifiedTable, StorageBackend, StorageMode,
+    StoragePlan, StorageRetention, StoreRow, StoreValue, StoreWrite, TableSchema, WriteMode,
+    STEP_LOG_TABLE,
 };
 
 use std::collections::HashMap;
@@ -129,9 +136,10 @@ impl From<KernelError> for FrameworkError {
 
 /// Domain module as a host-side plugin.
 ///
-/// Presentation hooks are optional. Modules must not import each other; couple
-/// only through contract refs and assemblies. Never return real UI toolkits —
-/// only [`Presentation`] data.
+/// Presentation and storage hooks are optional. Modules must not import each
+/// other; couple only through contract refs and assemblies. Never return real
+/// UI toolkits — only [`Presentation`] data. Storage writes are tabular data
+/// only — the host owns the backend.
 pub trait ModulePlugin: Send {
     /// Manifest passed to `Register`.
     fn manifest(&self) -> ModuleManifest;
@@ -158,6 +166,23 @@ pub trait ModulePlugin: Send {
         } else {
             None
         }
+    }
+
+    /// Optional table schema when policy enables module storage.
+    ///
+    /// Called at [`Host::register_plugin`]. Return `None` to skip tables even
+    /// when the run uses [`StorageMode::PerRun`] / [`StorageMode::Shared`].
+    fn storage_schema(&self) -> Option<TableSchema> {
+        None
+    }
+
+    /// Optional rows to write after a step (success or failure).
+    ///
+    /// Invoked by the host when the run's [`StoragePlan`] enables module tables.
+    /// The module chooses append / upsert / replace via [`StoreWrite::mode`].
+    /// Framework injects `_run_id`, `_work_id`, `_node_id`, `_module` when missing.
+    fn on_store(&self, _step: &StepContext, _result: &StepResult) -> Option<StoreWrite> {
+        None
     }
 
     /// Legacy hook — prefer [`ModulePlugin::on_init`].
@@ -189,8 +214,14 @@ pub struct Host<K: KernelApi> {
     ctx: RequestContext,
     ui_persist: UiPersist,
     step_events: Vec<StepEvent>,
-    /// Policy frozen at [`Host::start_pipeline`] (drive / claim filters).
+    /// Policy frozen at [`Host::start_pipeline`] (drive / claim filters / storage).
     run_policies: HashMap<String, FrameworkPolicy>,
+    /// Optional tabular backend (required when any run uses storage).
+    storage: Option<Box<dyn StorageBackend>>,
+    /// Schemas captured at [`Host::register_plugin`] (module → schema).
+    storage_schemas: HashMap<String, TableSchema>,
+    /// Physical tables created for a run (for PerRun cleanup).
+    run_tables: HashMap<String, Vec<String>>,
 }
 
 impl<K: KernelApi> Host<K> {
@@ -206,6 +237,9 @@ impl<K: KernelApi> Host<K> {
             ui_persist: UiPersist::LocalOnly,
             step_events: Vec::new(),
             run_policies: HashMap::new(),
+            storage: None,
+            storage_schemas: HashMap::new(),
+            run_tables: HashMap::new(),
         }
     }
 
@@ -221,9 +255,25 @@ impl<K: KernelApi> Host<K> {
         self
     }
 
+    /// Attach a tabular storage backend for [`StoragePlan`]-enabled runs.
+    pub fn with_storage(mut self, backend: impl StorageBackend + 'static) -> Self {
+        self.storage = Some(Box::new(backend));
+        self
+    }
+
     /// Borrow the underlying kernel.
     pub fn kernel(&self) -> &K {
         &self.kernel
+    }
+
+    /// Borrow the storage backend, if configured.
+    pub fn storage(&self) -> Option<&(dyn StorageBackend + 'static)> {
+        self.storage.as_deref()
+    }
+
+    /// Mutable storage backend (e.g. for tests inspecting rows).
+    pub fn storage_mut(&mut self) -> Option<&mut (dyn StorageBackend + 'static)> {
+        self.storage.as_deref_mut()
     }
 
     /// Policy frozen for a run started via [`Host::start_pipeline`], if any.
@@ -252,6 +302,9 @@ impl<K: KernelApi> Host<K> {
     }
 
     /// Register a plugin: `Register` on the kernel and store it for claims.
+    ///
+    /// Also asks [`ModulePlugin::storage_schema`] and remembers it for later
+    /// `ensure_table` when a run enables module storage.
     pub fn register_plugin(
         &mut self,
         plugin: Box<dyn ModulePlugin>,
@@ -269,12 +322,23 @@ impl<K: KernelApi> Host<K> {
             )));
         }
         let name = manifest.name.clone();
+        if let Some(schema) = plugin.storage_schema() {
+            if schema.name.is_empty() {
+                return Err(FrameworkError::Invalid(format!(
+                    "plugin {name} storage_schema.name must be non-empty"
+                )));
+            }
+            self.storage_schemas.insert(name.clone(), schema);
+        }
         self.kernel.register(manifest, &self.ctx);
         self.plugins.insert(name, plugin);
         Ok(())
     }
 
     /// Start a pipeline with an opinionated [`FrameworkPolicy`].
+    ///
+    /// When `policy.storage` is enabled, ensures module tables (and optional
+    /// step log) on the host storage backend.
     pub fn start_pipeline(
         &mut self,
         run_id: impl Into<String>,
@@ -299,6 +363,13 @@ impl<K: KernelApi> Host<K> {
             )));
         }
 
+        if policy.storage.enabled() && self.storage.is_none() {
+            return Err(FrameworkError::Invalid(
+                "StoragePlan enabled but host has no StorageBackend (use Host::with_storage)"
+                    .into(),
+            ));
+        }
+
         let req = policy.apply_to_run_request(RunRequest {
             id: run_id.clone(),
             assembly: Some(assembly),
@@ -306,6 +377,7 @@ impl<K: KernelApi> Host<K> {
             ..Default::default()
         });
         let run = self.kernel.start_run(req, &self.ctx)?;
+        self.ensure_run_storage(&run_id, &policy)?;
         self.run_policies.insert(run_id, policy);
         Ok(run)
     }
@@ -346,7 +418,7 @@ impl<K: KernelApi> Host<K> {
         }
     }
 
-    /// Cancel a run. Drops stored framework policy for the id.
+    /// Cancel a run. Drops stored framework policy and per-run tables when retention says so.
     pub fn cancel(&mut self, run_id: &str) -> Result<Run, FrameworkError> {
         let run = self.kernel.cancel_run(
             &RunRef {
@@ -354,7 +426,7 @@ impl<K: KernelApi> Host<K> {
             },
             &self.ctx,
         )?;
-        self.run_policies.remove(run_id);
+        self.finish_run_storage(run_id);
         Ok(run)
     }
 
@@ -374,10 +446,16 @@ impl<K: KernelApi> Host<K> {
             DrivePlan::UntilIdleThenWait => DrivePlan::UntilIdle,
             other => other,
         };
-        match plan {
+        let result = match plan {
             DrivePlan::OnePass => self.drive_one_pass(run_id),
             DrivePlan::UntilIdle | DrivePlan::UntilIdleThenWait => self.drive_until_idle(run_id),
+        };
+        if let Ok(ref run) = result {
+            if run.state() != RunState::Running {
+                self.finish_run_storage(run_id);
+            }
         }
+        result
     }
 
     fn claim_module_names(&self, run_id: &str) -> Vec<String> {
@@ -527,13 +605,17 @@ impl<K: KernelApi> Host<K> {
                 self.kernel.commit(
                     Derivation {
                         run_id: run_id.into(),
-                        work_id: work.id,
-                        node_id: work.node_id,
+                        work_id: work.id.clone(),
+                        node_id: work.node_id.clone(),
                         outputs: named_outputs,
                         ..Default::default()
                     },
                     &self.ctx,
                 )?;
+
+                // ── Storage (after successful commit) ─────────────────────
+                self.apply_step_storage(run_id, module, &step, &step_result)?;
+
                 Ok(true)
             }
             Err(e) => {
@@ -558,6 +640,8 @@ impl<K: KernelApi> Host<K> {
                     p.fill_identity(run_id, &work);
                     let _ = self.emit_presentation(module, p);
                 }
+                // Best-effort storage / step_log on failure (no commit).
+                let _ = self.apply_step_storage(run_id, module, &step, &step_result);
                 // Do not commit; work unit may remain claimed depending on kernel —
                 // MemoryKernel leaves claimed work; product may cancel run.
                 Err(FrameworkError::StepFailed(msg))
@@ -619,6 +703,176 @@ impl<K: KernelApi> Host<K> {
             &self.ctx,
         )?;
         Ok(r.id)
+    }
+
+    // ── Storage helpers ───────────────────────────────────────────────────
+
+    fn ensure_run_storage(
+        &mut self,
+        run_id: &str,
+        policy: &FrameworkPolicy,
+    ) -> Result<(), FrameworkError> {
+        if !policy.storage.enabled() {
+            return Ok(());
+        }
+        if self.storage.is_none() {
+            return Err(FrameworkError::Invalid(
+                "storage enabled without backend".into(),
+            ));
+        }
+
+        let mut physical = Vec::new();
+        let mut to_ensure: Vec<storage::QualifiedTable> = Vec::new();
+
+        if policy.storage.module_tables() {
+            let mode = policy.storage.mode;
+            for (module, schema) in &self.storage_schemas {
+                to_ensure.push(storage::qualify_table(mode, run_id, module, schema));
+            }
+        }
+
+        if policy.storage.step_log {
+            to_ensure.push(storage::step_log_qualified(policy.storage.mode, run_id));
+        }
+
+        let backend = self.storage.as_mut().expect("checked above");
+        for q in &to_ensure {
+            backend.ensure_table(q)?;
+            physical.push(q.physical_name.clone());
+        }
+
+        if !physical.is_empty() {
+            self.run_tables.insert(run_id.into(), physical);
+        }
+        Ok(())
+    }
+
+    fn apply_step_storage(
+        &mut self,
+        run_id: &str,
+        module: &str,
+        step: &StepContext,
+        result: &StepResult,
+    ) -> Result<(), FrameworkError> {
+        let Some(policy) = self.run_policies.get(run_id).cloned() else {
+            return Ok(());
+        };
+        if !policy.storage.enabled() {
+            return Ok(());
+        }
+
+        if policy.storage.module_tables() {
+            if let Some(schema) = self.storage_schemas.get(module).cloned() {
+                let write = {
+                    let plugin = self
+                        .plugins
+                        .get(module)
+                        .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
+                    plugin.on_store(step, result)
+                };
+                if let Some(write) = write {
+                    if !write.rows.is_empty() {
+                        let mode = write.mode.unwrap_or(schema.write_mode);
+                        let q = storage::qualify_table(
+                            policy.storage.mode,
+                            run_id,
+                            module,
+                            &schema,
+                        );
+                        let mut rows = write.rows;
+                        for row in &mut rows {
+                            storage::inject_identity(
+                                row,
+                                run_id,
+                                &step.work.id,
+                                &step.work.node_id,
+                                module,
+                            );
+                        }
+                        let backend = self.storage.as_mut().ok_or_else(|| {
+                            FrameworkError::Invalid("storage missing at write".into())
+                        })?;
+                        backend.write_rows(
+                            &q.physical_name,
+                            mode,
+                            &rows,
+                            &schema.primary_key,
+                            run_id,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        if policy.storage.step_log {
+            let q = storage::step_log_qualified(policy.storage.mode, run_id);
+            let ports: Vec<String> = result.outputs.iter().map(|o| o.name.clone()).collect();
+            let ports_json = serde_json::to_value(&ports).unwrap_or(serde_json::Value::Null);
+            let mut row = StoreRow::new();
+            row.insert("run_id".into(), StoreValue::Text(run_id.into()));
+            row.insert(
+                "work_id".into(),
+                StoreValue::Text(step.work.id.clone()),
+            );
+            row.insert(
+                "node_id".into(),
+                StoreValue::Text(step.work.node_id.clone()),
+            );
+            row.insert("module".into(), StoreValue::Text(module.into()));
+            row.insert(
+                "capability".into(),
+                StoreValue::Text(step.work.capability.clone()),
+            );
+            row.insert("ok".into(), StoreValue::Boolean(result.ok));
+            if let Some(err) = &result.error {
+                row.insert("error".into(), StoreValue::Text(err.clone()));
+            }
+            row.insert("output_ports".into(), StoreValue::Json(ports_json));
+
+            let backend = self.storage.as_mut().ok_or_else(|| {
+                FrameworkError::Invalid("storage missing at step_log write".into())
+            })?;
+            // ensure in case only step_log (already ensured at start, but Shared is fine)
+            backend.ensure_table(&q)?;
+            backend.write_rows(
+                &q.physical_name,
+                WriteMode::Append,
+                &[row],
+                &[],
+                run_id,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Drop PerRun tables when retention is DropOnEnd; always forget run policy.
+    fn finish_run_storage(&mut self, run_id: &str) {
+        let retention = self
+            .run_policies
+            .get(run_id)
+            .map(|p| p.storage.retention)
+            .unwrap_or(StorageRetention::Keep);
+        let mode = self
+            .run_policies
+            .get(run_id)
+            .map(|p| p.storage.mode)
+            .unwrap_or(StorageMode::Off);
+
+        if retention == StorageRetention::DropOnEnd
+            && mode == StorageMode::PerRun
+        {
+            if let Some(tables) = self.run_tables.remove(run_id) {
+                if let Some(backend) = self.storage.as_mut() {
+                    for t in tables {
+                        let _ = backend.drop_table(&t);
+                    }
+                }
+            }
+        } else {
+            self.run_tables.remove(run_id);
+        }
+        self.run_policies.remove(run_id);
     }
 }
 

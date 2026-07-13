@@ -39,11 +39,12 @@ cargo test --manifest-path framework/rust/Cargo.toml
 
 ```rust
 use srcport_framework::{
-    DriveAfter, FrameworkPolicy, Host, ModulePlugin, PortBody, Presentation,
-    StepContext, StepOutput, StepResult,
+    DriveAfter, FrameworkPolicy, Host, MemoryStorage, ModulePlugin, PortBody,
+    Presentation, StepContext, StepOutput, StepResult, StoragePlan,
 };
 
 // ModulePlugin: execute(&mut step); optional on_init / on_final;
+// optional storage_schema / on_store when policy enables storage
 // step.emit_progress(Presentation::progress("…", Some(0.5)));
 
 // host.start_pipeline(id, assembly, inputs, FrameworkPolicy::converge())?;
@@ -53,6 +54,10 @@ use srcport_framework::{
 // stream:
 // host.start_pipeline(id, assembly, inputs, FrameworkPolicy::stream())?;
 // host.inject(id, named_input, DriveAfter::UntilIdle)?;
+
+// storage (optional):
+// let mut host = Host::new(kernel).with_storage(MemoryStorage::new());
+// FrameworkPolicy::converge().with_storage(StoragePlan::per_run())
 ```
 
 | Preset | Use when |
@@ -62,7 +67,15 @@ use srcport_framework::{
 | `FrameworkPolicy::stream_dedupe()` | Stream but once per key |
 | `FrameworkPolicy::selective(nodes)` | Only some assembly nodes |
 
-See `framework/rust/tests/` (`host_drive`, `modes`).
+| Storage | Use when |
+|---------|----------|
+| `StoragePlan::off()` | Default — no framework tables |
+| `StoragePlan::per_run()` | Isolated tables per run (drop on end) |
+| `StoragePlan::per_run_keep()` | Per-run tables kept after complete |
+| `StoragePlan::shared()` | Durable module tables across runs |
+| `StoragePlan::step_log_only()` | Framework step audit only |
+
+See `framework/rust/tests/` (`host_drive`, `modes`, `lifecycle`, `storage`).
 
 ## Layout
 
@@ -76,7 +89,7 @@ framework/
 
 ## Status
 
-**`v0.1.0`** — scaffolding. Manual assemblies, Rust host, optional processing /
-result UI as JSON artifacts. Auto-composer not yet implemented.
+**`v0.1.0`** — manual assemblies, Rust host, step presentation lifecycle,
+optional `StoragePlan` + `MemoryStorage`. Auto-composer not yet implemented.
 
 Minimum substrate: **v1.1.0**.
