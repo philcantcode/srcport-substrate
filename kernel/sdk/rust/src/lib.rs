@@ -60,6 +60,8 @@ pub enum KernelError {
     FailedPrecondition(String),
     /// Stored blob bytes do not match the claimed digest or byte_count.
     BlobIntegrity(String),
+    /// A store size limit or bounded buffer was hit ([`ErrorCode::ResourceExhausted`]).
+    ResourceExhausted(String),
 }
 
 impl std::fmt::Display for KernelError {
@@ -71,6 +73,7 @@ impl std::fmt::Display for KernelError {
             KernelError::RunClosed(state) => write!(f, "run is closed: {state:?}"),
             KernelError::FailedPrecondition(reason) => write!(f, "failed precondition: {reason}"),
             KernelError::BlobIntegrity(reason) => write!(f, "blob integrity: {reason}"),
+            KernelError::ResourceExhausted(reason) => write!(f, "resource exhausted: {reason}"),
         }
     }
 }
@@ -90,12 +93,12 @@ impl KernelError {
                 ErrorCode::FailedPrecondition
             }
             KernelError::BlobIntegrity(_) => ErrorCode::BlobIntegrity,
+            KernelError::ResourceExhausted(_) => ErrorCode::ResourceExhausted,
         }
     }
 
-    /// Whether re-issuing the identical call may later succeed. None of the
-    /// current conditions clear on retry alone; a bounded-buffer backpressure
-    /// (`RESOURCE_EXHAUSTED`, wire-only) would be the retryable case.
+    /// Whether re-issuing the identical call may later succeed. Size-limit
+    /// rejections do not clear on retry alone; wire backpressure may.
     pub fn retryable(&self) -> bool {
         false
     }
@@ -133,11 +136,45 @@ pub type Result<T> = std::result::Result<T, KernelError>;
 
 const SEP: u8 = 0x00;
 
-/// Advisory ceiling for a single [`Trait::body`]. Larger payloads should
-/// `put_blob` and place a verified [`ObjectRef`] on the trait. The kernel does
-/// not hard-reject oversized inline bodies; production modules SHOULD honour
-/// this.
+/// Default hard max for a single [`Trait::body`] when
+/// [`ArtifactStorePolicy::max_inline_bytes`] is `0` at construction.
+/// Larger payloads must `put_blob` and place a verified [`ObjectRef`].
 pub const MAX_INLINE_ARTIFACT_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Normalise an [`ArtifactStorePolicy`]: fill defaults and reject unsupported
+/// ingest modes. Call once at `KernelApi` construction; store the result frozen.
+///
+/// Defaults: `max_inline_bytes = 1 MiB` when zero; `max_blob_bytes` stays `0`
+/// (unlimited); `ingest_mode = COPY_VERIFY`; `durability = EPHEMERAL`.
+pub fn normalize_store_policy(mut policy: ArtifactStorePolicy) -> Result<ArtifactStorePolicy> {
+    if policy.max_inline_bytes == 0 {
+        policy.max_inline_bytes = MAX_INLINE_ARTIFACT_BYTES as u64;
+    }
+    // Only COPY_VERIFY is defined in v2; any unknown wire value is INVALID.
+    let mode = BlobIngestMode::try_from(policy.ingest_mode).unwrap_or(BlobIngestMode::Unspecified);
+    if matches!(
+        mode,
+        BlobIngestMode::Unspecified | BlobIngestMode::CopyVerify
+    ) {
+        policy.ingest_mode = BlobIngestMode::CopyVerify as i32;
+    } else {
+        return Err(KernelError::Invalid(format!(
+            "unsupported BlobIngestMode: {mode:?} (only COPY_VERIFY in v2)"
+        )));
+    }
+    match StoreDurability::try_from(policy.durability).unwrap_or(StoreDurability::Unspecified) {
+        StoreDurability::Unspecified => {
+            policy.durability = StoreDurability::Ephemeral as i32;
+        }
+        StoreDurability::Ephemeral | StoreDurability::Durable => {}
+    }
+    Ok(policy)
+}
+
+/// Default normalised store policy for [`MemoryKernel`] (`EPHEMERAL`, 1 MiB inline).
+pub fn default_store_policy() -> ArtifactStorePolicy {
+    normalize_store_policy(ArtifactStorePolicy::default()).expect("default policy is valid")
+}
 
 /// Bound on a single subscriber's undelivered-event backlog. The event bus is
 /// notification, not the data plane (artifact refs are), and the ledger is the
@@ -511,8 +548,12 @@ struct State {
 /// an `Arc` across module threads. Every meaningful action lands one
 /// append-only ledger entry. Durability lives in Modules (or other
 /// [`KernelApi`] implementations), not in this type.
+///
+/// [`ArtifactStorePolicy`] is frozen at construction (`EPHEMERAL` durability
+/// for this backend). Physical layout is this process's memory map.
 pub struct MemoryKernel {
     state: Mutex<State>,
+    store_policy: ArtifactStorePolicy,
 }
 
 impl Default for MemoryKernel {
@@ -522,10 +563,25 @@ impl Default for MemoryKernel {
 }
 
 impl MemoryKernel {
+    /// Empty kernel with the default [`ArtifactStorePolicy`] (1 MiB inline max,
+    /// unlimited blobs, `COPY_VERIFY`, `EPHEMERAL`).
     pub fn new() -> Self {
-        MemoryKernel {
+        Self::with_store_policy(ArtifactStorePolicy::default())
+            .expect("default ArtifactStorePolicy is valid")
+    }
+
+    /// Construct with an explicit store policy (normalised and frozen).
+    pub fn with_store_policy(policy: ArtifactStorePolicy) -> Result<Self> {
+        let store_policy = normalize_store_policy(policy)?;
+        Ok(MemoryKernel {
             state: Mutex::new(State::default()),
-        }
+            store_policy,
+        })
+    }
+
+    /// The frozen, normalised [`ArtifactStorePolicy`] for this instance.
+    pub fn store_policy(&self) -> &ArtifactStorePolicy {
+        &self.store_policy
     }
 
     // ── ledger helper: the ONLY way entries are ever created ───────────────
@@ -664,7 +720,7 @@ impl MemoryKernel {
         ctx: &RequestContext,
     ) -> Result<ArtifactRef> {
         check_deadline(ctx)?;
-        validate_artifact_content(&artifact)?;
+        validate_artifact_content(&artifact, &self.store_policy)?;
         let mut state = self.state.lock().unwrap();
         if let Some(IdempotentResult::ArtifactRef(r)) = idempotent_get(&state, "put_artifact", ctx) {
             return Ok(r);
@@ -717,9 +773,17 @@ impl MemoryKernel {
             .ok_or_else(|| KernelError::NotFound(r#ref.id.clone()))
     }
 
-    /// `rpc PutBlob(PutBlobRequest) -> BlobRef`. Content-addresses raw bytes
-    /// under `(namespace, digest)`. First write wins.
-    pub fn put_blob(&self, req: PutBlobRequest) -> BlobRef {
+    /// `rpc PutBlob(PutBlobRequest) -> BlobRef`. **Copies** raw bytes into the
+    /// blob store under `(namespace, digest)`. First write wins. Enforces
+    /// [`ArtifactStorePolicy::max_blob_bytes`].
+    pub fn put_blob(&self, req: PutBlobRequest) -> Result<BlobRef> {
+        enforce_blob_size(&self.store_policy, req.data.len())?;
+        // Only COPY_VERIFY is supported; normalised at construction.
+        if self.store_policy.ingest_mode != BlobIngestMode::CopyVerify as i32 {
+            return Err(KernelError::Invalid(
+                "unsupported BlobIngestMode (only COPY_VERIFY)".into(),
+            ));
+        }
         let digest = blob_id(&req.data);
         let r#ref = BlobRef {
             digest: digest.clone(),
@@ -737,7 +801,7 @@ impl MemoryKernel {
             });
             Self::append_locked(&mut state, "blob.put", &digest, detail);
         }
-        r#ref
+        Ok(r#ref)
     }
 
     /// `rpc GetBlob(GetBlobRequest) -> BlobData`. Returns verified blob bytes.
@@ -789,7 +853,7 @@ impl MemoryKernel {
         let blob = self.put_blob(PutBlobRequest {
             namespace: namespace.into(),
             data: data.to_vec(),
-        });
+        })?;
         let mut traits = BTreeMap::new();
         traits.insert(
             contract.into(),
@@ -922,13 +986,15 @@ impl MemoryKernel {
     // ── 6. REGISTRY ────────────────────────────────────────────────────────
 
     /// `rpc Snapshot(SnapshotRequest) -> RegistrySnapshot`. "What exists right
-    /// now": every registered module, capability, and contract.
+    /// now": every registered module, capability, contract, and the frozen
+    /// store policy.
     pub fn snapshot(&self) -> RegistrySnapshot {
         let state = self.state.lock().unwrap();
         RegistrySnapshot {
             modules: state.modules.iter().map(|m| m.manifest.clone()).collect(),
             capabilities: state.capabilities.clone(),
             contracts: state.contracts.values().cloned().collect(),
+            store_policy: Some(self.store_policy.clone()),
         }
     }
 
@@ -1356,7 +1422,7 @@ pub trait KernelApi {
     fn transition(&self, req: TransitionRequest, ctx: &RequestContext) -> Result<TransitionAck>;
     fn put_artifact(&self, artifact: Artifact, ctx: &RequestContext) -> Result<ArtifactRef>;
     fn get_artifact(&self, r#ref: &ArtifactRef, ctx: &RequestContext) -> Result<Artifact>;
-    fn put_blob(&self, req: PutBlobRequest, ctx: &RequestContext) -> BlobRef;
+    fn put_blob(&self, req: PutBlobRequest, ctx: &RequestContext) -> Result<BlobRef>;
     fn get_blob(&self, req: GetBlobRequest, ctx: &RequestContext) -> Result<BlobData>;
     fn has_blob(&self, req: HasBlobRequest, ctx: &RequestContext) -> HasBlobResponse;
     fn put_contract(&self, contract: Contract, ctx: &RequestContext) -> Result<Contract>;
@@ -1386,7 +1452,7 @@ impl KernelApi for MemoryKernel {
         check_deadline(ctx)?;
         MemoryKernel::get_artifact(self, r#ref)
     }
-    fn put_blob(&self, req: PutBlobRequest, _ctx: &RequestContext) -> BlobRef {
+    fn put_blob(&self, req: PutBlobRequest, _ctx: &RequestContext) -> Result<BlobRef> {
         MemoryKernel::put_blob(self, req)
     }
     fn get_blob(&self, req: GetBlobRequest, ctx: &RequestContext) -> Result<BlobData> {
@@ -1479,12 +1545,23 @@ fn is_sha256_digest(d: &str) -> bool {
         .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn validate_artifact_content(artifact: &Artifact) -> Result<()> {
+fn enforce_blob_size(policy: &ArtifactStorePolicy, len: usize) -> Result<()> {
+    let max = policy.max_blob_bytes;
+    if max > 0 && (len as u64) > max {
+        return Err(KernelError::ResourceExhausted(format!(
+            "blob size {len} exceeds max_blob_bytes {max}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_artifact_content(artifact: &Artifact, policy: &ArtifactStorePolicy) -> Result<()> {
     if artifact.traits.is_empty() {
         return Err(KernelError::Invalid(
             "artifact must have at least one trait".into(),
         ));
     }
+    let max_inline = policy.max_inline_bytes;
     for (contract, tr) in &artifact.traits {
         if contract.is_empty() {
             return Err(KernelError::Invalid(
@@ -1496,6 +1573,12 @@ fn validate_artifact_content(artifact: &Artifact) -> Result<()> {
         if has_obj && has_body {
             return Err(KernelError::Invalid(format!(
                 "trait {contract} must not set both body and object"
+            )));
+        }
+        if has_body && (tr.body.len() as u64) > max_inline {
+            return Err(KernelError::ResourceExhausted(format!(
+                "trait {contract}: body size {} exceeds max_inline_bytes {max_inline}",
+                tr.body.len()
             )));
         }
         if let Some(obj) = tr.object.as_ref() {

@@ -536,7 +536,10 @@ func TestBlobStoreIsContentAddressedAndImmutable(t *testing.T) {
 	k := NewMemoryKernel()
 	data := []byte("pcap-or-apk-bytes-go-here")
 
-	a := k.PutBlob(&PutBlobRequest{Namespace: "evidence", Data: data})
+	a, err := k.PutBlob(&PutBlobRequest{Namespace: "evidence", Data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Digest != BlobID(data) {
 		t.Fatalf("blob digest must be pure content id: %s", a.Digest)
 	}
@@ -545,7 +548,10 @@ func TestBlobStoreIsContentAddressedAndImmutable(t *testing.T) {
 	}
 
 	// First write wins: a later put of the same content is a no-op.
-	b := k.PutBlob(&PutBlobRequest{Namespace: "evidence", Data: data})
+	b, err := k.PutBlob(&PutBlobRequest{Namespace: "evidence", Data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a.Digest != b.Digest {
 		t.Fatal("same bytes ⇒ same blob digest")
 	}
@@ -585,7 +591,10 @@ func TestExternalArtifactRefsLargeDataWithoutInlining(t *testing.T) {
 	// Multi-chunk "evidence" that should never sit in Artifact.body.
 	payload := bytes.Repeat([]byte("EVIDENCE-BUNDLE-"), 64*1024) // 1 MiB-ish
 
-	blob := k.PutBlob(&PutBlobRequest{Namespace: "observer", Data: payload})
+	blob, err := k.PutBlob(&PutBlobRequest{Namespace: "observer", Data: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ref, err := k.PutArtifact(func() *Artifact { a := ArtifactWithExternalTrait("observer.v1.Capture", &ObjectRef{
 			Digest:    blob.Digest,
 			ByteCount: blob.ByteCount,
@@ -655,7 +664,10 @@ func TestExternalArtifactRefsLargeDataWithoutInlining(t *testing.T) {
 func TestExternalArtifactRejectsMissingOrMismatchedBlob(t *testing.T) {
 	k := NewMemoryKernel()
 	data := []byte("small-but-external")
-	blob := k.PutBlob(&PutBlobRequest{Namespace: "ns", Data: data})
+	blob, err := k.PutBlob(&PutBlobRequest{Namespace: "ns", Data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Missing blob.
 	if _, err := k.PutArtifact(ArtifactWithExternalTrait("t", &ObjectRef{Digest: BlobID([]byte("nope")), ByteCount: 4, Namespace: "ns"})); !errors.Is(err, ErrNotFound) {
@@ -681,9 +693,15 @@ func TestExternalArtifactRejectsMissingOrMismatchedBlob(t *testing.T) {
 func TestValueIdentityIndependentOfBlobIdentity(t *testing.T) {
 	k := NewMemoryKernel()
 	data := []byte("shared-raw-bytes")
-	blob := k.PutBlob(&PutBlobRequest{Namespace: "a", Data: data})
+	blob, err := k.PutBlob(&PutBlobRequest{Namespace: "a", Data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Same bytes, different namespace ⇒ different blob slot and different ObjectRef.
-	blobB := k.PutBlob(&PutBlobRequest{Namespace: "b", Data: data})
+	blobB, err := k.PutBlob(&PutBlobRequest{Namespace: "b", Data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if blob.Digest != blobB.Digest {
 		t.Fatal("blob identity is pure content — digest must match across namespaces")
 	}
@@ -746,6 +764,61 @@ func TestTransitionIsOnTheABI(t *testing.T) {
 	}
 }
 
+func TestStorePolicyDefaultsAndSnapshot(t *testing.T) {
+	k := NewMemoryKernel()
+	p := k.StorePolicy()
+	if p.MaxInlineBytes != MaxInlineArtifactBytes {
+		t.Fatalf("default max_inline: got %d", p.MaxInlineBytes)
+	}
+	if p.MaxBlobBytes != 0 {
+		t.Fatal("default max_blob must be unlimited (0)")
+	}
+	if p.IngestMode != BlobIngestModeCopyVerify {
+		t.Fatal("default ingest is COPY_VERIFY")
+	}
+	if p.Durability != StoreDurabilityEphemeral {
+		t.Fatal("MemoryKernel durability is EPHEMERAL")
+	}
+	snap := k.Snapshot()
+	if snap.StorePolicy == nil || snap.StorePolicy.MaxInlineBytes != p.MaxInlineBytes {
+		t.Fatal("snapshot must expose store_policy")
+	}
+}
+
+func TestStorePolicyRejectsOversizedInlineBody(t *testing.T) {
+	k, err := NewMemoryKernelWithStorePolicy(&ArtifactStorePolicy{
+		MaxInlineBytes: 8,
+		IngestMode:     BlobIngestModeCopyVerify,
+		Durability:     StoreDurabilityEphemeral,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.PutArtifact(ArtifactWithTrait("t", []byte("ok-small"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.PutArtifact(ArtifactWithTrait("t", []byte("too-large!"))); !errors.Is(err, ErrResourceExhausted) {
+		t.Fatalf("want resource exhausted, got %v", err)
+	}
+}
+
+func TestStorePolicyRejectsOversizedBlob(t *testing.T) {
+	k, err := NewMemoryKernelWithStorePolicy(&ArtifactStorePolicy{
+		MaxInlineBytes: MaxInlineArtifactBytes,
+		MaxBlobBytes:   16,
+		IngestMode:     BlobIngestModeCopyVerify,
+		Durability:     StoreDurabilityEphemeral,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.PutBlob(&PutBlobRequest{Namespace: "n", Data: []byte("fifteen-bytes!")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.PutBlob(&PutBlobRequest{Namespace: "n", Data: []byte("seventeen-bytes!!!")}); !errors.Is(err, ErrResourceExhausted) {
+		t.Fatalf("want resource exhausted, got %v", err)
+	}
+}
 
 func firstTraitKey(a *Artifact) string {
 	for k := range a.Traits {

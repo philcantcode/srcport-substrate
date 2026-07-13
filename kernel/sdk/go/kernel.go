@@ -27,6 +27,10 @@ var ErrFailedPrecondition = errors.New("failed precondition")
 // digest or byte_count (verified external refs).
 var ErrBlobIntegrity = errors.New("blob integrity check failed")
 
+// ErrResourceExhausted is returned when a store size limit (or bounded buffer)
+// is hit — portable ERROR_CODE_RESOURCE_EXHAUSTED.
+var ErrResourceExhausted = errors.New("resource exhausted")
+
 // RunClosedError is returned when a terminal run accepts no more work.
 type RunClosedError struct{ State RunState }
 
@@ -52,6 +56,8 @@ func ToError(err error) *Error {
 	case errors.Is(err, ErrBlobIntegrity):
 		e.Code = ErrorCodeBlobIntegrity
 		e.FailedPrecondition = err.Error()
+	case errors.Is(err, ErrResourceExhausted):
+		e.Code = ErrorCodeResourceExhausted
 	case errors.Is(err, ErrFailedPrecondition):
 		e.Code = ErrorCodeFailedPrecondition
 		e.FailedPrecondition = err.Error()
@@ -62,6 +68,43 @@ func ToError(err error) *Error {
 		e.Code = ErrorCodeUnspecified
 	}
 	return e
+}
+
+// NormalizeStorePolicy fills defaults and rejects unsupported ingest modes.
+// Call once at KernelApi construction; store the result frozen.
+func NormalizeStorePolicy(p *ArtifactStorePolicy) (*ArtifactStorePolicy, error) {
+	if p == nil {
+		p = &ArtifactStorePolicy{}
+	} else {
+		p = clone(p)
+	}
+	if p.MaxInlineBytes == 0 {
+		p.MaxInlineBytes = MaxInlineArtifactBytes
+	}
+	switch p.IngestMode {
+	case BlobIngestModeUnspecified, BlobIngestModeCopyVerify:
+		p.IngestMode = BlobIngestModeCopyVerify
+	default:
+		return nil, fmt.Errorf("%w: unsupported BlobIngestMode %v (only COPY_VERIFY in v2)", ErrInvalid, p.IngestMode)
+	}
+	switch p.Durability {
+	case StoreDurabilityUnspecified:
+		p.Durability = StoreDurabilityEphemeral
+	case StoreDurabilityEphemeral, StoreDurabilityDurable:
+		// keep
+	default:
+		return nil, fmt.Errorf("%w: unknown StoreDurability %v", ErrInvalid, p.Durability)
+	}
+	return p, nil
+}
+
+// DefaultStorePolicy returns the normalised MemoryKernel defaults.
+func DefaultStorePolicy() *ArtifactStorePolicy {
+	p, err := NormalizeStorePolicy(&ArtifactStorePolicy{})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
 // SubscriberBuffer is the bound on a single subscriber's undelivered-event
@@ -114,6 +157,7 @@ type idempotentResult struct {
 //
 // Durability of kernel state is the job of a KernelApi backend; domain state
 // lives in Modules. MemoryKernel is one backend, not the authority.
+// ArtifactStorePolicy is frozen at construction (EPHEMERAL for this backend).
 type MemoryKernel struct {
 	mu           sync.Mutex
 	modules      []moduleSlot
@@ -127,17 +171,39 @@ type MemoryKernel struct {
 	derivations  []*Derivation
 	eventSeq     uint64
 	idempotency  map[string]idempotentResult
+	storePolicy  *ArtifactStorePolicy
 }
 
-// NewMemoryKernel returns an empty, ready in-memory kernel.
+// NewMemoryKernel returns an empty kernel with default ArtifactStorePolicy
+// (1 MiB inline max, unlimited blobs, COPY_VERIFY, EPHEMERAL).
 func NewMemoryKernel() *MemoryKernel {
+	k, err := NewMemoryKernelWithStorePolicy(&ArtifactStorePolicy{})
+	if err != nil {
+		panic(err)
+	}
+	return k
+}
+
+// NewMemoryKernelWithStorePolicy constructs a kernel with an explicit
+// (normalised, frozen) store policy.
+func NewMemoryKernelWithStorePolicy(policy *ArtifactStorePolicy) (*MemoryKernel, error) {
+	p, err := NormalizeStorePolicy(policy)
+	if err != nil {
+		return nil, err
+	}
 	return &MemoryKernel{
 		contracts:   map[string]*Contract{},
 		artifacts:   map[string]*Artifact{},
 		blobs:       map[blobKey]*blobSlot{},
 		runs:        map[string]*runSlot{},
 		idempotency: map[string]idempotentResult{},
-	}
+		storePolicy: p,
+	}, nil
+}
+
+// StorePolicy returns the frozen, normalised ArtifactStorePolicy.
+func (k *MemoryKernel) StorePolicy() *ArtifactStorePolicy {
+	return clone(k.storePolicy)
 }
 
 // KernelApi is the portable ABI: the unary RPCs of service Kernel (including
@@ -153,7 +219,7 @@ type KernelApi interface {
 	Transition(req *TransitionRequest, ctx ...*RequestContext) (*TransitionAck, error)
 	PutArtifact(a *Artifact, ctx ...*RequestContext) (*ArtifactRef, error)
 	GetArtifact(ref *ArtifactRef, ctx ...*RequestContext) (*Artifact, error)
-	PutBlob(req *PutBlobRequest, ctx ...*RequestContext) *BlobRef
+	PutBlob(req *PutBlobRequest, ctx ...*RequestContext) (*BlobRef, error)
 	GetBlob(req *GetBlobRequest, ctx ...*RequestContext) (*BlobData, error)
 	HasBlob(req *HasBlobRequest, ctx ...*RequestContext) *HasBlobResponse
 	PutContract(c *Contract, ctx ...*RequestContext) (*Contract, error)
@@ -311,7 +377,7 @@ func (k *MemoryKernel) PutArtifact(a *Artifact, ctx ...*RequestContext) (*Artifa
 		return nil, err
 	}
 	a = clone(a)
-	if err := validateArtifactContent(a); err != nil {
+	if err := validateArtifactContent(a, k.storePolicy); err != nil {
 		return nil, err
 	}
 	k.mu.Lock()
@@ -367,9 +433,16 @@ func (k *MemoryKernel) GetArtifact(ref *ArtifactRef, ctx ...*RequestContext) (*A
 	return clone(a), nil
 }
 
-// PutBlob content-addresses raw bytes and stores them immutably under
-// (namespace, digest). First write wins. Mirrors rpc PutBlob.
-func (k *MemoryKernel) PutBlob(req *PutBlobRequest, ctx ...*RequestContext) *BlobRef {
+// PutBlob copies raw bytes into the blob store under (namespace, digest).
+// First write wins. Enforces ArtifactStorePolicy.max_blob_bytes.
+// Mirrors rpc PutBlob.
+func (k *MemoryKernel) PutBlob(req *PutBlobRequest, ctx ...*RequestContext) (*BlobRef, error) {
+	if err := enforceBlobSize(k.storePolicy, len(req.Data)); err != nil {
+		return nil, err
+	}
+	if k.storePolicy.IngestMode != BlobIngestModeCopyVerify {
+		return nil, fmt.Errorf("%w: unsupported BlobIngestMode (only COPY_VERIFY)", ErrInvalid)
+	}
 	data := append([]byte(nil), req.Data...)
 	digest := BlobID(data)
 	ns := req.Namespace
@@ -383,7 +456,7 @@ func (k *MemoryKernel) PutBlob(req *PutBlobRequest, ctx ...*RequestContext) *Blo
 		// Never chain raw blob data — subject is the digest; detail is BlobRef.
 		k.appendLocked("blob.put", digest, marshalCanonical(ref))
 	}
-	return clone(ref)
+	return clone(ref), nil
 }
 
 // GetBlob streams back (in-process: returns) verified blob bytes. Re-hashes on
@@ -426,7 +499,10 @@ func (k *MemoryKernel) HasBlob(req *HasBlobRequest, ctx ...*RequestContext) *Has
 // PutArtifactWithBlob puts the blob then an external artifact referencing it.
 // Convenience for the production path: large data → blob store + ObjectRef.
 func (k *MemoryKernel) PutArtifactWithBlob(contract, namespace string, data []byte, producedBy string, ctx ...*RequestContext) (*ArtifactRef, *BlobRef, error) {
-	blob := k.PutBlob(&PutBlobRequest{Namespace: namespace, Data: data})
+	blob, err := k.PutBlob(&PutBlobRequest{Namespace: namespace, Data: data})
+	if err != nil {
+		return nil, nil, err
+	}
 	a := ArtifactWithExternalTrait(contract, &ObjectRef{
 		Digest:    blob.Digest,
 		ByteCount: blob.ByteCount,
@@ -437,12 +513,23 @@ func (k *MemoryKernel) PutArtifactWithBlob(contract, namespace string, data []by
 	return ref, blob, err
 }
 
-func validateArtifactContent(a *Artifact) error {
+func enforceBlobSize(policy *ArtifactStorePolicy, n int) error {
+	if policy != nil && policy.MaxBlobBytes > 0 && uint64(n) > policy.MaxBlobBytes {
+		return fmt.Errorf("%w: blob size %d exceeds max_blob_bytes %d", ErrResourceExhausted, n, policy.MaxBlobBytes)
+	}
+	return nil
+}
+
+func validateArtifactContent(a *Artifact, policy *ArtifactStorePolicy) error {
 	if a == nil {
 		return fmt.Errorf("%w: artifact is required", ErrInvalid)
 	}
 	if len(a.Traits) == 0 {
 		return fmt.Errorf("%w: artifact must have at least one trait", ErrInvalid)
+	}
+	maxInline := uint64(MaxInlineArtifactBytes)
+	if policy != nil {
+		maxInline = policy.MaxInlineBytes
 	}
 	for contract, f := range a.Traits {
 		if contract == "" {
@@ -452,6 +539,9 @@ func validateArtifactContent(a *Artifact) error {
 		hasBody := f != nil && len(f.Body) > 0
 		if hasObj && hasBody {
 			return fmt.Errorf("%w: trait %s must not set both body and object", ErrInvalid, contract)
+		}
+		if hasBody && uint64(len(f.Body)) > maxInline {
+			return fmt.Errorf("%w: trait %s: body size %d exceeds max_inline_bytes %d", ErrResourceExhausted, contract, len(f.Body), maxInline)
 		}
 		if f != nil && f.Object != nil {
 			if f.Object.Digest == "" && (f.Object.ByteCount != 0 || f.Object.Namespace != "") {
@@ -620,13 +710,14 @@ func (k *MemoryKernel) VerifyLedger() bool {
 // ─── 6. Registry ──────────────────────────────────────────────────────────
 
 // Snapshot answers "what exists right now": every registered module,
-// capability, and contract. Mirrors rpc Snapshot.
+// capability, contract, and the frozen store policy. Mirrors rpc Snapshot.
 func (k *MemoryKernel) Snapshot(ctx ...*RequestContext) *RegistrySnapshot {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	snap := &RegistrySnapshot{
 		Modules:      make([]*ModuleManifest, 0, len(k.modules)),
 		Capabilities: make([]*Capability, 0, len(k.capabilities)),
+		StorePolicy:  clone(k.storePolicy),
 	}
 	for _, m := range k.modules {
 		snap.Modules = append(snap.Modules, clone(m.manifest))

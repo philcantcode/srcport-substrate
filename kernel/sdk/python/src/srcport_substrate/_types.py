@@ -19,12 +19,14 @@ import hashlib
 from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     AppendRequest,
     Artifact,
+    ArtifactStorePolicy,
     Trait,
     ArtifactRef,
     Assembly,
     AssemblyNode,
     Binding,
     BlobData,
+    BlobIngestMode,
     BlobRef,
     Capability,
     ClaimRequest,
@@ -59,6 +61,7 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     RunRequest,
     RunState,
     SnapshotRequest,
+    StoreDurability,
     Subscription,
     TransitionAck,
     TransitionRequest,
@@ -69,9 +72,35 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
 
 _SEP = b"\x00"
 
-# Advisory ceiling for a single Trait.body. Larger payloads should put_blob and
-# place a verified ObjectRef on the trait.
+# Default hard max for a single Trait.body when ArtifactStorePolicy.max_inline_bytes
+# is 0 at construction. Larger payloads must put_blob + ObjectRef.
 MAX_INLINE_ARTIFACT_BYTES = 1 << 20  # 1 MiB
+
+
+def normalize_store_policy(policy: ArtifactStorePolicy | None = None) -> ArtifactStorePolicy:
+    """Fill defaults and reject unsupported ingest modes. Frozen at construction."""
+    p = ArtifactStorePolicy() if policy is None else ArtifactStorePolicy()
+    if policy is not None:
+        p.CopyFrom(policy)
+    if p.max_inline_bytes == 0:
+        p.max_inline_bytes = MAX_INLINE_ARTIFACT_BYTES
+    if p.ingest_mode in (
+        BlobIngestMode.BLOB_INGEST_MODE_UNSPECIFIED,
+        BlobIngestMode.BLOB_INGEST_MODE_COPY_VERIFY,
+    ):
+        p.ingest_mode = BlobIngestMode.BLOB_INGEST_MODE_COPY_VERIFY
+    else:
+        raise ValueError(
+            f"unsupported BlobIngestMode: {p.ingest_mode} (only COPY_VERIFY in v2)"
+        )
+    if p.durability == StoreDurability.STORE_DURABILITY_UNSPECIFIED:
+        p.durability = StoreDurability.STORE_DURABILITY_EPHEMERAL
+    return p
+
+
+def default_store_policy() -> ArtifactStorePolicy:
+    """Normalised MemoryKernel defaults (EPHEMERAL, 1 MiB inline)."""
+    return normalize_store_policy(None)
 
 
 def blob_id(data: bytes) -> str:

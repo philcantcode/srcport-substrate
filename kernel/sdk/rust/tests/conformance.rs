@@ -1148,18 +1148,22 @@ fn blob_store_is_content_addressed_and_immutable() {
     let k = MemoryKernel::new();
     let data = b"pcap-or-apk-bytes-go-here".to_vec();
 
-    let a = k.put_blob(PutBlobRequest {
-        namespace: "evidence".into(),
-        data: data.clone(),
-    });
+    let a = k
+        .put_blob(PutBlobRequest {
+            namespace: "evidence".into(),
+            data: data.clone(),
+        })
+        .unwrap();
     assert_eq!(a.digest, blob_id(&data));
     assert_eq!(a.byte_count, data.len() as u64);
     assert_eq!(a.namespace, "evidence");
 
-    let b = k.put_blob(PutBlobRequest {
-        namespace: "evidence".into(),
-        data: data.clone(),
-    });
+    let b = k
+        .put_blob(PutBlobRequest {
+            namespace: "evidence".into(),
+            data: data.clone(),
+        })
+        .unwrap();
     assert_eq!(a.digest, b.digest);
 
     let got = k
@@ -1195,10 +1199,12 @@ fn external_artifact_refs_large_data_without_inlining() {
     let k = MemoryKernel::new();
     let payload = b"EVIDENCE-BUNDLE-".repeat(64 * 1024);
 
-    let blob = k.put_blob(PutBlobRequest {
-        namespace: "observer".into(),
-        data: payload.clone(),
-    });
+    let blob = k
+        .put_blob(PutBlobRequest {
+            namespace: "observer".into(),
+            data: payload.clone(),
+        })
+        .unwrap();
     let obj = ObjectRef {
         digest: blob.digest.clone(),
         byte_count: blob.byte_count,
@@ -1263,10 +1269,12 @@ fn external_artifact_refs_large_data_without_inlining() {
 fn external_artifact_rejects_missing_or_mismatched_blob() {
     let k = MemoryKernel::new();
     let data = b"small-but-external".to_vec();
-    let blob = k.put_blob(PutBlobRequest {
-        namespace: "ns".into(),
-        data: data.clone(),
-    });
+    let blob = k
+        .put_blob(PutBlobRequest {
+            namespace: "ns".into(),
+            data: data.clone(),
+        })
+        .unwrap();
 
     let missing = k.put_artifact(artifact_with_external_trait(
         "t",
@@ -1314,14 +1322,18 @@ fn external_artifact_rejects_missing_or_mismatched_blob() {
 fn value_identity_independent_of_blob_identity() {
     let k = MemoryKernel::new();
     let data = b"shared-raw-bytes".to_vec();
-    let blob_a = k.put_blob(PutBlobRequest {
-        namespace: "a".into(),
-        data: data.clone(),
-    });
-    let blob_b = k.put_blob(PutBlobRequest {
-        namespace: "b".into(),
-        data: data.clone(),
-    });
+    let blob_a = k
+        .put_blob(PutBlobRequest {
+            namespace: "a".into(),
+            data: data.clone(),
+        })
+        .unwrap();
+    let blob_b = k
+        .put_blob(PutBlobRequest {
+            namespace: "b".into(),
+            data: data.clone(),
+        })
+        .unwrap();
     assert_eq!(blob_a.digest, blob_b.digest);
 
     let art_a = k
@@ -1457,4 +1469,72 @@ fn transition_is_on_the_abi() {
     assert_eq!(ack.state, Lifecycle::Loaded as i32);
     let chain = k.ledger();
     assert!(chain.iter().any(|e| e.kind == "module.loaded"));
+}
+
+// 13. ARTIFACT STORE POLICY — frozen limits; copy-verify; snapshot exposure.
+#[test]
+fn store_policy_defaults_and_snapshot() {
+    let k = MemoryKernel::new();
+    let p = k.store_policy();
+    assert_eq!(p.max_inline_bytes, MAX_INLINE_ARTIFACT_BYTES as u64);
+    assert_eq!(p.max_blob_bytes, 0);
+    assert_eq!(p.ingest_mode, BlobIngestMode::CopyVerify as i32);
+    assert_eq!(p.durability, StoreDurability::Ephemeral as i32);
+
+    let snap = k.snapshot();
+    let sp = snap.store_policy.expect("snapshot carries store_policy");
+    assert_eq!(sp.max_inline_bytes, p.max_inline_bytes);
+    assert_eq!(sp.durability, StoreDurability::Ephemeral as i32);
+}
+
+#[test]
+fn store_policy_rejects_oversized_inline_body() {
+    let k = MemoryKernel::with_store_policy(ArtifactStorePolicy {
+        max_inline_bytes: 8,
+        max_blob_bytes: 0,
+        ingest_mode: BlobIngestMode::CopyVerify as i32,
+        durability: StoreDurability::Ephemeral as i32,
+    })
+    .unwrap();
+
+    assert!(matches!(
+        k.put_artifact(artifact_with_trait("t", b"ok-small".to_vec())),
+        Ok(_)
+    ));
+    let err = k
+        .put_artifact(artifact_with_trait("t", b"too-large!".to_vec()))
+        .unwrap_err();
+    assert!(matches!(err, KernelError::ResourceExhausted(_)));
+    assert_eq!(err.code(), ErrorCode::ResourceExhausted);
+}
+
+#[test]
+fn store_policy_rejects_oversized_blob() {
+    let k = MemoryKernel::with_store_policy(ArtifactStorePolicy {
+        max_inline_bytes: MAX_INLINE_ARTIFACT_BYTES as u64,
+        max_blob_bytes: 16,
+        ingest_mode: BlobIngestMode::CopyVerify as i32,
+        durability: StoreDurability::Ephemeral as i32,
+    })
+    .unwrap();
+
+    k.put_blob(PutBlobRequest {
+        namespace: "n".into(),
+        data: b"sixteen-bytes!!".to_vec(), // 15
+    })
+    .unwrap();
+    let err = k
+        .put_blob(PutBlobRequest {
+            namespace: "n".into(),
+            data: b"seventeen-bytes!!!".to_vec(), // 18
+        })
+        .unwrap_err();
+    assert!(matches!(err, KernelError::ResourceExhausted(_)));
+}
+
+#[test]
+fn store_policy_zero_inline_normalises_to_default() {
+    let p = normalize_store_policy(ArtifactStorePolicy::default()).unwrap();
+    assert_eq!(p.max_inline_bytes, MAX_INLINE_ARTIFACT_BYTES as u64);
+    assert_eq!(p.ingest_mode, BlobIngestMode::CopyVerify as i32);
 }

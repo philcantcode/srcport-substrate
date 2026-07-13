@@ -13,9 +13,11 @@ from ._types import (
     AppendRequest,
     Artifact,
     ArtifactRef,
+    ArtifactStorePolicy,
     Assembly,
     AssemblyNode,
     BlobData,
+    BlobIngestMode,
     BlobRef,
     Capability,
     ClaimRequest,
@@ -55,6 +57,7 @@ from ._types import (
     artifact_with_external_trait,
     blob_id,
     contract_digest,
+    normalize_store_policy,
     trait_has_external,
     trait_set_covers,
     has_traits,
@@ -156,6 +159,13 @@ class BlobIntegrity(KernelError):
         return e
 
 
+class ResourceExhausted(KernelError):
+    """A store size limit or bounded buffer was hit."""
+
+    def code(self) -> ErrorCode:
+        return ErrorCode.ERROR_CODE_RESOURCE_EXHAUSTED
+
+
 def _check_deadline(ctx: RequestContext | None) -> None:
     if ctx is None or not ctx.deadline_unix_ms:
         return
@@ -223,7 +233,7 @@ class KernelApi(Protocol):
     ) -> Artifact: ...
     def put_blob(
         self, req: PutBlobRequest, ctx: RequestContext | None = None
-    ) -> BlobRef: ...
+    ) -> BlobRef: ...  # may raise ResourceExhausted
     def get_blob(
         self, req: GetBlobRequest, ctx: RequestContext | None = None
     ) -> BlobData: ...
@@ -273,9 +283,14 @@ class MemoryKernel:
 
     Kernel-state durability is a :class:`KernelApi` backend concern; domain
     state lives in Modules. This type is one backend, not the authority.
+    :class:`ArtifactStorePolicy` is frozen at construction (EPHEMERAL here).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store_policy: ArtifactStorePolicy | None = None) -> None:
+        try:
+            self._store_policy = normalize_store_policy(store_policy)
+        except ValueError as e:
+            raise Invalid(str(e)) from e
         self._lock = threading.RLock()
         self._modules: list[list] = []  # [manifest, lifecycle] pairs
         self._capabilities: list = []
@@ -290,6 +305,11 @@ class MemoryKernel:
         self._event_seq = 0
         # op\\0caller\\0request_key -> ArtifactRef | Run
         self._idempotency: dict[str, object] = {}
+
+    @property
+    def store_policy(self) -> ArtifactStorePolicy:
+        """Frozen, normalised ArtifactStorePolicy for this instance."""
+        return copy.deepcopy(self._store_policy)
 
     # ── ledger helper: the ONLY path that creates entries. Caller holds lock.
     def _append_locked(
@@ -387,7 +407,7 @@ class MemoryKernel:
         At least one trait is required. Honour deadline and request_key.
         """
         _check_deadline(ctx)
-        self._validate_artifact_content(artifact)
+        self._validate_artifact_content(artifact, self._store_policy)
         with self._lock:
             key = _idempotency_key("put_artifact", ctx)
             if key is not None and key in self._idempotency:
@@ -421,8 +441,18 @@ class MemoryKernel:
             return copy.deepcopy(a)
 
     def put_blob(self, req: PutBlobRequest, ctx: RequestContext | None = None) -> BlobRef:
-        """rpc PutBlob. Content-addresses raw bytes under (namespace, digest)."""
+        """rpc PutBlob. Copies raw bytes into the blob store under (namespace, digest)."""
         data = bytes(req.data)
+        max_blob = self._store_policy.max_blob_bytes
+        if max_blob > 0 and len(data) > max_blob:
+            raise ResourceExhausted(
+                f"blob size {len(data)} exceeds max_blob_bytes {max_blob}"
+            )
+        if (
+            self._store_policy.ingest_mode
+            != BlobIngestMode.BLOB_INGEST_MODE_COPY_VERIFY
+        ):
+            raise Invalid("unsupported BlobIngestMode (only COPY_VERIFY)")
         digest = blob_id(data)
         ns = req.namespace
         ref = BlobRef(digest=digest, byte_count=len(data), namespace=ns)
@@ -482,9 +512,12 @@ class MemoryKernel:
         return ref, blob
 
     @staticmethod
-    def _validate_artifact_content(artifact: Artifact) -> None:
+    def _validate_artifact_content(
+        artifact: Artifact, policy: ArtifactStorePolicy
+    ) -> None:
         if not artifact.traits:
             raise Invalid("artifact must have at least one trait")
+        max_inline = policy.max_inline_bytes
         for contract, trait in artifact.traits.items():
             if not contract:
                 raise Invalid("trait contract ref must be non-empty")
@@ -493,6 +526,11 @@ class MemoryKernel:
             if has_obj and has_body:
                 raise Invalid(
                     f"trait {contract} must not set both body and object"
+                )
+            if has_body and len(trait.body) > max_inline:
+                raise ResourceExhausted(
+                    f"trait {contract}: body size {len(trait.body)} "
+                    f"exceeds max_inline_bytes {max_inline}"
                 )
             obj = trait.object
             if obj.digest == "" and (obj.byte_count != 0 or obj.namespace != ""):
@@ -616,12 +654,13 @@ class MemoryKernel:
     # ── 6. Registry ────────────────────────────────────────────────────────
 
     def snapshot(self, req: SnapshotRequest | None = None, ctx: RequestContext | None = None) -> RegistrySnapshot:
-        """rpc Snapshot. "What exists right now": every module, capability, contract."""
+        """rpc Snapshot. Modules, capabilities, contracts, and frozen store policy."""
         with self._lock:
             return RegistrySnapshot(
                 modules=[copy.deepcopy(s[0]) for s in self._modules],
                 capabilities=[copy.deepcopy(c) for c in self._capabilities],
                 contracts=[copy.deepcopy(c) for c in self._contracts.values()],
+                store_policy=copy.deepcopy(self._store_policy),
             )
 
     # ── 7. Run / convergence ──────────────────────────────────────────────

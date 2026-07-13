@@ -53,28 +53,40 @@ type (
 	AssemblyNode     = pb.AssemblyNode
 	Binding          = pb.Binding
 	NodeOutput       = pb.NodeOutput
-	Limits            = pb.Limits
-	Assembly          = pb.Assembly
-	RunRequest        = pb.RunRequest
-	Run               = pb.Run
-	RunRef            = pb.RunRef
+	Limits             = pb.Limits
+	Assembly           = pb.Assembly
+	RunRequest         = pb.RunRequest
+	Run                = pb.Run
+	RunRef             = pb.RunRef
 	InjectInputRequest = pb.InjectInputRequest
-	ClaimRequest      = pb.ClaimRequest
-	WorkItem          = pb.WorkItem
-	Derivation        = pb.Derivation
-	DerivationList    = pb.DerivationList
-	ExecutionPolicy   = pb.ExecutionPolicy
-	RequestContext    = pb.RequestContext
-	Error             = pb.Error
-	ErrorCode         = pb.ErrorCode
-	SnapshotRequest   = pb.SnapshotRequest
-	TransitionRequest = pb.TransitionRequest
-	TransitionAck     = pb.TransitionAck
+	ClaimRequest       = pb.ClaimRequest
+	WorkItem           = pb.WorkItem
+	Derivation         = pb.Derivation
+	DerivationList     = pb.DerivationList
+	ExecutionPolicy    = pb.ExecutionPolicy
+	ArtifactStorePolicy = pb.ArtifactStorePolicy
+	RequestContext     = pb.RequestContext
+	Error              = pb.Error
+	ErrorCode          = pb.ErrorCode
+	SnapshotRequest    = pb.SnapshotRequest
+	TransitionRequest  = pb.TransitionRequest
+	TransitionAck      = pb.TransitionAck
 
-	Lifecycle = pb.Lifecycle
-	RunState  = pb.RunState
-	Firing    = pb.Firing
-	Closure   = pb.Closure
+	Lifecycle       = pb.Lifecycle
+	RunState        = pb.RunState
+	Firing          = pb.Firing
+	Closure         = pb.Closure
+	BlobIngestMode  = pb.BlobIngestMode
+	StoreDurability = pb.StoreDurability
+)
+
+// Blob ingest / durability enum aliases.
+const (
+	BlobIngestModeUnspecified = pb.BlobIngestMode_BLOB_INGEST_MODE_UNSPECIFIED
+	BlobIngestModeCopyVerify  = pb.BlobIngestMode_BLOB_INGEST_MODE_COPY_VERIFY
+	StoreDurabilityUnspecified = pb.StoreDurability_STORE_DURABILITY_UNSPECIFIED
+	StoreDurabilityEphemeral   = pb.StoreDurability_STORE_DURABILITY_EPHEMERAL
+	StoreDurabilityDurable     = pb.StoreDurability_STORE_DURABILITY_DURABLE
 )
 
 // Portable ErrorCode values (same integers on every SDK and over the wire).
@@ -88,10 +100,9 @@ const (
 	ErrorCodeBlobIntegrity      = pb.ErrorCode_ERROR_CODE_BLOB_INTEGRITY
 )
 
-// MaxInlineArtifactBytes is the advisory ceiling for a single Trait.body.
-// Larger payloads should PutBlob and place a verified ObjectRef on the trait.
-// The kernel does not hard-reject oversized inline bodies; modules and hosts
-// SHOULD honour this boundary in production.
+// MaxInlineArtifactBytes is the default hard max for a single Trait.body when
+// ArtifactStorePolicy.max_inline_bytes is 0 at construction. Larger payloads
+// must PutBlob and place a verified ObjectRef.
 const MaxInlineArtifactBytes = 1 << 20 // 1 MiB
 
 // Bounded run states.

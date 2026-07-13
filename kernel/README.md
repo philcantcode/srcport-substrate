@@ -205,9 +205,14 @@ flowchart TB
 | **Inline** (small) | `body` | the artifact record |
 | **External** (large) | `object_ref_bytes(ObjectRef)` | blob store (`PutBlob` / `GetBlob`) |
 
-Modules place large evidence (PCAP, APK, bundles) by putting the blob once and
-committing an artifact that holds only the verified ref — no copy into the
-typed value store.
+Modules place large evidence (PCAP, APK, bundles) by putting the blob once
+(**copy into** the blob store) and committing an artifact that holds only the
+verified ref — no multi‑MB copy into the typed value store.
+
+**`ArtifactStorePolicy`** (frozen at kernel construction) hard-limits
+`Trait.body` (default 1 MiB) and optional blob size, requires `COPY_VERIFY`
+ingest, and declares durability (`EPHEMERAL` for `MemoryKernel`). See
+[`docs/Artifact.md`](../docs/Artifact.md) and SPEC §ArtifactStorePolicy.
 
 ---
 

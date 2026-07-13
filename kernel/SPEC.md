@@ -150,25 +150,45 @@ through the artifact store.
 
 | Mode | When | How identity works | Where bytes live |
 |------|------|--------------------|------------------|
-| **Inline** | Small typed values | `id = H(type ‖ 0x00 ‖ body)` | `Artifact.body` |
-| **External** | Large / shared blobs | `id = H(type ‖ 0x00 ‖ object_ref_bytes(object))` | Blob store; artifact holds `ObjectRef` |
+| **Inline** | Small typed values | trait content = `body` | artifact record (`Trait.body`) |
+| **External** | Large / shared blobs | trait content = `object_ref_bytes(object)` | blob store; trait holds `ObjectRef` |
 
 Rules the kernel enforces:
 
 1. Exactly one of `body` or `object` (non-empty digest) carries the value.
-2. `PutBlob` content-addresses raw bytes (`digest = H(data)`), stores immutably
-   under `(namespace, digest)`, and never interprets domain content. First write
-   wins for a given key.
+2. `PutBlob` **copies** raw bytes into the kernel blob store, content-addresses
+   them (`digest = H(data)`), stores immutably under `(namespace, digest)`, and
+   never interprets domain content. First write wins for a given key. It does
+   **not** retain a pointer to the caller's original path or buffer.
 3. `PutArtifact` with `object` set requires the blob to already exist in
    `object.namespace`, with matching digest and `byte_count`. `body` must be empty.
 4. `GetBlob` re-hashes stored bytes and rejects digest or size mismatches
    (verified external refs).
 5. Typed value equality is independent of blob location policy beyond what is
-   encoded in `ObjectRef`: same `(type, object_ref_bytes)` converges; same blob
-   bytes under different namespaces are different object refs and may be
-   different artifact ids.
-6. The ledger never records raw blob data or inline artifact bodies; it records
-   digests / `ObjectRef` / `BlobRef` metadata only.
+   encoded in `ObjectRef`: same trait bag converges; same blob bytes under
+   different namespaces are different object refs and may be different artifact ids.
+6. The ledger never records raw blob data; for external traits, bodies are cleared
+   in `artifact.put` detail (inline bodies retained). Digests / `ObjectRef` /
+   `BlobRef` metadata remain.
+
+### ArtifactStorePolicy (frozen store law)
+
+Every `KernelApi` backend freezes an **`ArtifactStorePolicy`** at construction.
+It is **acceptance and durability law**, not physical layout. Value identity
+formulas do not depend on it. `RegistrySnapshot.store_policy` exposes the
+normalised policy in force.
+
+| Field | Default (after normalisation) | Enforcement |
+|-------|-------------------------------|-------------|
+| `max_inline_bytes` | `1 MiB` when input is `0` | `PutArtifact`: any `Trait.body` longer → `RESOURCE_EXHAUSTED` |
+| `max_blob_bytes` | `0` = unlimited | `PutBlob`: payload longer → `RESOURCE_EXHAUSTED` |
+| `ingest_mode` | `COPY_VERIFY` | Only supported strong mode; other values → `INVALID` |
+| `durability` | `EPHEMERAL` | Declared class (`EPHEMERAL` for `MemoryKernel`; durable backends report `DURABLE`) |
+
+**Non-goals of the policy (v2):** filesystem paths, mount options, SQL DSNs, or
+"reference caller file in place." Physical store location is a backend ctor
+concern. In-place path refs would be a **new**, weaker payload kind — never an
+`ObjectRef` mode.
 
 ---
 
@@ -327,6 +347,7 @@ Within a major version, evolution is by **addition**, never by mutation:
   above and the breaking-change check are law. Projects pin an exact version
   and upgrade deliberately.
 - **`v2.0.0`** — product/SDK major: **trait bags** as the sole artifact model (formerly drafted as v1.2). Breaking vs v1.x single-type artifacts. Proto package path remains `srcport.substrate.v1` (reserved fields); SDK crates and tags are **2.0.0**.
+- **`v2.1.0`** — additive: **`ArtifactStorePolicy`** (frozen store law: max inline/blob sizes, `COPY_VERIFY` ingest, durability class), exposed on `RegistrySnapshot.store_policy`; hard enforcement via `RESOURCE_EXHAUSTED`.
 - **`v1.2.0`** (draft line, superseded by v2.0.0) — **trait bags** replace single-type artifacts. `Artifact` is
   a map of contract ref → `Trait`; `Port.traits` declares required/guaranteed
   sets; matching is set inclusion; projection helpers isolate traits. No
@@ -388,6 +409,11 @@ The minimal conformance suite (each SDK ships it) is:
     (object_ref_bytes for external), not raw blob bytes. Exactly one of body or
     object per trait. The ledger never stores raw blob data; external trait
     bodies are cleared in `artifact.put` detail (inline bodies retained).
+11b. **ArtifactStorePolicy** — frozen at kernel construction; exposed on
+    `RegistrySnapshot.store_policy`. Hard `max_inline_bytes` / optional
+    `max_blob_bytes`; `PutBlob` is copy-verify only; durability is declared
+    (`EPHEMERAL` for `MemoryKernel`). Oversized payloads → `RESOURCE_EXHAUSTED`.
+    Policy does not change artifact ids.
 12. **Trait projection** — a bag with traits `{A, B}` projects to `{A}` or `{B}`
     as a new in-memory artifact; putting the projection yields a different id
     unless the projected bag equals a prior put. Port matching is structural

@@ -161,7 +161,54 @@ message Artifact {
 
 message ArtifactRef { string id = 1; }
 
+// ─── Artifact / blob store law (frozen at KernelApi construction) ──────────
+// Enforceable acceptance and durability guarantees for PutArtifact / PutBlob.
+// Does NOT affect value identity formulas (trait body / object_ref_bytes).
+// Physical layout (memory map, filesystem path, object storage) is a backend
+// implementation detail — never part of this policy.
+
+// How raw bytes enter the blob store. Strong default: always copy + verify.
+enum BlobIngestMode {
+  BLOB_INGEST_MODE_UNSPECIFIED  = 0;  // treat as COPY_VERIFY
+  BLOB_INGEST_MODE_COPY_VERIFY  = 1;  // only supported strong mode (v2)
+  // Future weak modes (e.g. path locators) require a new enum value + explicit
+  // weaker guarantees — do not overload ObjectRef.
+}
+
+// Declared durability of this kernel's artifact + blob stores.
+enum StoreDurability {
+  STORE_DURABILITY_UNSPECIFIED = 0;  // treat as EPHEMERAL
+  STORE_DURABILITY_EPHEMERAL   = 1;  // may vanish on process restart (MemoryKernel)
+  STORE_DURABILITY_DURABLE     = 2;  // survives process restart (backend-specific)
+}
+
+// Frozen store law for one KernelApi instance. Construction normalises zeros
+// and UNSPECIFIED enums to the defaults below. Every conforming backend MUST
+// enforce the same accept/reject rules for the same policy.
+//
+// Defaults after normalisation:
+//   max_inline_bytes = 1 MiB (when zero on input)
+//   max_blob_bytes   = 0     (unlimited; zero stays zero)
+//   ingest_mode      = COPY_VERIFY
+//   durability       = EPHEMERAL
+//
+// Oversized Trait.body or PutBlob data → ERROR_CODE_RESOURCE_EXHAUSTED.
+// Unsupported ingest_mode → ERROR_CODE_INVALID at construction (or put).
+message ArtifactStorePolicy {
+  // Hard max bytes for a single Trait.body. 0 on input → default 1 MiB.
+  // Set to a very large value only when you intentionally allow huge inline.
+  uint64 max_inline_bytes = 1;
+  // Hard max bytes for a single PutBlob payload. 0 = unlimited.
+  uint64 max_blob_bytes = 2;
+  // Ingest semantics. Only COPY_VERIFY is supported in v2.
+  BlobIngestMode ingest_mode = 3;
+  // Declared durability class of this backend's stores.
+  StoreDurability durability = 4;
+}
+
 // Blob store ABI (streaming-capable on the wire; in-process SDKs take full bytes).
+// PutBlob COPIES bytes into the kernel blob store (ingest_mode COPY_VERIFY);
+// it never retains a pointer to the caller's original path or buffer identity.
 message PutBlobRequest {
   string namespace = 1;  // empty = default
   bytes  data      = 2;
@@ -266,6 +313,8 @@ message RegistrySnapshot {
   repeated ModuleManifest modules      = 1;
   repeated Capability      capabilities = 2;
   repeated Contract        contracts    = 3;
+  // Frozen ArtifactStorePolicy for this kernel instance (normalised defaults).
+  ArtifactStorePolicy store_policy     = 4;
 }
 
 // ─── 7. RUN / CONVERGENCE ──────────────────────────────────────────────────
@@ -443,7 +492,7 @@ enum ErrorCode {
   ERROR_CODE_INVALID             = 2;  // malformed request, manifest, or assembly
   ERROR_CODE_CONFLICT            = 3;  // id exists / work already claimed
   ERROR_CODE_FAILED_PRECONDITION = 4;  // run closed / deadline exceeded / other
-  ERROR_CODE_RESOURCE_EXHAUSTED  = 5;  // a bounded buffer is full (backpressure)
+  ERROR_CODE_RESOURCE_EXHAUSTED  = 5;  // bounded buffer full, or store size limit hit
   ERROR_CODE_BLOB_INTEGRITY      = 6;  // stored bytes do not match digest/size
 }
 

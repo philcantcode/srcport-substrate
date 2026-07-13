@@ -14,9 +14,11 @@ from srcport_substrate import (
 
     AppendRequest,
     Artifact,
+    ArtifactStorePolicy,
     Assembly,
     AssemblyNode,
     Binding,
+    BlobIngestMode,
     BlobIntegrity,
     BlobRef,
     Capability,
@@ -30,6 +32,7 @@ from srcport_substrate import (
     HasBlobRequest,
     Invalid,
     Lifecycle,
+    MAX_INLINE_ARTIFACT_BYTES,
     MemoryKernel,
     ModuleManifest,
     NamedArtifact,
@@ -38,6 +41,8 @@ from srcport_substrate import (
     ObjectRef,
     Port,
     PutBlobRequest,
+    ResourceExhausted,
+    StoreDurability,
     RequestContext,
     RunRequest,
     RunRef,
@@ -721,6 +726,42 @@ class Conformance(unittest.TestCase):
         ack = k.transition(TransitionRequest(module="m", to=Lifecycle.LIFECYCLE_LOADED))
         self.assertEqual(ack.state, Lifecycle.LIFECYCLE_LOADED)
         self.assertTrue(any(e.kind == "module.loaded" for e in k.ledger()))
+
+    def test_store_policy_defaults_and_snapshot(self):
+        k = MemoryKernel()
+        p = k.store_policy
+        self.assertEqual(p.max_inline_bytes, MAX_INLINE_ARTIFACT_BYTES)
+        self.assertEqual(p.max_blob_bytes, 0)
+        self.assertEqual(p.ingest_mode, BlobIngestMode.BLOB_INGEST_MODE_COPY_VERIFY)
+        self.assertEqual(p.durability, StoreDurability.STORE_DURABILITY_EPHEMERAL)
+        snap = k.snapshot()
+        self.assertEqual(snap.store_policy.max_inline_bytes, p.max_inline_bytes)
+
+    def test_store_policy_rejects_oversized_inline_body(self):
+        k = MemoryKernel(
+            ArtifactStorePolicy(
+                max_inline_bytes=8,
+                ingest_mode=BlobIngestMode.BLOB_INGEST_MODE_COPY_VERIFY,
+                durability=StoreDurability.STORE_DURABILITY_EPHEMERAL,
+            )
+        )
+        k.put_artifact(artifact_with_trait("t", b"ok-small"))
+        with self.assertRaises(ResourceExhausted):
+            k.put_artifact(artifact_with_trait("t", b"too-large!"))
+
+    def test_store_policy_rejects_oversized_blob(self):
+        k = MemoryKernel(
+            ArtifactStorePolicy(
+                max_inline_bytes=MAX_INLINE_ARTIFACT_BYTES,
+                max_blob_bytes=16,
+                ingest_mode=BlobIngestMode.BLOB_INGEST_MODE_COPY_VERIFY,
+                durability=StoreDurability.STORE_DURABILITY_EPHEMERAL,
+            )
+        )
+        k.put_blob(PutBlobRequest(namespace="n", data=b"fifteen-bytes!"))
+        with self.assertRaises(ResourceExhausted):
+            k.put_blob(PutBlobRequest(namespace="n", data=b"seventeen-bytes!!!"))
+
 
 if __name__ == "__main__":
     unittest.main()

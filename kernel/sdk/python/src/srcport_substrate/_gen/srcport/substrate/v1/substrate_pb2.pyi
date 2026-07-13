@@ -21,6 +21,17 @@ class Firing(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     FIRING_ALWAYS: _ClassVar[Firing]
     FIRING_ONCE_PER_KEY: _ClassVar[Firing]
 
+class BlobIngestMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    BLOB_INGEST_MODE_UNSPECIFIED: _ClassVar[BlobIngestMode]
+    BLOB_INGEST_MODE_COPY_VERIFY: _ClassVar[BlobIngestMode]
+
+class StoreDurability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    STORE_DURABILITY_UNSPECIFIED: _ClassVar[StoreDurability]
+    STORE_DURABILITY_EPHEMERAL: _ClassVar[StoreDurability]
+    STORE_DURABILITY_DURABLE: _ClassVar[StoreDurability]
+
 class Closure(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     __slots__ = ()
     CLOSURE_UNSPECIFIED: _ClassVar[Closure]
@@ -54,6 +65,11 @@ FIRING_UNSPECIFIED: Firing
 FIRING_ONCE: Firing
 FIRING_ALWAYS: Firing
 FIRING_ONCE_PER_KEY: Firing
+BLOB_INGEST_MODE_UNSPECIFIED: BlobIngestMode
+BLOB_INGEST_MODE_COPY_VERIFY: BlobIngestMode
+STORE_DURABILITY_UNSPECIFIED: StoreDurability
+STORE_DURABILITY_EPHEMERAL: StoreDurability
+STORE_DURABILITY_DURABLE: StoreDurability
 CLOSURE_UNSPECIFIED: Closure
 CLOSURE_FIRST_TERMINAL: Closure
 CLOSURE_OPEN: Closure
@@ -173,6 +189,18 @@ class ArtifactRef(_message.Message):
     id: str
     def __init__(self, id: _Optional[str] = ...) -> None: ...
 
+class ArtifactStorePolicy(_message.Message):
+    __slots__ = ("max_inline_bytes", "max_blob_bytes", "ingest_mode", "durability")
+    MAX_INLINE_BYTES_FIELD_NUMBER: _ClassVar[int]
+    MAX_BLOB_BYTES_FIELD_NUMBER: _ClassVar[int]
+    INGEST_MODE_FIELD_NUMBER: _ClassVar[int]
+    DURABILITY_FIELD_NUMBER: _ClassVar[int]
+    max_inline_bytes: int
+    max_blob_bytes: int
+    ingest_mode: BlobIngestMode
+    durability: StoreDurability
+    def __init__(self, max_inline_bytes: _Optional[int] = ..., max_blob_bytes: _Optional[int] = ..., ingest_mode: _Optional[_Union[BlobIngestMode, str]] = ..., durability: _Optional[_Union[StoreDurability, str]] = ...) -> None: ...
+
 class PutBlobRequest(_message.Message):
     __slots__ = ("namespace", "data")
     NAMESPACE_FIELD_NUMBER: _ClassVar[int]
@@ -268,14 +296,16 @@ class LedgerEntry(_message.Message):
     def __init__(self, seq: _Optional[int] = ..., kind: _Optional[str] = ..., subject: _Optional[str] = ..., detail: _Optional[bytes] = ..., prev_hash: _Optional[str] = ..., hash: _Optional[str] = ...) -> None: ...
 
 class RegistrySnapshot(_message.Message):
-    __slots__ = ("modules", "capabilities", "contracts")
+    __slots__ = ("modules", "capabilities", "contracts", "store_policy")
     MODULES_FIELD_NUMBER: _ClassVar[int]
     CAPABILITIES_FIELD_NUMBER: _ClassVar[int]
     CONTRACTS_FIELD_NUMBER: _ClassVar[int]
+    STORE_POLICY_FIELD_NUMBER: _ClassVar[int]
     modules: _containers.RepeatedCompositeFieldContainer[ModuleManifest]
     capabilities: _containers.RepeatedCompositeFieldContainer[Capability]
     contracts: _containers.RepeatedCompositeFieldContainer[Contract]
-    def __init__(self, modules: _Optional[_Iterable[_Union[ModuleManifest, _Mapping]]] = ..., capabilities: _Optional[_Iterable[_Union[Capability, _Mapping]]] = ..., contracts: _Optional[_Iterable[_Union[Contract, _Mapping]]] = ...) -> None: ...
+    store_policy: ArtifactStorePolicy
+    def __init__(self, modules: _Optional[_Iterable[_Union[ModuleManifest, _Mapping]]] = ..., capabilities: _Optional[_Iterable[_Union[Capability, _Mapping]]] = ..., contracts: _Optional[_Iterable[_Union[Contract, _Mapping]]] = ..., store_policy: _Optional[_Union[ArtifactStorePolicy, _Mapping]] = ...) -> None: ...
 
 class NamedArtifact(_message.Message):
     __slots__ = ("name", "artifact")
