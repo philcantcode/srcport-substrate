@@ -77,43 +77,62 @@ A language-native trait/interface (Rust first) implemented by domain code:
 | Hook | Required? | Role |
 |------|-----------|------|
 | `manifest()` | yes | `ModuleManifest` for `Register` |
-| `execute(step)` | yes | Domain work for a claimed `WorkItem` |
-| `processing_ui(work)` | no | View while / as work is claimed |
-| `result_ui(work, outputs)` | no | View after outputs are produced |
+| `execute(step)` | yes | Domain work; may `step.emit_progress` |
+| `on_init(step)` | no | **Init** presentation after claim |
+| `on_final(step, result)` | no | **Final** presentation (ok or fail) |
+| `processing_ui` / `result_ui` | no | **Legacy** — default `on_init` / `on_final` adapters |
 
-Empty / `None` UI hooks mean “headless.” No plugin is forced to implement UI.
+Empty hooks mean “headless.” Modules emit **presentation data only** — never
+widgets, HTML, or shell code.
 
 Plugins **must not** import other plugins. Cross-module coupling remains
 contract refs and assembly bindings on the kernel — same rule as the substrate.
 
-### 3. Step context & output
+### 3. Step lifecycle (presentation)
 
-`execute` receives a **step context** (run id, work item, input artifacts
-resolved from the kernel) and returns **named port outputs** (contract ref +
-body). The host puts artifacts and commits the derivation so provenance stays
-on the ledger.
+Per **work unit** (not kernel module `REGISTERED→…`):
+
+```text
+ClaimReady → on_init (Init) → execute { emit_progress* } → on_final (Final) → Put/Commit
+```
+
+| Stage | How | Contract |
+|-------|-----|----------|
+| **Init** | `on_init` | `srcport.ui.v1.StepInit` |
+| **Progress** | `StepContext::emit_progress` (0..N) | `srcport.ui.v1.StepProgress` |
+| **Final** | `on_final` (success or failure) | `srcport.ui.v1.StepFinal` |
+
+Host collects [`StepEvent`]s (`stage` + `Presentation` + optional artifact id).
+`UiPersist::Artifacts` also `PutArtifact`s JSON bodies for audit/replay.
+
+On execute **failure**: host still emits Progress buffer + Final (failed), does
+**not** commit a derivation, returns `StepFailed`.
+
+### 4. Step context & output
+
+`execute` receives a **mutable step context** (run id, work item, inputs) and
+returns **named port outputs**. The host puts domain artifacts and commits the
+derivation so provenance stays on the ledger.
 
 Enrichment is ordinary: produce a new typed artifact; bind it downstream.
 There is no mutable “enrichment bag” in the kernel.
 
-### 4. UI profile (`srcport.ui.v1`)
+### 5. UI profile (`srcport.ui.v1`)
 
 Optional well-known contract refs. Bodies are JSON (UTF-8) in `Artifact.body`
-unless a later profile version says otherwise.
+when persisted.
 
-| Contract ref | Purpose |
-|--------------|---------|
-| `srcport.ui.v1.ProcessingView` | Step is running / claimed |
-| `srcport.ui.v1.ResultView` | Step produced outputs |
+| Contract ref | Stage |
+|--------------|--------|
+| `srcport.ui.v1.StepInit` | Init |
+| `srcport.ui.v1.StepProgress` | Progress |
+| `srcport.ui.v1.StepFinal` | Final |
+| `ProcessingView` / `ResultView` | **Legacy** aliases |
 
-Schemas live under [`profiles/ui/`](profiles/ui/). Hosts that do not care
-about UI never read these artifacts.
+Schemas live under [`profiles/ui/`](profiles/ui/). Presentation is a **side
+channel** — never required for readiness or domain ports.
 
-UI is **notification + presentation data**, not the run data plane. Domain
-ports still carry domain contracts; UI artifacts are side-channel records
-(and optional host-local events) keyed by run / work / node ids.
-
-### 5. Composition (now vs later)
+### 6. Composition (now vs later)
 
 | Mode | Status |
 |------|--------|
@@ -123,7 +142,7 @@ ports still carry domain contracts; UI artifacts are side-channel records
 Auto-resolution is a framework concern. The kernel continues to reject invalid
 assemblies; it does not invent them.
 
-### 6. Run modes (`FrameworkPolicy`)
+### 7. Run modes (`FrameworkPolicy`)
 
 Product-facing presets compile to kernel `ExecutionPolicy` / `include_nodes` /
 `Limits` plus host drive rules. **Presets are the API; raw kernel fields are
@@ -181,6 +200,7 @@ Host entrypoints:
 |---------|--------|
 | `0.1.0` | Initial charter; Rust host + `ModulePlugin`; UI profile stubs; manual assemblies only |
 | `0.1.0` (+modes) | `FrameworkPolicy` presets: converge / stream / stream_dedupe / selective; `start_pipeline`, `inject`, `DrivePlan` |
+| `0.1.0` (+lifecycle) | Step presentation lifecycle Init → Progress* → Final; `StepEvent`; UI schemas; legacy view adapters |
 
 ---
 
@@ -197,8 +217,9 @@ Host entrypoints:
 
 A framework implementation is “good enough” for `0.1` when:
 
-1. A plugin with no UI hooks can complete a multi-node run via the host loop.
-2. A plugin that returns `ProcessingView` / `ResultView` causes those values to
-   be observable to the host (and optionally stored as artifacts).
-3. Headless and UI-enabled plugins can coexist in one run.
-4. The substrate conformance suite still passes with zero framework imports.
+1. A plugin with no presentation hooks can complete a multi-node run via the host.
+2. Init / Progress / Final emit in order; Progress supports multiple emits.
+3. Failure emits Final(failed) without committing domain outputs.
+4. Headless and presentation-enabled plugins coexist in one run.
+5. Optional artifact persist uses step contract refs (`StepInit` / `Progress` / `Final`).
+6. The substrate conformance suite still passes with zero framework imports.

@@ -39,18 +39,20 @@ cargo test --manifest-path framework/rust/Cargo.toml
 
 ```rust
 use srcport_framework::{
-    DriveAfter, FrameworkPolicy, Host, ModulePlugin, PortBody, StepContext, StepOutput,
+    DriveAfter, FrameworkPolicy, Host, ModulePlugin, PortBody, Presentation,
+    StepContext, StepOutput, StepResult,
 };
 
-// register plugins, then:
+// ModulePlugin: execute(&mut step); optional on_init / on_final;
+// step.emit_progress(Presentation::progress("…", Some(0.5)));
+
 // host.start_pipeline(id, assembly, inputs, FrameworkPolicy::converge())?;
 // host.drive(id)?;
+// let events = host.take_step_events(); // Init / Progress* / Final
 
-// loop on new data:
+// stream:
 // host.start_pipeline(id, assembly, inputs, FrameworkPolicy::stream())?;
-// host.drive(id)?;                         // stays RUNNING
 // host.inject(id, named_input, DriveAfter::UntilIdle)?;
-// host.cancel(id)?;
 ```
 
 | Preset | Use when |

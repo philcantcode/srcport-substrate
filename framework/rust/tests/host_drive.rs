@@ -1,9 +1,9 @@
-//! End-to-end: three plugins, manual assembly, host drive, optional UI.
+//! End-to-end: three plugins, converge policy, step lifecycle presentation.
 
 use srcport_framework::{
-    FrameworkError, FrameworkPolicy, Host, ModulePlugin, PortBody, ProcessingStatus, ProcessingView,
-    ResultStatus, ResultView, StepContext, StepOutput, UiEvent, UiPersist, CONTRACT_PROCESSING_VIEW,
-    CONTRACT_RESULT_VIEW,
+    FrameworkError, FrameworkPolicy, Host, ModulePlugin, PortBody, Presentation, PresentationStatus,
+    ProcessingStatus, ProcessingView, ResultStatus, ResultView, StepContext, StepEvent, StepOutput,
+    StepResult, StepStage, UiPersist, CONTRACT_STEP_FINAL, CONTRACT_STEP_INIT,
 };
 use srcport_substrate::{
     Artifact, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
@@ -29,12 +29,17 @@ impl ModulePlugin for Extractor {
         }
     }
 
-    fn execute(&mut self, step: &StepContext) -> Result<StepOutput, FrameworkError> {
-        let q = step
+    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
+        let q_body = step
             .inputs
             .get("question")
-            .ok_or_else(|| FrameworkError::Invalid("missing question".into()))?;
-        let facts = format!("facts-from:{}", String::from_utf8_lossy(&q.body));
+            .ok_or_else(|| FrameworkError::Invalid("missing question".into()))?
+            .body
+            .clone();
+        step.emit_progress(
+            Presentation::progress("Extracting facts", Some(0.5)).with_detail("Reading question…"),
+        );
+        let facts = format!("facts-from:{}", String::from_utf8_lossy(&q_body));
         Ok(StepOutput {
             outputs: vec![PortBody {
                 port: "facts".into(),
@@ -44,23 +49,12 @@ impl ModulePlugin for Extractor {
         })
     }
 
-    fn processing_ui(&self, _work: &WorkItem) -> Option<ProcessingView> {
-        Some(ProcessingView {
-            title: "Extracting facts".into(),
-            status: ProcessingStatus::Running,
-            detail: Some("Reading question…".into()),
-            progress: Some(0.5),
-            ..Default::default()
-        })
+    fn on_init(&self, _step: &StepContext) -> Option<Presentation> {
+        Some(Presentation::init("Extracting facts").with_detail("Starting…"))
     }
 
-    fn result_ui(&self, _work: &WorkItem, _outputs: &[NamedArtifact]) -> Option<ResultView> {
-        Some(ResultView {
-            title: "Facts ready".into(),
-            status: ResultStatus::Ok,
-            summary: Some("Extracted facts".into()),
-            ..Default::default()
-        })
+    fn on_final(&self, _step: &StepContext, _result: &StepResult) -> Option<Presentation> {
+        Some(Presentation::final_ok("Facts ready").with_detail("Extracted facts"))
     }
 }
 
@@ -81,7 +75,7 @@ impl ModulePlugin for Retriever {
         }
     }
 
-    fn execute(&mut self, _step: &StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&mut self, _step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         Ok(StepOutput {
             outputs: vec![PortBody {
                 port: "sources".into(),
@@ -90,7 +84,6 @@ impl ModulePlugin for Retriever {
             }],
         })
     }
-    // headless — no UI hooks
 }
 
 struct Writer;
@@ -114,7 +107,7 @@ impl ModulePlugin for Writer {
         }
     }
 
-    fn execute(&mut self, step: &StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let facts = step.inputs.get("facts").map(|a| a.body.clone()).unwrap_or_default();
         let sources = step.inputs.get("sources").map(|a| a.body.clone()).unwrap_or_default();
         let mut body = b"answer:".to_vec();
@@ -130,6 +123,7 @@ impl ModulePlugin for Writer {
         })
     }
 
+    // Legacy hooks still work via default on_init / on_final adapters.
     fn processing_ui(&self, _work: &WorkItem) -> Option<ProcessingView> {
         Some(ProcessingView {
             title: "Writing answer".into(),
@@ -137,9 +131,15 @@ impl ModulePlugin for Writer {
             ..Default::default()
         })
     }
-}
 
-// ── helpers ─────────────────────────────────────────────────────────────────
+    fn result_ui(&self, _work: &WorkItem, _outputs: &[NamedArtifact]) -> Option<ResultView> {
+        Some(ResultView {
+            title: "Answer ready".into(),
+            status: ResultStatus::Ok,
+            ..Default::default()
+        })
+    }
+}
 
 fn port(name: &str, contract: &str) -> Port {
     Port {
@@ -177,10 +177,8 @@ fn from_node(to_node: &str, to_port: &str, from_node: &str, from_port: &str) -> 
     }
 }
 
-// ── tests ───────────────────────────────────────────────────────────────────
-
 #[test]
-fn host_drives_diamond_with_optional_ui() {
+fn host_drives_diamond_with_step_lifecycle() {
     let mut host = Host::new(MemoryKernel::new()).with_ui_persist(UiPersist::Artifacts);
 
     host.register_plugin(Box::new(Extractor)).unwrap();
@@ -231,66 +229,46 @@ fn host_drives_diamond_with_optional_ui() {
     let run = host.drive("run-1").unwrap();
     assert_eq!(run.state(), RunState::Completed);
     assert!(run.answer.is_some());
-    assert!(matches!(
-        host.policy("run-1").map(|p| &p.mode),
-        Some(srcport_framework::RunMode::Converge)
-    ));
 
-    let events = host.take_ui_events();
-    // extractor: processing + result; writer: processing; retriever: none
+    let events = host.take_step_events();
+    // extractor: init + progress + final; writer: init (legacy) + final (legacy); retriever: none
     assert!(
-        events.len() >= 3,
-        "expected UI from extractor and writer, got {events:?}"
+        events.len() >= 5,
+        "expected lifecycle events, got {events:?}"
     );
 
-    let mut saw_extract_processing = false;
-    let mut saw_extract_result = false;
-    for ev in &events {
-        match ev {
-            UiEvent::Processing { view, artifact_id } => {
-                assert!(!artifact_id.is_empty(), "UiPersist::Artifacts must put views");
-                if view.module == "extractor" {
-                    saw_extract_processing = true;
-                    assert_eq!(view.title, "Extracting facts");
-                    let art = host
-                        .kernel()
-                        .get_artifact(
-                            &srcport_substrate::ArtifactRef {
-                                id: artifact_id.clone(),
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(art.r#type, CONTRACT_PROCESSING_VIEW);
-                }
-            }
-            UiEvent::Result { view, artifact_id } => {
-                assert!(!artifact_id.is_empty());
-                if view.module == "extractor" {
-                    saw_extract_result = true;
-                    assert_eq!(view.status, ResultStatus::Ok);
-                    let art = host
-                        .kernel()
-                        .get_artifact(
-                            &srcport_substrate::ArtifactRef {
-                                id: artifact_id.clone(),
-                            },
-                        )
-                        .unwrap();
-                    assert_eq!(art.r#type, CONTRACT_RESULT_VIEW);
-                }
-            }
-        }
-    }
-    assert!(saw_extract_processing);
-    assert!(saw_extract_result);
+    let extract: Vec<&StepEvent> = events
+        .iter()
+        .filter(|e| e.presentation.module == "extractor")
+        .collect();
+    assert_eq!(extract[0].stage, StepStage::Init);
+    assert_eq!(extract[1].stage, StepStage::Progress);
+    assert_eq!(extract[2].stage, StepStage::Final);
+    assert_eq!(extract[2].presentation.status, PresentationStatus::Ok);
+    assert!(!extract[0].artifact_id.is_empty());
+
+    let art = host
+        .kernel()
+        .get_artifact(&srcport_substrate::ArtifactRef {
+            id: extract[0].artifact_id.clone(),
+        })
+        .unwrap();
+    assert_eq!(art.r#type, CONTRACT_STEP_INIT);
+
+    let final_art = host
+        .kernel()
+        .get_artifact(&srcport_substrate::ArtifactRef {
+            id: extract[2].artifact_id.clone(),
+        })
+        .unwrap();
+    assert_eq!(final_art.r#type, CONTRACT_STEP_FINAL);
 }
 
 #[test]
-fn headless_plugins_need_no_ui() {
+fn headless_plugins_need_no_presentation() {
     let mut host = Host::new(MemoryKernel::new());
     host.register_plugin(Box::new(Retriever)).unwrap();
 
-    // Single-node assembly: question → sources
     let question = host
         .kernel()
         .put_artifact(Artifact {
@@ -322,5 +300,5 @@ fn headless_plugins_need_no_ui() {
 
     let run = host.drive("run-h").unwrap();
     assert_eq!(run.state(), RunState::Completed);
-    assert!(host.ui_events().is_empty());
+    assert!(host.step_events().is_empty());
 }

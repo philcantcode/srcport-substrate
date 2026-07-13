@@ -37,7 +37,7 @@ impl ModulePlugin for Echo {
         }
     }
 
-    fn execute(&mut self, step: &StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         self.hits += 1;
         let body = step
             .inputs
@@ -72,7 +72,7 @@ impl ModulePlugin for Extractor {
         }
     }
 
-    fn execute(&mut self, step: &StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let q = step.inputs.get("question").map(|a| &a.body[..]).unwrap_or(b"");
         Ok(StepOutput {
             outputs: vec![PortBody {
@@ -102,7 +102,7 @@ impl ModulePlugin for Writer {
         }
     }
 
-    fn execute(&mut self, step: &StepContext) -> Result<StepOutput, FrameworkError> {
+    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let mut body = b"answer:".to_vec();
         if let Some(f) = step.inputs.get("facts") {
             body.extend_from_slice(&f.body);

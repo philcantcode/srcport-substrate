@@ -1,171 +1,40 @@
 //! # srcport-framework — Rust host + module plugins (v0.1.0)
 //!
 //! Opinionated application layer on [`srcport_substrate`]. The kernel never
-//! loads plugins or calls UI hooks — only a [`Host`] does. Domain work still
-//! flows as immutable artifacts through assemblies; see `framework/SPEC.md`.
+//! loads plugins or calls presentation hooks — only a [`Host`] does.
 //!
 //! ```text
-//! start_pipeline(policy) → drive / inject
-//! Host::drive  →  ClaimReady  →  processing_ui?  →  execute  →  Put/Commit  →  result_ui?
-//!                      │                │                              │
-//!                      └──────── KernelApi (substrate) ────────────────┘
+//! start_pipeline(policy)
+//! Host::drive → ClaimReady → on_init → execute (emit_progress*) → on_final → Put/Commit
+//!                  │              │              │                    │
+//!                  └──────── KernelApi ──────────┴── presentation side-channel ──┘
 //! ```
 //!
-//! **Modes** ([`FrameworkPolicy`]): `converge`, `stream`, `stream_dedupe`,
-//! `selective` — presets that compile to kernel `ExecutionPolicy` + host drive rules.
+//! **Modes** ([`FrameworkPolicy`]): converge / stream / stream_dedupe / selective.  
+//! **Step lifecycle**: Init → Progress\* → Final ([`Presentation`], [`StepEvent`]).
 
 #![deny(missing_docs)]
 
 mod policy;
+mod presentation;
 
 pub use policy::{
     DriveAfter, DrivePlan, FiringPlan, FrameworkPolicy, NodePlan, RunMode,
 };
+pub use presentation::{
+    Presentation, PresentationStatus, ProcessingStatus, ProcessingView, ResultStatus, ResultView,
+    StepEvent, StepResult, StepStage, UiEvent, CONTRACT_PROCESSING_VIEW, CONTRACT_RESULT_VIEW,
+    CONTRACT_STEP_FINAL, CONTRACT_STEP_INIT, CONTRACT_STEP_PROGRESS,
+};
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use srcport_substrate::{
     Artifact, ArtifactRef, Assembly, ClaimRequest, Derivation, InjectInputRequest, KernelApi,
     KernelError, ModuleManifest, NamedArtifact, RequestContext, Run, RunRef, RunRequest, RunState,
     WorkItem,
 };
-
-// ── UI profile (srcport.ui.v1) ──────────────────────────────────────────────
-
-/// Contract ref for a processing (in-flight) view artifact.
-pub const CONTRACT_PROCESSING_VIEW: &str = "srcport.ui.v1.ProcessingView";
-/// Contract ref for a result view artifact.
-pub const CONTRACT_RESULT_VIEW: &str = "srcport.ui.v1.ResultView";
-
-/// Coarse processing state for product chrome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessingStatus {
-    /// Not started.
-    Pending,
-    /// Claimed / executing.
-    Running,
-    /// Waiting on inputs (host may surface this without a claim).
-    Blocked,
-    /// Step failed in the product sense (optional; kernel failure is separate).
-    Failed,
-}
-
-/// Optional step chrome while work is in flight (`srcport.ui.v1.ProcessingView`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProcessingView {
-    /// Short label.
-    pub title: String,
-    /// Coarse status.
-    pub status: ProcessingStatus,
-    /// Optional detail line.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    /// Optional 0..=1 progress.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<f64>,
-    /// Run id (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub run_id: String,
-    /// Work id (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub work_id: String,
-    /// Assembly node id (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub node_id: String,
-    /// Module name (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub module: String,
-}
-
-impl Default for ProcessingView {
-    fn default() -> Self {
-        Self {
-            title: String::new(),
-            status: ProcessingStatus::Running,
-            detail: None,
-            progress: None,
-            run_id: String::new(),
-            work_id: String::new(),
-            node_id: String::new(),
-            module: String::new(),
-        }
-    }
-}
-
-/// Coarse result state for product chrome.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResultStatus {
-    /// Outputs produced successfully.
-    Ok,
-    /// Succeeded with nothing useful to show.
-    Empty,
-    /// Product-level failure presentation.
-    Failed,
-}
-
-/// Optional step chrome after outputs exist (`srcport.ui.v1.ResultView`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResultView {
-    /// Short label.
-    pub title: String,
-    /// Coarse status.
-    pub status: ResultStatus,
-    /// Optional summary line.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    /// Run id (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub run_id: String,
-    /// Work id (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub work_id: String,
-    /// Assembly node id (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub node_id: String,
-    /// Module name (host fills if empty).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub module: String,
-    /// Output port names produced.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub output_ports: Vec<String>,
-}
-
-impl Default for ResultView {
-    fn default() -> Self {
-        Self {
-            title: String::new(),
-            status: ResultStatus::Ok,
-            summary: None,
-            run_id: String::new(),
-            work_id: String::new(),
-            node_id: String::new(),
-            module: String::new(),
-            output_ports: Vec::new(),
-        }
-    }
-}
-
-/// A UI event observed by the host (and optionally written as an artifact).
-#[derive(Debug, Clone, PartialEq)]
-pub enum UiEvent {
-    /// Processing chrome for a claimed work unit.
-    Processing {
-        /// View body.
-        view: ProcessingView,
-        /// Artifact id when `Host` persisted the view; empty if host-local only.
-        artifact_id: String,
-    },
-    /// Result chrome after commit inputs were built.
-    Result {
-        /// View body.
-        view: ResultView,
-        /// Artifact id when persisted; empty if host-local only.
-        artifact_id: String,
-    },
-}
 
 // ── Plugin surface ──────────────────────────────────────────────────────────
 
@@ -187,8 +56,10 @@ pub struct StepOutput {
     pub outputs: Vec<PortBody>,
 }
 
-/// Read-only inputs and identity for one claimed work unit.
-#[derive(Debug, Clone)]
+/// Context for one claimed work unit: inputs, identity, and progress emission.
+///
+/// Domain ports stay on the kernel data plane. Presentation is a side channel
+/// via [`StepContext::emit_progress`] and plugin lifecycle hooks.
 pub struct StepContext {
     /// Run id.
     pub run_id: String,
@@ -196,6 +67,32 @@ pub struct StepContext {
     pub work: WorkItem,
     /// Input artifacts loaded from the kernel, keyed by port name.
     pub inputs: HashMap<String, Artifact>,
+    /// Buffered progress presentations (drained by the host after execute).
+    progress_buf: Vec<Presentation>,
+}
+
+impl StepContext {
+    /// Emit a **Progress** presentation mid-execute.
+    ///
+    /// The host records [`StepEvent`]s (and optionally puts artifacts) after
+    /// `execute` returns, in emission order. Stage is forced to [`StepStage::Progress`].
+    pub fn emit_progress(&mut self, mut presentation: Presentation) {
+        presentation.stage = StepStage::Progress;
+        if presentation.status == PresentationStatus::Pending {
+            presentation.status = PresentationStatus::Running;
+        }
+        presentation.fill_identity(&self.run_id, &self.work);
+        self.progress_buf.push(presentation);
+    }
+
+    /// Number of progress emits buffered so far.
+    pub fn progress_count(&self) -> usize {
+        self.progress_buf.len()
+    }
+
+    fn take_progress(&mut self) -> Vec<Presentation> {
+        std::mem::take(&mut self.progress_buf)
+    }
 }
 
 /// Framework-level failure (wraps kernel errors and plugin mistakes).
@@ -207,6 +104,8 @@ pub enum FrameworkError {
     NoPlugin(String),
     /// Plugin or host usage error.
     Invalid(String),
+    /// Domain step failed (execute returned err after optional final presentation).
+    StepFailed(String),
 }
 
 impl std::fmt::Display for FrameworkError {
@@ -215,6 +114,7 @@ impl std::fmt::Display for FrameworkError {
             FrameworkError::Kernel(e) => write!(f, "kernel: {e}"),
             FrameworkError::NoPlugin(m) => write!(f, "no plugin registered for module {m}"),
             FrameworkError::Invalid(r) => write!(f, "invalid: {r}"),
+            FrameworkError::StepFailed(r) => write!(f, "step failed: {r}"),
         }
     }
 }
@@ -227,24 +127,45 @@ impl From<KernelError> for FrameworkError {
     }
 }
 
-/// Domain module as a host-side plugin. Optional UI hooks default to `None`.
+/// Domain module as a host-side plugin.
 ///
-/// The substrate kernel never sees this trait. Plugins must not import each
-/// other; couple only through contract refs and assemblies.
+/// Presentation hooks are optional. Modules must not import each other; couple
+/// only through contract refs and assemblies. Never return real UI toolkits —
+/// only [`Presentation`] data.
 pub trait ModulePlugin: Send {
     /// Manifest passed to `Register`.
     fn manifest(&self) -> ModuleManifest;
 
-    /// Perform domain work for a claimed unit. Return port bodies; the host
-    /// puts artifacts and commits the derivation.
-    fn execute(&mut self, step: &StepContext) -> Result<StepOutput, FrameworkError>;
+    /// Perform domain work for a claimed unit.
+    ///
+    /// Call [`StepContext::emit_progress`] zero or more times for Progress stages.
+    fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError>;
 
-    /// Optional processing chrome when work is claimed.
+    /// Optional **Init** presentation after claim, before `execute`.
+    ///
+    /// Default: maps legacy [`ModulePlugin::processing_ui`] if implemented.
+    fn on_init(&self, step: &StepContext) -> Option<Presentation> {
+        self.processing_ui(&step.work).map(Presentation::from)
+    }
+
+    /// Optional **Final** presentation after outputs (or on failure).
+    ///
+    /// Default: maps legacy [`ModulePlugin::result_ui`] on success.
+    fn on_final(&self, step: &StepContext, result: &StepResult) -> Option<Presentation> {
+        if result.ok {
+            self.result_ui(&step.work, &result.outputs)
+                .map(Presentation::from)
+        } else {
+            None
+        }
+    }
+
+    /// Legacy hook — prefer [`ModulePlugin::on_init`].
     fn processing_ui(&self, _work: &WorkItem) -> Option<ProcessingView> {
         None
     }
 
-    /// Optional result chrome after outputs are produced (before or after commit).
+    /// Legacy hook — prefer [`ModulePlugin::on_final`].
     fn result_ui(&self, _work: &WorkItem, _outputs: &[NamedArtifact]) -> Option<ResultView> {
         None
     }
@@ -252,12 +173,12 @@ pub trait ModulePlugin: Send {
 
 // ── Host ────────────────────────────────────────────────────────────────────
 
-/// Whether the host should `PutArtifact` UI views onto the kernel.
+/// Whether the host should `PutArtifact` presentation payloads onto the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiPersist {
-    /// Only collect [`UiEvent`]s host-locally (default for light shells).
+    /// Only collect [`StepEvent`]s host-locally (default for light shells).
     LocalOnly,
-    /// Also store UI views as content-addressed artifacts (auditable).
+    /// Also store presentation as content-addressed artifacts (auditable).
     Artifacts,
 }
 
@@ -267,7 +188,7 @@ pub struct Host<K: KernelApi> {
     plugins: HashMap<String, Box<dyn ModulePlugin>>,
     ctx: RequestContext,
     ui_persist: UiPersist,
-    ui_events: Vec<UiEvent>,
+    step_events: Vec<StepEvent>,
     /// Policy frozen at [`Host::start_pipeline`] (drive / claim filters).
     run_policies: HashMap<String, FrameworkPolicy>,
 }
@@ -283,7 +204,7 @@ impl<K: KernelApi> Host<K> {
                 ..Default::default()
             },
             ui_persist: UiPersist::LocalOnly,
-            ui_events: Vec::new(),
+            step_events: Vec::new(),
             run_policies: HashMap::new(),
         }
     }
@@ -294,7 +215,7 @@ impl<K: KernelApi> Host<K> {
         self
     }
 
-    /// Persist UI views as kernel artifacts (in addition to host events).
+    /// Persist presentation as kernel artifacts (in addition to host events).
     pub fn with_ui_persist(mut self, mode: UiPersist) -> Self {
         self.ui_persist = mode;
         self
@@ -310,14 +231,24 @@ impl<K: KernelApi> Host<K> {
         self.run_policies.get(run_id)
     }
 
-    /// UI events collected since the last [`Host::take_ui_events`].
-    pub fn ui_events(&self) -> &[UiEvent] {
-        &self.ui_events
+    /// Step lifecycle events since the last [`Host::take_step_events`].
+    pub fn step_events(&self) -> &[StepEvent] {
+        &self.step_events
     }
 
-    /// Drain collected UI events.
-    pub fn take_ui_events(&mut self) -> Vec<UiEvent> {
-        std::mem::take(&mut self.ui_events)
+    /// Drain step lifecycle events.
+    pub fn take_step_events(&mut self) -> Vec<StepEvent> {
+        std::mem::take(&mut self.step_events)
+    }
+
+    /// Alias for [`Host::step_events`] (older name).
+    pub fn ui_events(&self) -> &[StepEvent] {
+        self.step_events()
+    }
+
+    /// Alias for [`Host::take_step_events`] (older name).
+    pub fn take_ui_events(&mut self) -> Vec<StepEvent> {
+        self.take_step_events()
     }
 
     /// Register a plugin: `Register` on the kernel and store it for claims.
@@ -344,9 +275,6 @@ impl<K: KernelApi> Host<K> {
     }
 
     /// Start a pipeline with an opinionated [`FrameworkPolicy`].
-    ///
-    /// Compiles policy → kernel `ExecutionPolicy` / `include_nodes` / `Limits`,
-    /// stores the policy for later [`Host::drive`] / [`Host::inject`].
     pub fn start_pipeline(
         &mut self,
         run_id: impl Into<String>,
@@ -382,10 +310,7 @@ impl<K: KernelApi> Host<K> {
         Ok(run)
     }
 
-    /// Freeze an assembly over inputs (`StartRun`) without a framework policy.
-    ///
-    /// Prefer [`Host::start_pipeline`] for product modes. Raw starts use
-    /// [`FrameworkPolicy::converge`] drive defaults when driving.
+    /// Freeze an assembly over inputs without a framework policy.
     pub fn start_run(&self, req: RunRequest) -> Result<Run, FrameworkError> {
         Ok(self.kernel.start_run(req, &self.ctx)?)
     }
@@ -400,7 +325,7 @@ impl<K: KernelApi> Host<K> {
         )?)
     }
 
-    /// Inject a named run input (kernel `InjectInput`). Optionally re-drive.
+    /// Inject a named run input. Optionally re-drive.
     pub fn inject(
         &mut self,
         run_id: &str,
@@ -421,7 +346,7 @@ impl<K: KernelApi> Host<K> {
         }
     }
 
-    /// Cancel a run (kernel `CancelRun`). Drops stored framework policy for the id.
+    /// Cancel a run. Drops stored framework policy for the id.
     pub fn cancel(&mut self, run_id: &str) -> Result<Run, FrameworkError> {
         let run = self.kernel.cancel_run(
             &RunRef {
@@ -433,8 +358,7 @@ impl<K: KernelApi> Host<K> {
         Ok(run)
     }
 
-    /// Drive using the policy frozen at [`Host::start_pipeline`], or
-    /// [`DrivePlan::UntilIdle`] if the run was started with raw [`Host::start_run`].
+    /// Drive using the policy frozen at [`Host::start_pipeline`].
     pub fn drive(&mut self, run_id: &str) -> Result<Run, FrameworkError> {
         let plan = self
             .run_policies
@@ -444,8 +368,7 @@ impl<K: KernelApi> Host<K> {
         self.drive_with(run_id, plan)
     }
 
-    /// Drive with an explicit plan (ignores stored policy's drive field; still
-    /// honours `claim_modules` when a policy is stored).
+    /// Drive with an explicit plan.
     pub fn drive_with(&mut self, run_id: &str, plan: DrivePlan) -> Result<Run, FrameworkError> {
         let plan = match plan {
             DrivePlan::UntilIdleThenWait => DrivePlan::UntilIdle,
@@ -459,9 +382,16 @@ impl<K: KernelApi> Host<K> {
 
     fn claim_module_names(&self, run_id: &str) -> Vec<String> {
         let all: Vec<String> = self.plugins.keys().cloned().collect();
-        match self.run_policies.get(run_id).and_then(|p| p.claim_modules.as_ref()) {
+        match self
+            .run_policies
+            .get(run_id)
+            .and_then(|p| p.claim_modules.as_ref())
+        {
             None => all,
-            Some(allow) => all.into_iter().filter(|m| allow.iter().any(|a| a == m)).collect(),
+            Some(allow) => all
+                .into_iter()
+                .filter(|m| allow.iter().any(|a| a == m))
+                .collect(),
         }
     }
 
@@ -507,7 +437,10 @@ impl<K: KernelApi> Host<K> {
         self.get_run(run_id)
     }
 
-    /// Attempt one claim/execute/commit for `module`. Returns whether work ran.
+    /// Claim → Init → execute (Progress\*) → Final → put/commit for `module`.
+    ///
+    /// Returns whether a work unit ran. On domain execute failure, emits Final
+    /// (if any) and returns [`FrameworkError::StepFailed`] without committing.
     pub fn try_step(&mut self, run_id: &str, module: &str) -> Result<bool, FrameworkError> {
         let work = self.kernel.claim_ready(
             ClaimRequest {
@@ -521,68 +454,115 @@ impl<K: KernelApi> Host<K> {
             return Ok(false);
         }
 
-        let processing = {
+        let mut step = self.load_step(run_id, &work)?;
+
+        // ── Init ──────────────────────────────────────────────────────────
+        let init = {
             let plugin = self
                 .plugins
                 .get(module)
                 .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
-            plugin.processing_ui(&work)
+            plugin.on_init(&step)
         };
-        if let Some(mut view) = processing {
-            fill_processing_ids(&mut view, run_id, &work);
-            self.emit_processing(module, view)?;
+        if let Some(mut p) = init {
+            p.stage = StepStage::Init;
+            p.fill_identity(run_id, &work);
+            self.emit_presentation(module, p)?;
         }
 
-        let step = self.load_step(run_id, &work)?;
-        let output = {
+        // ── Execute (+ buffered Progress) ─────────────────────────────────
+        let exec_result = {
             let plugin = self
                 .plugins
                 .get_mut(module)
                 .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
-            plugin.execute(&step)?
+            plugin.execute(&mut step)
         };
 
-        let mut named_outputs = Vec::with_capacity(output.outputs.len());
-        for out in &output.outputs {
-            let r = self.kernel.put_artifact(
-                Artifact {
-                    r#type: out.contract.clone(),
-                    body: out.body.clone(),
-                    produced_by: module.into(),
-                    ..Default::default()
-                },
-                &self.ctx,
-            )?;
-            named_outputs.push(NamedArtifact {
-                name: out.port.clone(),
-                artifact: Some(r),
-            });
+        let progress = step.take_progress();
+        for p in progress {
+            self.emit_presentation(module, p)?;
         }
 
-        let result_ui = {
-            let plugin = self
-                .plugins
-                .get(module)
-                .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
-            plugin.result_ui(&work, &named_outputs)
-        };
-        if let Some(mut view) = result_ui {
-            fill_result_ids(&mut view, run_id, &work, &named_outputs);
-            self.emit_result(module, view)?;
+        match exec_result {
+            Ok(output) => {
+                let mut named_outputs = Vec::with_capacity(output.outputs.len());
+                for out in &output.outputs {
+                    let r = self.kernel.put_artifact(
+                        Artifact {
+                            r#type: out.contract.clone(),
+                            body: out.body.clone(),
+                            produced_by: module.into(),
+                            ..Default::default()
+                        },
+                        &self.ctx,
+                    )?;
+                    named_outputs.push(NamedArtifact {
+                        name: out.port.clone(),
+                        artifact: Some(r),
+                    });
+                }
+
+                let step_result = StepResult {
+                    ok: true,
+                    outputs: named_outputs.clone(),
+                    error: None,
+                };
+                let final_p = {
+                    let plugin = self
+                        .plugins
+                        .get(module)
+                        .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
+                    plugin.on_final(&step, &step_result)
+                };
+                if let Some(mut p) = final_p {
+                    p.stage = StepStage::Final;
+                    p.fill_identity(run_id, &work);
+                    if p.output_ports.is_empty() {
+                        p.output_ports = named_outputs.iter().map(|o| o.name.clone()).collect();
+                    }
+                    self.emit_presentation(module, p)?;
+                }
+
+                self.kernel.commit(
+                    Derivation {
+                        run_id: run_id.into(),
+                        work_id: work.id,
+                        node_id: work.node_id,
+                        outputs: named_outputs,
+                        ..Default::default()
+                    },
+                    &self.ctx,
+                )?;
+                Ok(true)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let step_result = StepResult {
+                    ok: false,
+                    outputs: Vec::new(),
+                    error: Some(msg.clone()),
+                };
+                let final_p = {
+                    let plugin = self
+                        .plugins
+                        .get(module)
+                        .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
+                    plugin
+                        .on_final(&step, &step_result)
+                        .or_else(|| Some(Presentation::final_failed("Step failed", msg.clone())))
+                };
+                if let Some(mut p) = final_p {
+                    p.stage = StepStage::Final;
+                    p.status = PresentationStatus::Failed;
+                    p.fill_identity(run_id, &work);
+                    let _ = self.emit_presentation(module, p);
+                }
+                // Do not commit; work unit may remain claimed depending on kernel —
+                // MemoryKernel leaves claimed work; product may cancel run.
+                Err(FrameworkError::StepFailed(msg))
+            }
         }
-
-        self.kernel.commit(
-            Derivation {
-                run_id: run_id.into(),
-                work_id: work.id,
-                node_id: work.node_id,
-                outputs: named_outputs,
-                ..Default::default()
-            },
-            &self.ctx,
-        )?;
-
-        Ok(true)
     }
 
     fn load_step(&self, run_id: &str, work: &WorkItem) -> Result<StepContext, FrameworkError> {
@@ -598,22 +578,23 @@ impl<K: KernelApi> Host<K> {
             run_id: run_id.into(),
             work: work.clone(),
             inputs,
+            progress_buf: Vec::new(),
         })
     }
 
-    fn emit_processing(
+    fn emit_presentation(
         &mut self,
         module: &str,
-        view: ProcessingView,
+        presentation: Presentation,
     ) -> Result<(), FrameworkError> {
-        let artifact_id = self.maybe_put_ui(module, CONTRACT_PROCESSING_VIEW, &view)?;
-        self.ui_events.push(UiEvent::Processing { view, artifact_id });
-        Ok(())
-    }
-
-    fn emit_result(&mut self, module: &str, view: ResultView) -> Result<(), FrameworkError> {
-        let artifact_id = self.maybe_put_ui(module, CONTRACT_RESULT_VIEW, &view)?;
-        self.ui_events.push(UiEvent::Result { view, artifact_id });
+        let stage = presentation.stage;
+        let contract = stage.contract_ref();
+        let artifact_id = self.maybe_put_ui(module, contract, &presentation)?;
+        self.step_events.push(StepEvent {
+            stage,
+            presentation,
+            artifact_id,
+        });
         Ok(())
     }
 
@@ -627,7 +608,7 @@ impl<K: KernelApi> Host<K> {
             return Ok(String::new());
         }
         let body = serde_json::to_vec(view)
-            .map_err(|e| FrameworkError::Invalid(format!("serialize ui view: {e}")))?;
+            .map_err(|e| FrameworkError::Invalid(format!("serialize presentation: {e}")))?;
         let r = self.kernel.put_artifact(
             Artifact {
                 r#type: contract.into(),
@@ -638,44 +619,6 @@ impl<K: KernelApi> Host<K> {
             &self.ctx,
         )?;
         Ok(r.id)
-    }
-}
-
-fn fill_processing_ids(view: &mut ProcessingView, run_id: &str, work: &WorkItem) {
-    if view.run_id.is_empty() {
-        view.run_id = run_id.into();
-    }
-    if view.work_id.is_empty() {
-        view.work_id = work.id.clone();
-    }
-    if view.node_id.is_empty() {
-        view.node_id = work.node_id.clone();
-    }
-    if view.module.is_empty() {
-        view.module = work.module.clone();
-    }
-}
-
-fn fill_result_ids(
-    view: &mut ResultView,
-    run_id: &str,
-    work: &WorkItem,
-    outputs: &[NamedArtifact],
-) {
-    if view.run_id.is_empty() {
-        view.run_id = run_id.into();
-    }
-    if view.work_id.is_empty() {
-        view.work_id = work.id.clone();
-    }
-    if view.node_id.is_empty() {
-        view.node_id = work.node_id.clone();
-    }
-    if view.module.is_empty() {
-        view.module = work.module.clone();
-    }
-    if view.output_ports.is_empty() {
-        view.output_ports = outputs.iter().map(|o| o.name.clone()).collect();
     }
 }
 

@@ -13,8 +13,8 @@ cargo clippy --manifest-path framework/rust/Cargo.toml --all-targets -- -D warni
 |------|------|
 | [`Host`](src/lib.rs) | Plugins, `start_pipeline`, `drive` / `inject` / `cancel` |
 | [`FrameworkPolicy`](src/policy.rs) | Modes: converge / stream / stream_dedupe / selective |
-| [`ModulePlugin`](src/lib.rs) | `manifest` + `execute`; optional UI hooks |
-| [`ProcessingView`](src/lib.rs) / [`ResultView`](src/lib.rs) | `srcport.ui.v1` JSON bodies |
+| [`ModulePlugin`](src/lib.rs) | `execute`; `on_init` / `emit_progress` / `on_final` |
+| [`Presentation`](src/presentation.rs) / [`StepEvent`](src/presentation.rs) | Step lifecycle chrome (no real UI) |
 | [`UiPersist`](src/lib.rs) | Host-local events only, or also `PutArtifact` |
 
 Depends only on the public `srcport-substrate` ABI (path dependency on
