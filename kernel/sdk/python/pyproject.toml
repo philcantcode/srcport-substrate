@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srcport-substrate"
-version = "1.1.0"
-description = "In-process Python SDK for the srcport-substrate microkernel: seven primitives and one KernelApi, conformant to SPEC.md (v1.1)."
+version = "2.0.0"
+description = "In-process Python SDK for the srcport-substrate microkernel: seven primitives and one KernelApi, conformant to SPEC.md (v2.0)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT OR Apache-2.0"

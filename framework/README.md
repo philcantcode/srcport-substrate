@@ -89,7 +89,7 @@ framework/
 
 ## Status
 
-**`v0.1.0`** — manual assemblies, Rust host, step presentation lifecycle,
+**`v2.0.0`** — manual assemblies, Rust host, step presentation lifecycle,
 optional `StoragePlan` + `MemoryStorage`. Auto-composer not yet implemented.
 
-Minimum substrate: **v1.1.0**.
+Minimum substrate: **v2.0.0**.

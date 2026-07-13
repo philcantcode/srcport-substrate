@@ -4,7 +4,7 @@ use srcport_framework::{
     FrameworkError, FrameworkPolicy, Host, ModulePlugin, PortBody, Presentation, PresentationStatus,
     StepContext, StepOutput, StepResult, StepStage, UiPersist, CONTRACT_STEP_PROGRESS,
 };
-use srcport_substrate::{
+use srcport_substrate::{artifact_with_trait, has_traits, 
     Artifact, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
     NamedArtifact, NodeOutput, Port, RunState,
 };
@@ -20,12 +20,12 @@ impl ModulePlugin for Scanner {
                 name: "scan.run".into(),
                 inputs: vec![Port {
                     name: "target".into(),
-                    contract: "demo.v1.Target".into(),
+                    traits: vec!["demo.v1.Target".into()],
                     ..Default::default()
                 }],
                 outputs: vec![Port {
                     name: "report".into(),
-                    contract: "demo.v1.Report".into(),
+                    traits: vec!["demo.v1.Report".into()],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -52,14 +52,10 @@ impl ModulePlugin for Scanner {
         let body = step
             .inputs
             .get("target")
-            .map(|a| a.body.clone())
+            .and_then(|a| a.traits.values().next().map(|f| f.body.clone()))
             .unwrap_or_default();
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "report".into(),
-                contract: "demo.v1.Report".into(),
-                body,
-            }],
+            outputs: vec![PortBody::with_trait("report", "demo.v1.Report", body)],
         })
     }
 
@@ -88,12 +84,12 @@ impl ModulePlugin for Boom {
                 name: "boom.run".into(),
                 inputs: vec![Port {
                     name: "in".into(),
-                    contract: "demo.v1.In".into(),
+                    traits: vec!["demo.v1.In".into()],
                     ..Default::default()
                 }],
                 outputs: vec![Port {
                     name: "out".into(),
-                    contract: "demo.v1.Out".into(),
+                    traits: vec!["demo.v1.Out".into()],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -148,12 +144,7 @@ fn init_progress_final_sequence_and_artifacts() {
 
     let target = host
         .kernel()
-        .put_artifact(Artifact {
-            r#type: "demo.v1.Target".into(),
-            body: b"host1".to_vec(),
-            produced_by: "op".into(),
-            ..Default::default()
-        })
+        .put_artifact({ let mut __a = artifact_with_trait("demo.v1.Target", b"host1".to_vec()); __a.produced_by = "op".into(); __a })
         .unwrap();
 
     host.start_pipeline(
@@ -186,7 +177,7 @@ fn init_progress_final_sequence_and_artifacts() {
             id: events[1].artifact_id.clone(),
         })
         .unwrap();
-    assert_eq!(prog.r#type, CONTRACT_STEP_PROGRESS);
+    assert!(has_traits(&prog, &[CONTRACT_STEP_PROGRESS]));
 }
 
 #[test]
@@ -196,12 +187,7 @@ fn failure_emits_final_failed_without_commit() {
 
     let inp = host
         .kernel()
-        .put_artifact(Artifact {
-            r#type: "demo.v1.In".into(),
-            body: b"x".to_vec(),
-            produced_by: "op".into(),
-            ..Default::default()
-        })
+        .put_artifact({ let mut __a = artifact_with_trait("demo.v1.In", b"x".to_vec()); __a.produced_by = "op".into(); __a })
         .unwrap();
 
     host.start_pipeline(

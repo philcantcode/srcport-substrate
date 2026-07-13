@@ -5,7 +5,7 @@ use srcport_framework::{
     ProcessingStatus, ProcessingView, ResultStatus, ResultView, StepContext, StepEvent, StepOutput,
     StepResult, StepStage, UiPersist, CONTRACT_STEP_FINAL, CONTRACT_STEP_INIT,
 };
-use srcport_substrate::{
+use srcport_substrate::{artifact_with_trait, has_traits, 
     Artifact, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
     NamedArtifact, NodeOutput, Port, RunState, WorkItem,
 };
@@ -34,18 +34,17 @@ impl ModulePlugin for Extractor {
             .inputs
             .get("question")
             .ok_or_else(|| FrameworkError::Invalid("missing question".into()))?
-            .body
-            .clone();
+            .traits
+            .values()
+            .next()
+            .map(|f| f.body.clone())
+            .unwrap_or_default();
         step.emit_progress(
             Presentation::progress("Extracting facts", Some(0.5)).with_detail("Reading question…"),
         );
         let facts = format!("facts-from:{}", String::from_utf8_lossy(&q_body));
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "facts".into(),
-                contract: "demo.v1.Facts".into(),
-                body: facts.into_bytes(),
-            }],
+            outputs: vec![PortBody::with_trait("facts", "demo.v1.Facts", facts.into_bytes())],
         })
     }
 
@@ -77,11 +76,7 @@ impl ModulePlugin for Retriever {
 
     fn execute(&mut self, _step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "sources".into(),
-                contract: "demo.v1.Sources".into(),
-                body: b"SPEC.md".to_vec(),
-            }],
+            outputs: vec![PortBody::with_trait("sources", "demo.v1.Sources", b"SPEC.md".to_vec())],
         })
     }
 }
@@ -108,18 +103,14 @@ impl ModulePlugin for Writer {
     }
 
     fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
-        let facts = step.inputs.get("facts").map(|a| a.body.clone()).unwrap_or_default();
-        let sources = step.inputs.get("sources").map(|a| a.body.clone()).unwrap_or_default();
+        let facts = step.inputs.get("facts").and_then(|a| a.traits.values().next().map(|f| f.body.clone())).unwrap_or_default();
+        let sources = step.inputs.get("sources").and_then(|a| a.traits.values().next().map(|f| f.body.clone())).unwrap_or_default();
         let mut body = b"answer:".to_vec();
         body.extend_from_slice(&facts);
         body.push(b'+');
         body.extend_from_slice(&sources);
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "answer".into(),
-                contract: "demo.v1.Answer".into(),
-                body,
-            }],
+            outputs: vec![PortBody::with_trait("answer", "demo.v1.Answer", body)],
         })
     }
 
@@ -144,7 +135,7 @@ impl ModulePlugin for Writer {
 fn port(name: &str, contract: &str) -> Port {
     Port {
         name: name.into(),
-        contract: contract.into(),
+        traits: vec![contract.into()],
         ..Default::default()
     }
 }
@@ -187,12 +178,7 @@ fn host_drives_diamond_with_step_lifecycle() {
 
     let question = host
         .kernel()
-        .put_artifact(Artifact {
-            r#type: "demo.v1.Question".into(),
-            body: b"What is substrate?".to_vec(),
-            produced_by: "operator".into(),
-            ..Default::default()
-        })
+        .put_artifact({ let mut __a = artifact_with_trait("demo.v1.Question", b"What is substrate?".to_vec()); __a.produced_by = "operator".into(); __a })
         .unwrap();
 
     let assembly = Assembly {
@@ -253,7 +239,7 @@ fn host_drives_diamond_with_step_lifecycle() {
             id: extract[0].artifact_id.clone(),
         })
         .unwrap();
-    assert_eq!(art.r#type, CONTRACT_STEP_INIT);
+    assert!(has_traits(&art, &[CONTRACT_STEP_INIT]));
 
     let final_art = host
         .kernel()
@@ -261,7 +247,7 @@ fn host_drives_diamond_with_step_lifecycle() {
             id: extract[2].artifact_id.clone(),
         })
         .unwrap();
-    assert_eq!(final_art.r#type, CONTRACT_STEP_FINAL);
+    assert!(has_traits(&final_art, &[CONTRACT_STEP_FINAL]));
 }
 
 #[test]
@@ -271,12 +257,7 @@ fn headless_plugins_need_no_presentation() {
 
     let question = host
         .kernel()
-        .put_artifact(Artifact {
-            r#type: "demo.v1.Question".into(),
-            body: b"q".to_vec(),
-            produced_by: "op".into(),
-            ..Default::default()
-        })
+        .put_artifact({ let mut __a = artifact_with_trait("demo.v1.Question", b"q".to_vec()); __a.produced_by = "op".into(); __a })
         .unwrap();
 
     host.start_pipeline(

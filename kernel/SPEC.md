@@ -1,4 +1,4 @@
-# srcport-substrate — Specification v1.1.0
+# srcport-substrate — Specification v2.0.0
 
 One canonical contract for every future project. Domain-neutral. Small enough
 to hold in your head. This document and [`substrate.proto`](contracts/proto/srcport/substrate/v1/substrate.proto)
@@ -75,8 +75,8 @@ trusted; modules and host processes are not principals the kernel polices.
 | # | Primitive | Message(s) | Invariant the kernel guarantees |
 |---|-----------|------------|---------------------------------|
 | 1 | **Module** | `ModuleManifest`, `Capability`, `Port`, `Lifecycle`, `TransitionRequest` | A module is a self-contained vertical slice. Capabilities declare typed input/output **ports** (the only I/O typing) and a default **`Firing`** policy (`ONCE` / `ALWAYS` / `ONCE_PER_KEY`). Ports may mark `key` for uniqueness identity (artifact ids only). `requires` is a boot/load **availability hint only** — never run dataflow; the kernel does not gate `LOADED` or `ClaimReady` on it. Lifecycle moves through `REGISTERED → LOADED → ACTIVE → DEACTIVATED` via `Transition` (one forward step at a time) and the module never imports another module. |
-| 2 | **Artifact** | `Artifact`, `ArtifactRef`, `ObjectRef`, `BlobRef` | Typed, content-addressed, **immutable**. Value identity and blob identity are distinct. **Inline (small):** `id = H(type ‖ 0x00 ‖ body)`. **External (large):** `id = H(type ‖ 0x00 ‖ object_ref_bytes(object))` where `object_ref_bytes = digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace`. **Blob identity** is pure content: `digest = "sha256:" + hex(sha256(data))`. Same value ⇒ same artifact id; any change ⇒ a new id. Large blobs live in the content-addressed blob store; artifacts hold a verified `ObjectRef` without copying bytes. Production provenance lives **only** in separate `Derivation` records — not on the Artifact. |
-| 3 | **Contract** | `Contract`, `Port.contract`, `Artifact.type`, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to a contract **identity** (`ref` pinned to a content `digest`), never to each other's code. Ports (and artifact/event types) name the ref. Registration is **immutable**: same ref + different content ⇒ conflict. |
+| 2 | **Artifact** | `Artifact`, `Trait`, `ArtifactRef`, `ObjectRef`, `BlobRef` | A content-addressed, **immutable trait bag**. Value = map of contract ref → `Trait` (inline `body` or external `ObjectRef`). **Identity:** `id = H(canonical_traits)` where for each key in UTF-8 order: `contract_ref ‖ 0x00 ‖ trait_content ‖ 0x00`, and `trait_content` is body or `object_ref_bytes(object)`. **Blob identity** is pure content: `digest = "sha256:" + hex(sha256(data))`. Same bag ⇒ same id; any change ⇒ a new id. `entity_id` / `supersedes` / `meta` / `produced_by` are **not** part of identity. Projection (`project_traits` / `get_trait`) isolates traits without mutation. Provenance lives **only** in `Derivation` records. |
+| 3 | **Contract** | `Contract`, `Port.traits`, `Artifact.traits` keys, `Event.type` | The declarative schema is the **sole** coupling point. Modules couple to contract **identities** (`ref` pinned to a content `digest`), never to each other's code. Ports declare **trait sets** (required on input, guaranteed on output). Registration is **immutable**: same ref + different content ⇒ conflict. |
 | 4 | **Event** | `Event`, `Subscription` | Modules publish to topics and subscribe to topics; they never call each other directly. Every event gets a monotonic `seq` — a **total order** within the kernel. **Artifact refs are the data plane** (`Event.artifacts`); the bus never carries domain value bytes. |
 | 5 | **Ledger** | `LedgerEntry` | Append-only and **hash-chained**. Each entry commits to the previous entry's hash, so the whole history is tamper-evident and fully agent-observable. Every meaningful kernel action writes one entry. |
 | 6 | **Registry** | `RegistrySnapshot` | Discovery. At any moment you can ask the kernel what modules, capabilities, and contracts exist. This is the "what systems are here?" answer, always available. |
@@ -253,7 +253,7 @@ change to chain verification.
   ambiguous.
 - Every required input port has a binding. Multiple bindings require a port
   explicitly marked `multiple`; unbound ports must be explicitly `optional`.
-- Bindings must preserve contract refs. The kernel never parses domain bodies.
+- Bindings use **trait set inclusion**: source guarantees ⊇ target requires (port-to-port), or the actual input artifact has all required traits. The kernel never parses domain bodies.
 - Assemblies are acyclic. Multi-fire is a **work-unit** schedule over time, never
   a cycle edge in the assembly graph.
 - **Work units, not bare nodes.** A work unit is claimed and committed at most
@@ -278,10 +278,10 @@ change to chain verification.
 - A commit records exact input and output artifact refs in a separate immutable
   `Derivation`. Downstream readiness uses the **latest** committed derivation
   per upstream node.
-- Artifact identity remains the typed value: `(type, body)` when inline, or
-  `(type, object_ref_bytes(object))` when external. Equal values share one
-  address while distinct derivations remain separately observable. Blob identity
-  (`digest` of raw bytes) is separate and lives in the blob store.
+- Artifact identity is the **trait bag** (canonical encoding of all traits).
+  Equal bags share one address while distinct derivations remain separately
+  observable. Blob identity (`digest` of raw bytes) is separate and lives in
+  the blob store.
 - **Closure** (`ExecutionPolicy.closure`):
   - `FIRST_TERMINAL` (default / unspecified): terminal output → `COMPLETED`;
     no ready or in-flight work unit → `STALLED`; `max_steps` exhausted →
@@ -326,6 +326,11 @@ Within a major version, evolution is by **addition**, never by mutation:
   `KernelApi` / `MemoryKernel` split. From this tag on, the evolution rules
   above and the breaking-change check are law. Projects pin an exact version
   and upgrade deliberately.
+- **`v2.0.0`** — product/SDK major: **trait bags** as the sole artifact model (formerly drafted as v1.2). Breaking vs v1.x single-type artifacts. Proto package path remains `srcport.substrate.v1` (reserved fields); SDK crates and tags are **2.0.0**.
+- **`v1.2.0`** (draft line, superseded by v2.0.0) — **trait bags** replace single-type artifacts. `Artifact` is
+  a map of contract ref → `Trait`; `Port.traits` declares required/guaranteed
+  sets; matching is set inclusion; projection helpers isolate traits. No
+  backward compatibility with `Artifact.type` / `body` / `Port.contract`.
 - **`v1.1.0`** — additive run-mode surface: `Firing` / `Port.key` on modules,
   `ExecutionPolicy` + `include_nodes` on runs, `InjectInput`, work-unit claim
   identity (`ONCE` / `ALWAYS` / `ONCE_PER_KEY`), and `Closure` (`FIRST_TERMINAL`
@@ -338,9 +343,9 @@ Within a major version, evolution is by **addition**, never by mutation:
 An SDK for any language is conformant iff it upholds every invariant in the table.
 The minimal conformance suite (each SDK ships it) is:
 
-1. **Addressing** — same typed value yields the same `id` (inline: same
-   `(type, body)`; external: same `(type, object_ref_bytes)`); a one-byte change
-   yields a different `id`. (Metamorphic: content change *must* change the address.)
+1. **Addressing** — same trait bag yields the same `id`; a one-byte change in
+   any trait (or a different trait set) yields a different `id`. (Metamorphic:
+   content change *must* change the address.)
 2. **Immutability** — a stored artifact reads back byte-identical and is never
    altered by a later put of the same id.
 3. **Ordering & isolation** — published events reach exactly their subscribers, in
@@ -360,10 +365,9 @@ The minimal conformance suite (each SDK ships it) is:
    registry and the artifact store both round-trip from the tamper-evident chain
    alone. A shared known-answer fixture pins the exact chain hash identically
    across Rust, Go, and Python, so cross-verification is proven, not assumed.
-7. **Address invariance** — `meta` and `produced_by` are not part of the address;
-   an identity-preserving change to them must *not* move the `id`. (Metamorphic:
-   the mirror of #1 — a change that preserves the typed value must preserve the
-   address.) Provenance is a `Derivation`, never part of artifact identity.
+7. **Address invariance** — `meta`, `produced_by`, `entity_id`, and `supersedes`
+   are not part of the address; changing them must *not* move the `id`.
+   Provenance is a `Derivation`, never part of artifact identity.
 8. **Feed-forward convergence** — downstream work is unavailable until every
    typed binding resolves; fan-in supplies the complete input set; under default
    `FIRST_TERMINAL` closure the declared terminal artifact closes the run and a
@@ -378,11 +382,16 @@ The minimal conformance suite (each SDK ships it) is:
     may override. `include_nodes` materialises a valid subset assembly.
 10. **Derivation preservation** — value-equal artifacts share an address while
     distinct production paths remain separately committed and observable.
-11. **Production artifact boundary** — small values inline in `Artifact.body`;
-    large values use a verified `ObjectRef` (digest, byte_count, namespace)
-    after `PutBlob`. Blob identity is `H(data)` only. `GetBlob` verifies digest
-    and size. Typed value identity does not hash blob bytes. Exactly one of
-    body or object is set. The ledger never stores raw blob data.
+11. **Production artifact boundary** — each trait is small inline (`Trait.body`)
+    or a verified `ObjectRef` after `PutBlob`. Blob identity is `H(data)` only.
+    `GetBlob` verifies digest and size. Value identity hashes trait content
+    (object_ref_bytes for external), not raw blob bytes. Exactly one of body or
+    object per trait. The ledger never stores raw blob data; external trait
+    bodies are cleared in `artifact.put` detail (inline bodies retained).
+12. **Trait projection** — a bag with traits `{A, B}` projects to `{A}` or `{B}`
+    as a new in-memory artifact; putting the projection yields a different id
+    unless the projected bag equals a prior put. Port matching is structural
+    inclusion (`has all required traits`), not equality of the full bag.
 
 An SDK is "done" when these pass and the human-owned contract above is unchanged.
 Everything else in the SDK is a leaf you never have to read.

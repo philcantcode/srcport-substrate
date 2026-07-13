@@ -4,7 +4,7 @@ use srcport_framework::{
     DriveAfter, FrameworkError, FrameworkPolicy, Host, ModulePlugin, PortBody, StepContext,
     StepOutput,
 };
-use srcport_substrate::{
+use srcport_substrate::{artifact_with_trait, has_traits, 
     Artifact, Assembly, AssemblyNode, Binding, Capability, Firing, MemoryKernel, ModuleManifest,
     NamedArtifact, NodeOutput, Port, RunState,
 };
@@ -22,12 +22,12 @@ impl ModulePlugin for Echo {
                 name: "echo.run".into(),
                 inputs: vec![Port {
                     name: "in".into(),
-                    contract: "demo.v1.In".into(),
+                    traits: vec!["demo.v1.In".into()],
                     ..Default::default()
                 }],
                 outputs: vec![Port {
                     name: "out".into(),
-                    contract: "demo.v1.Out".into(),
+                    traits: vec!["demo.v1.Out".into()],
                     ..Default::default()
                 }],
                 // Capability default is ONCE; stream policy overrides to ALWAYS.
@@ -42,14 +42,10 @@ impl ModulePlugin for Echo {
         let body = step
             .inputs
             .get("in")
-            .map(|a| a.body.clone())
+            .and_then(|a| a.traits.values().next().map(|f| f.body.clone()))
             .unwrap_or_default();
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "out".into(),
-                contract: "demo.v1.Out".into(),
-                body,
-            }],
+            outputs: vec![PortBody::with_trait("out", "demo.v1.Out", body)],
         })
     }
 }
@@ -73,13 +69,13 @@ impl ModulePlugin for Extractor {
     }
 
     fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
-        let q = step.inputs.get("question").map(|a| &a.body[..]).unwrap_or(b"");
+        let q = step.inputs.get("question").and_then(|a| a.traits.values().next().map(|f| f.body.as_slice())).unwrap_or(b"");
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "facts".into(),
-                contract: "demo.v1.Facts".into(),
-                body: format!("facts:{}" , String::from_utf8_lossy(q)).into_bytes(),
-            }],
+            outputs: vec![PortBody::with_trait(
+                "facts",
+                "demo.v1.Facts",
+                format!("facts:{}", String::from_utf8_lossy(q)).into_bytes(),
+            )],
         })
     }
 }
@@ -105,14 +101,12 @@ impl ModulePlugin for Writer {
     fn execute(&mut self, step: &mut StepContext) -> Result<StepOutput, FrameworkError> {
         let mut body = b"answer:".to_vec();
         if let Some(f) = step.inputs.get("facts") {
-            body.extend_from_slice(&f.body);
+            if let Some(tr) = f.traits.values().next() {
+                body.extend_from_slice(&tr.body);
+            }
         }
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "answer".into(),
-                contract: "demo.v1.Answer".into(),
-                body,
-            }],
+            outputs: vec![PortBody::with_trait("answer", "demo.v1.Answer", body)],
         })
     }
 }
@@ -120,19 +114,14 @@ impl ModulePlugin for Writer {
 fn port(name: &str, contract: &str) -> Port {
     Port {
         name: name.into(),
-        contract: contract.into(),
+        traits: vec![contract.into()],
         ..Default::default()
     }
 }
 
 fn put_in(host: &Host<MemoryKernel>, body: &[u8]) -> srcport_substrate::ArtifactRef {
     host.kernel()
-        .put_artifact(Artifact {
-            r#type: "demo.v1.In".into(),
-            body: body.to_vec(),
-            produced_by: "op".into(),
-            ..Default::default()
-        })
+        .put_artifact({ let mut __a = artifact_with_trait("demo.v1.In", body.to_vec()); __a.produced_by = "op".into(); __a })
         .unwrap()
 }
 
@@ -204,12 +193,7 @@ fn selective_mode_runs_subset_assembly() {
 
     let question = host
         .kernel()
-        .put_artifact(Artifact {
-            r#type: "demo.v1.Question".into(),
-            body: b"q".to_vec(),
-            produced_by: "op".into(),
-            ..Default::default()
-        })
+        .put_artifact({ let mut __a = artifact_with_trait("demo.v1.Question", b"q".to_vec()); __a.produced_by = "op".into(); __a })
         .unwrap();
 
     // Full diamond-shaped assembly textually includes a retrieve node we drop via selective.

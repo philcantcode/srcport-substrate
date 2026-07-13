@@ -140,12 +140,7 @@ fn main() {
 
     // ── 3. THE RUN — freeze the assembly over an immutable input artifact ────
     rule("3. start the Run (freeze the assembly over an input Artifact)");
-    let question = k.put_artifact(Artifact {
-        r#type: "demo.v1.Question".into(),
-        body: b"What makes this substrate reusable?".to_vec(),
-        produced_by: "operator".into(),
-        ..Default::default()
-    }).unwrap();
+    let question = k.put_artifact({ let mut __a = artifact_with_trait("demo.v1.Question", b"What makes this substrate reusable?".to_vec()); __a.produced_by = "operator".into(); __a }).unwrap();
     println!("  {DIM}input{RESET} question = {MAGENTA}{}{RESET}  {DIM}\"What makes this substrate reusable?\"{RESET}", short(&question.id));
 
     k.start_run(RunRequest {
@@ -179,12 +174,7 @@ fn main() {
         "  {GREEN}▶ writer READY{RESET} {DIM}— fan-in supplied {} typed inputs{RESET}",
         write.inputs.len()
     );
-    let answer = k.put_artifact(Artifact {
-        r#type: "demo.v1.Answer".into(),
-        body: b"One versioned contract; every project is just Modules on top.".to_vec(),
-        produced_by: "writer".into(),
-        ..Default::default()
-    }).unwrap();
+    let answer = k.put_artifact({ let mut __a = artifact_with_trait("demo.v1.Answer", b"One versioned contract; every project is just Modules on top.".to_vec()); __a.produced_by = "writer".into(); __a }).unwrap();
     let run = k
         .commit(Derivation {
             run_id: "run-1".into(),
@@ -234,11 +224,10 @@ fn run_node(k: &MemoryKernel, module: &str, out_port: &str, contract: &str, body
         .unwrap();
     assert!(!work.id.is_empty(), "{module} should have a ready node");
     let inputs: Vec<_> = work.inputs.iter().map(|i| i.name.clone()).collect();
-    let artifact = k.put_artifact(Artifact {
-        r#type: contract.into(),
-        body: body.to_vec(),
-        produced_by: module.into(),
-        ..Default::default()
+    let artifact = k.put_artifact({
+        let mut a = artifact_with_trait(contract, body.to_vec());
+        a.produced_by = module.into();
+        a
     }).unwrap();
     k.commit(Derivation {
         run_id: "run-1".into(),
@@ -260,7 +249,11 @@ fn run_node(k: &MemoryKernel, module: &str, out_port: &str, contract: &str, body
 // ── tiny constructors so the domain above reads like a diagram ───────────────
 
 fn port(name: &str, contract: &str) -> Port {
-    Port { name: name.into(), contract: contract.into(), ..Default::default() }
+    Port {
+        name: name.into(),
+        traits: vec![contract.into()],
+        ..Default::default()
+    }
 }
 
 fn node(id: &str, module: &str, version: &str, capability: &str) -> AssemblyNode {

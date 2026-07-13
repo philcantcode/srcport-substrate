@@ -1,10 +1,10 @@
-"""srcport-substrate — Python SDK (v1.1.0, in-process).
+"""srcport-substrate — Python SDK (v2.0.0, in-process).
 
 One pluggable core: seven primitives (Module · Artifact · Contract · Event ·
 Ledger · Registry · Run) and one Kernel ABI, conformant to SPEC.md.
-:class:`MemoryKernel` implements :class:`KernelApi` in-process. Kernel-state
-durability is a :class:`KernelApi` backend concern; domain state lives in
-Modules.
+Artifacts are **trait bags**. :class:`MemoryKernel` implements
+:class:`KernelApi` in-process. Kernel-state durability is a :class:`KernelApi`
+backend concern; domain state lives in Modules.
 """
 
 from ._kernel import (
@@ -38,6 +38,7 @@ from ._types import (
     ErrorCode,
     Event,
     ExecutionPolicy,
+    Trait,
     Firing,
     GetBlobRequest,
     HasBlobRequest,
@@ -66,13 +67,20 @@ from ._types import (
     TransitionAck,
     TransitionRequest,
     WorkItem,
-    artifact_content,
-    artifact_id,
+    artifact_canonical_bytes,
     artifact_id_of,
+    artifact_id_single,
+    artifact_with_external_trait,
+    artifact_with_trait,
     blob_id,
     contract_digest,
     contract_digest_of,
+    trait_content,
+    trait_has_external,
+    trait_set_covers,
+    get_trait,
     has_external_object,
+    has_traits,
     is_contract_placeholder,
     object_ref_bytes,
     verify_chain,

@@ -19,6 +19,7 @@ import hashlib
 from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
     AppendRequest,
     Artifact,
+    Trait,
     ArtifactRef,
     Assembly,
     AssemblyNode,
@@ -68,8 +69,8 @@ from ._gen.srcport.substrate.v1.substrate_pb2 import (  # noqa: F401
 
 _SEP = b"\x00"
 
-# Advisory ceiling for Artifact.body. Larger payloads should put_blob and place
-# a verified ObjectRef. The kernel does not hard-reject oversized inline bodies.
+# Advisory ceiling for a single Trait.body. Larger payloads should put_blob and
+# place a verified ObjectRef on the trait.
 MAX_INLINE_ARTIFACT_BYTES = 1 << 20  # 1 MiB
 
 
@@ -79,7 +80,7 @@ def blob_id(data: bytes) -> str:
 
 
 def object_ref_bytes(obj: ObjectRef) -> bytes:
-    """Address payload for an external Artifact value.
+    """Address payload for an external trait value.
 
     ``digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace``
     """
@@ -92,36 +93,83 @@ def object_ref_bytes(obj: ObjectRef) -> bytes:
     )
 
 
-def has_external_object(artifact: Artifact) -> bool:
-    """Whether *artifact* holds a verified external ObjectRef."""
-    return bool(artifact.object and artifact.object.digest)
+def trait_has_external(trait: Trait) -> bool:
+    """Whether this trait holds a verified external ObjectRef."""
+    return bool(trait.object and trait.object.digest)
 
 
-def artifact_content(artifact: Artifact) -> bytes:
-    """Bytes folded into the Artifact address: body or object_ref_bytes."""
-    if has_external_object(artifact):
-        return object_ref_bytes(artifact.object)
-    return bytes(artifact.body)
+def trait_content(trait: Trait) -> bytes:
+    """Bytes folded into value identity for one trait."""
+    if trait_has_external(trait):
+        return object_ref_bytes(trait.object)
+    return bytes(trait.body)
 
 
-def artifact_id(type: str, content: bytes) -> str:
-    """Content address: ``"sha256:" + hex(sha256(type + 0x00 + content))``.
+def artifact_canonical_bytes(artifact: Artifact) -> bytes:
+    """Canonical encoding of a trait bag for content addressing.
 
-    For inline values pass body; for external values pass ``object_ref_bytes``.
-    Prefer :func:`artifact_id_of` when you have a full Artifact. ``meta`` and
-    ``produced_by`` are deliberately NOT part of the address.
+    For each contract_ref in UTF-8 ascending order::
+
+        contract_ref ‖ 0x00 ‖ trait_content ‖ 0x00
     """
-    h = hashlib.sha256()
-    h.update(type.encode("utf-8"))
-    h.update(_SEP)
-    h.update(content)
-    return "sha256:" + h.hexdigest()
+    out = bytearray()
+    for key in sorted(artifact.traits.keys()):
+        out.extend(key.encode("utf-8"))
+        out.extend(_SEP)
+        out.extend(trait_content(artifact.traits[key]))
+        out.extend(_SEP)
+    return bytes(out)
 
 
 def artifact_id_of(artifact: Artifact) -> str:
-    """Typed value address for a full Artifact (inline or external)."""
-    return artifact_id(artifact.type, artifact_content(artifact))
+    """Content address of a full trait-bag Artifact.
 
+    ``meta``, ``produced_by``, ``entity_id``, and ``supersedes`` are NOT part
+    of the address.
+    """
+    return "sha256:" + hashlib.sha256(artifact_canonical_bytes(artifact)).hexdigest()
+
+
+def artifact_id_single(contract: str, content: bytes) -> str:
+    """Content address of a single-trait bag."""
+    return artifact_id_of(artifact_with_trait(contract, content))
+
+
+def artifact_with_trait(contract: str, body: bytes = b"") -> Artifact:
+    """Build an in-memory single-trait artifact (not yet stored)."""
+    a = Artifact()
+    a.traits[contract].body = bytes(body)
+    return a
+
+
+def artifact_with_external_trait(contract: str, obj: ObjectRef) -> Artifact:
+    """Build a single external-object trait artifact."""
+    a = Artifact()
+    a.traits[contract].object.CopyFrom(obj)
+    return a
+
+
+def has_traits(artifact: Artifact, required: list[str]) -> bool:
+    """True when the artifact contains every listed trait contract ref."""
+    return all(r in artifact.traits for r in required)
+
+
+def trait_set_covers(have: list[str], need: list[str]) -> bool:
+    """True when *have* is a superset of *need*."""
+    s = set(have)
+    return all(n in s for n in need)
+
+
+def get_trait(artifact: Artifact, contract: str) -> Trait | None:
+    """Return the trait for *contract*, or None."""
+    if contract not in artifact.traits:
+        return None
+    return artifact.traits[contract]
+
+
+def has_external_object(artifact: Artifact) -> bool:
+    """Whether any trait holds a verified external ObjectRef."""
+    return any(trait_has_external(f) for f in artifact.traits.values())
 
 def contract_digest(
     media_type: str,

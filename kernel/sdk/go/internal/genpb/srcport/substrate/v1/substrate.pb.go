@@ -6,6 +6,10 @@
 // knows nothing about any domain — no targets, trials, findings, entities,
 // terrain, or content. All of that is a Module built ON TOP of this.
 //
+// Artifacts are trait bundles: a value is a set of contract-typed traits that
+// travel together. Ports require (or guarantee) trait sets; satisfaction is
+// structural inclusion. Projection isolates one trait or a subset.
+//
 // Evolve by ADDING, never by mutating or renumbering a field. See SPEC.md.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -316,7 +320,8 @@ func (ErrorCode) EnumDescriptor() ([]byte, []int) {
 }
 
 // A named thing a module can do. Typed I/O is declared exclusively on ports —
-// modules couple through Port.contract refs, never through each other's code.
+// modules couple through Port.traits contract refs, never through each other's
+// code.
 type Capability struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Name    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // e.g. "recon.scan"
@@ -390,18 +395,24 @@ func (x *Capability) GetFiring() Firing {
 // A named, typed side of a capability. Multiple bindings are permitted only
 // when `multiple` is true; an unbound input is permitted only when `optional`
 // is true. These rules let the kernel determine readiness without parsing data.
+//
+// Typing is a **trait set**: `traits` lists contract refs. On an input port the
+// artifact must *contain* every listed trait (superset OK). On an output port
+// the module *guarantees* those traits will be present (may include more).
+// Assembly binding: source guarantees ⊇ target requires. The kernel never
+// parses trait bodies.
 type Port struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	// Contract *ref* — registry key. The kernel pins ref → digest at PutContract;
-	// the string is an identity handle, not a redefinable label.
-	Contract string `protobuf:"bytes,2,opt,name=contract,proto3" json:"contract,omitempty"`
-	Multiple bool   `protobuf:"varint,3,opt,name=multiple,proto3" json:"multiple,omitempty"`
-	Optional bool   `protobuf:"varint,4,opt,name=optional,proto3" json:"optional,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Name     string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Multiple bool                   `protobuf:"varint,3,opt,name=multiple,proto3" json:"multiple,omitempty"`
+	Optional bool                   `protobuf:"varint,4,opt,name=optional,proto3" json:"optional,omitempty"`
 	// When true, this port participates in FIRING_ONCE_PER_KEY identity. The
 	// kernel hashes artifact ids on key ports (never domain bodies). If no input
 	// port is marked key, all inputs participate.
-	Key           bool `protobuf:"varint,5,opt,name=key,proto3" json:"key,omitempty"`
+	Key bool `protobuf:"varint,5,opt,name=key,proto3" json:"key,omitempty"`
+	// Non-empty list of trait contract refs. Input: required. Output: guaranteed.
+	// Order is insignificant; the kernel normalizes to a set for matching.
+	Traits        []string `protobuf:"bytes,6,rep,name=traits,proto3" json:"traits,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -443,13 +454,6 @@ func (x *Port) GetName() string {
 	return ""
 }
 
-func (x *Port) GetContract() string {
-	if x != nil {
-		return x.Contract
-	}
-	return ""
-}
-
 func (x *Port) GetMultiple() bool {
 	if x != nil {
 		return x.Multiple
@@ -469,6 +473,13 @@ func (x *Port) GetKey() bool {
 		return x.Key
 	}
 	return false
+}
+
+func (x *Port) GetTraits() []string {
+	if x != nil {
+		return x.Traits
+	}
+	return nil
 }
 
 type ModuleManifest struct {
@@ -604,7 +615,7 @@ func (x *BlobRef) GetNamespace() string {
 }
 
 // Verified external object reference. Same fields as BlobRef; named separately
-// because it participates in typed Artifact value identity.
+// because it participates in typed Artifact value identity (via a Trait).
 type ObjectRef struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Digest        string                 `protobuf:"bytes,1,opt,name=digest,proto3" json:"digest,omitempty"`                         // blob digest; must match stored bytes
@@ -665,25 +676,83 @@ func (x *ObjectRef) GetNamespace() string {
 	return ""
 }
 
-type Artifact struct {
+// One contract-typed payload inside a trait bundle.
+type Trait struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`     // content address, assigned by the kernel
-	Type  string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"` // contract ref describing the value
 	// Small inline value. Must be empty when `object` is set.
-	Body       []byte            `protobuf:"bytes,3,opt,name=body,proto3" json:"body,omitempty"`
-	Meta       map[string]string `protobuf:"bytes,4,rep,name=meta,proto3" json:"meta,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	ProducedBy string            `protobuf:"bytes,5,opt,name=produced_by,json=producedBy,proto3" json:"produced_by,omitempty"` // module name
+	Body []byte `protobuf:"bytes,1,opt,name=body,proto3" json:"body,omitempty"`
 	// Large external value: a verified ref to a blob. When digest is non-empty,
-	// Artifact id hashes object_ref_bytes(object), not the blob bytes, and body
+	// trait content hashes object_ref_bytes(object), not the blob bytes, and body
 	// must be empty. The blob must already exist in `object.namespace`.
-	Object        *ObjectRef `protobuf:"bytes,7,opt,name=object,proto3" json:"object,omitempty"`
+	Object        *ObjectRef `protobuf:"bytes,2,opt,name=object,proto3" json:"object,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Trait) Reset() {
+	*x = Trait{}
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Trait) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Trait) ProtoMessage() {}
+
+func (x *Trait) ProtoReflect() protoreflect.Message {
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Trait.ProtoReflect.Descriptor instead.
+func (*Trait) Descriptor() ([]byte, []int) {
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *Trait) GetBody() []byte {
+	if x != nil {
+		return x.Body
+	}
+	return nil
+}
+
+func (x *Trait) GetObject() *ObjectRef {
+	if x != nil {
+		return x.Object
+	}
+	return nil
+}
+
+type Artifact struct {
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Id         string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"` // content address, assigned by the kernel
+	Meta       map[string]string      `protobuf:"bytes,4,rep,name=meta,proto3" json:"meta,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	ProducedBy string                 `protobuf:"bytes,5,opt,name=produced_by,json=producedBy,proto3" json:"produced_by,omitempty"` // module name (not part of value id)
+	// Trait bag: key = contract ref. At least one entry required.
+	Traits map[string]*Trait `protobuf:"bytes,8,rep,name=traits,proto3" json:"traits,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Optional stable entity identity across enrichments (e.g. "file:abc").
+	// NOT part of value identity — copy forward when merging traits.
+	EntityId string `protobuf:"bytes,9,opt,name=entity_id,json=entityId,proto3" json:"entity_id,omitempty"`
+	// Optional prior artifact id this value supersedes (lineage hint).
+	// NOT part of value identity.
+	Supersedes    string `protobuf:"bytes,10,opt,name=supersedes,proto3" json:"supersedes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Artifact) Reset() {
 	*x = Artifact{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[5]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -695,7 +764,7 @@ func (x *Artifact) String() string {
 func (*Artifact) ProtoMessage() {}
 
 func (x *Artifact) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[5]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -708,7 +777,7 @@ func (x *Artifact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Artifact.ProtoReflect.Descriptor instead.
 func (*Artifact) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{5}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Artifact) GetId() string {
@@ -716,20 +785,6 @@ func (x *Artifact) GetId() string {
 		return x.Id
 	}
 	return ""
-}
-
-func (x *Artifact) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
-}
-
-func (x *Artifact) GetBody() []byte {
-	if x != nil {
-		return x.Body
-	}
-	return nil
 }
 
 func (x *Artifact) GetMeta() map[string]string {
@@ -746,11 +801,25 @@ func (x *Artifact) GetProducedBy() string {
 	return ""
 }
 
-func (x *Artifact) GetObject() *ObjectRef {
+func (x *Artifact) GetTraits() map[string]*Trait {
 	if x != nil {
-		return x.Object
+		return x.Traits
 	}
 	return nil
+}
+
+func (x *Artifact) GetEntityId() string {
+	if x != nil {
+		return x.EntityId
+	}
+	return ""
+}
+
+func (x *Artifact) GetSupersedes() string {
+	if x != nil {
+		return x.Supersedes
+	}
+	return ""
 }
 
 type ArtifactRef struct {
@@ -762,7 +831,7 @@ type ArtifactRef struct {
 
 func (x *ArtifactRef) Reset() {
 	*x = ArtifactRef{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[6]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -774,7 +843,7 @@ func (x *ArtifactRef) String() string {
 func (*ArtifactRef) ProtoMessage() {}
 
 func (x *ArtifactRef) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[6]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -787,7 +856,7 @@ func (x *ArtifactRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ArtifactRef.ProtoReflect.Descriptor instead.
 func (*ArtifactRef) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{6}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ArtifactRef) GetId() string {
@@ -808,7 +877,7 @@ type PutBlobRequest struct {
 
 func (x *PutBlobRequest) Reset() {
 	*x = PutBlobRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[7]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -820,7 +889,7 @@ func (x *PutBlobRequest) String() string {
 func (*PutBlobRequest) ProtoMessage() {}
 
 func (x *PutBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[7]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -833,7 +902,7 @@ func (x *PutBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutBlobRequest.ProtoReflect.Descriptor instead.
 func (*PutBlobRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{7}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PutBlobRequest) GetNamespace() string {
@@ -860,7 +929,7 @@ type GetBlobRequest struct {
 
 func (x *GetBlobRequest) Reset() {
 	*x = GetBlobRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[8]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -872,7 +941,7 @@ func (x *GetBlobRequest) String() string {
 func (*GetBlobRequest) ProtoMessage() {}
 
 func (x *GetBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[8]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -885,7 +954,7 @@ func (x *GetBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetBlobRequest.ProtoReflect.Descriptor instead.
 func (*GetBlobRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{8}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GetBlobRequest) GetDigest() string {
@@ -914,7 +983,7 @@ type BlobData struct {
 
 func (x *BlobData) Reset() {
 	*x = BlobData{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[9]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -926,7 +995,7 @@ func (x *BlobData) String() string {
 func (*BlobData) ProtoMessage() {}
 
 func (x *BlobData) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[9]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -939,7 +1008,7 @@ func (x *BlobData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BlobData.ProtoReflect.Descriptor instead.
 func (*BlobData) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{9}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *BlobData) GetDigest() string {
@@ -980,7 +1049,7 @@ type HasBlobRequest struct {
 
 func (x *HasBlobRequest) Reset() {
 	*x = HasBlobRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[10]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -992,7 +1061,7 @@ func (x *HasBlobRequest) String() string {
 func (*HasBlobRequest) ProtoMessage() {}
 
 func (x *HasBlobRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[10]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1005,7 +1074,7 @@ func (x *HasBlobRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HasBlobRequest.ProtoReflect.Descriptor instead.
 func (*HasBlobRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{10}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HasBlobRequest) GetDigest() string {
@@ -1032,7 +1101,7 @@ type HasBlobResponse struct {
 
 func (x *HasBlobResponse) Reset() {
 	*x = HasBlobResponse{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[11]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1044,7 +1113,7 @@ func (x *HasBlobResponse) String() string {
 func (*HasBlobResponse) ProtoMessage() {}
 
 func (x *HasBlobResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[11]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1057,7 +1126,7 @@ func (x *HasBlobResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HasBlobResponse.ProtoReflect.Descriptor instead.
 func (*HasBlobResponse) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{11}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *HasBlobResponse) GetExists() bool {
@@ -1085,6 +1154,7 @@ type Contract struct {
 	Digest    string `protobuf:"bytes,5,opt,name=digest,proto3" json:"digest,omitempty"`   // content address; assigned by the kernel on put
 	// Optional: other contract refs this one claims compatibility with. Advisory
 	// only — does not rewrite or alias those refs. Sorted UTF-8 on registration.
+	// Does NOT participate in trait set matching (structural inclusion does).
 	CompatibleWith []string `protobuf:"bytes,6,rep,name=compatible_with,json=compatibleWith,proto3" json:"compatible_with,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
@@ -1092,7 +1162,7 @@ type Contract struct {
 
 func (x *Contract) Reset() {
 	*x = Contract{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[12]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1104,7 +1174,7 @@ func (x *Contract) String() string {
 func (*Contract) ProtoMessage() {}
 
 func (x *Contract) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[12]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1117,7 +1187,7 @@ func (x *Contract) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Contract.ProtoReflect.Descriptor instead.
 func (*Contract) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{12}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *Contract) GetRef() string {
@@ -1179,7 +1249,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[13]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1191,7 +1261,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[13]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1204,7 +1274,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{13}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Event) GetId() string {
@@ -1263,7 +1333,7 @@ type LedgerEntry struct {
 	Subject string                 `protobuf:"bytes,3,opt,name=subject,proto3" json:"subject,omitempty"` // id of the thing this entry is about
 	Detail  []byte                 `protobuf:"bytes,4,opt,name=detail,proto3" json:"detail,omitempty"`   // canonical proto of one message, keyed by `kind` (see
 	// SPEC.md "Ledger detail"); large content already
-	// addressed by `subject` (artifact body bytes, blob
+	// addressed by `subject` (trait body bytes, blob
 	// data) is cleared; verified ObjectRef / BlobRef
 	// metadata remains.
 	PrevHash      string `protobuf:"bytes,5,opt,name=prev_hash,json=prevHash,proto3" json:"prev_hash,omitempty"` // hash of entry seq-1 ("" for genesis)
@@ -1274,7 +1344,7 @@ type LedgerEntry struct {
 
 func (x *LedgerEntry) Reset() {
 	*x = LedgerEntry{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[14]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1286,7 +1356,7 @@ func (x *LedgerEntry) String() string {
 func (*LedgerEntry) ProtoMessage() {}
 
 func (x *LedgerEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[14]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1299,7 +1369,7 @@ func (x *LedgerEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LedgerEntry.ProtoReflect.Descriptor instead.
 func (*LedgerEntry) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{14}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *LedgerEntry) GetSeq() uint64 {
@@ -1355,7 +1425,7 @@ type RegistrySnapshot struct {
 
 func (x *RegistrySnapshot) Reset() {
 	*x = RegistrySnapshot{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[15]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1367,7 +1437,7 @@ func (x *RegistrySnapshot) String() string {
 func (*RegistrySnapshot) ProtoMessage() {}
 
 func (x *RegistrySnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[15]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1380,7 +1450,7 @@ func (x *RegistrySnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegistrySnapshot.ProtoReflect.Descriptor instead.
 func (*RegistrySnapshot) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{15}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *RegistrySnapshot) GetModules() []*ModuleManifest {
@@ -1414,7 +1484,7 @@ type NamedArtifact struct {
 
 func (x *NamedArtifact) Reset() {
 	*x = NamedArtifact{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[16]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1426,7 +1496,7 @@ func (x *NamedArtifact) String() string {
 func (*NamedArtifact) ProtoMessage() {}
 
 func (x *NamedArtifact) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[16]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1439,7 +1509,7 @@ func (x *NamedArtifact) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NamedArtifact.ProtoReflect.Descriptor instead.
 func (*NamedArtifact) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{16}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *NamedArtifact) GetName() string {
@@ -1468,7 +1538,7 @@ type AssemblyNode struct {
 
 func (x *AssemblyNode) Reset() {
 	*x = AssemblyNode{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[17]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1480,7 +1550,7 @@ func (x *AssemblyNode) String() string {
 func (*AssemblyNode) ProtoMessage() {}
 
 func (x *AssemblyNode) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[17]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1493,7 +1563,7 @@ func (x *AssemblyNode) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AssemblyNode.ProtoReflect.Descriptor instead.
 func (*AssemblyNode) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{17}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *AssemblyNode) GetId() string {
@@ -1539,7 +1609,7 @@ type Binding struct {
 
 func (x *Binding) Reset() {
 	*x = Binding{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[18]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1551,7 +1621,7 @@ func (x *Binding) String() string {
 func (*Binding) ProtoMessage() {}
 
 func (x *Binding) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[18]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1564,7 +1634,7 @@ func (x *Binding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Binding.ProtoReflect.Descriptor instead.
 func (*Binding) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{18}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Binding) GetToNode() string {
@@ -1612,7 +1682,7 @@ type NodeOutput struct {
 
 func (x *NodeOutput) Reset() {
 	*x = NodeOutput{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[19]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1624,7 +1694,7 @@ func (x *NodeOutput) String() string {
 func (*NodeOutput) ProtoMessage() {}
 
 func (x *NodeOutput) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[19]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1637,7 +1707,7 @@ func (x *NodeOutput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeOutput.ProtoReflect.Descriptor instead.
 func (*NodeOutput) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{19}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *NodeOutput) GetNode() string {
@@ -1665,7 +1735,7 @@ type Limits struct {
 
 func (x *Limits) Reset() {
 	*x = Limits{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[20]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1677,7 +1747,7 @@ func (x *Limits) String() string {
 func (*Limits) ProtoMessage() {}
 
 func (x *Limits) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[20]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1690,7 +1760,7 @@ func (x *Limits) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Limits.ProtoReflect.Descriptor instead.
 func (*Limits) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{20}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *Limits) GetMaxSteps() uint64 {
@@ -1713,7 +1783,7 @@ type ExecutionPolicy struct {
 
 func (x *ExecutionPolicy) Reset() {
 	*x = ExecutionPolicy{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[21]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1725,7 +1795,7 @@ func (x *ExecutionPolicy) String() string {
 func (*ExecutionPolicy) ProtoMessage() {}
 
 func (x *ExecutionPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[21]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1738,7 +1808,7 @@ func (x *ExecutionPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionPolicy.ProtoReflect.Descriptor instead.
 func (*ExecutionPolicy) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{21}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ExecutionPolicy) GetDefault() Firing {
@@ -1774,7 +1844,7 @@ type Assembly struct {
 
 func (x *Assembly) Reset() {
 	*x = Assembly{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[22]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1786,7 +1856,7 @@ func (x *Assembly) String() string {
 func (*Assembly) ProtoMessage() {}
 
 func (x *Assembly) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[22]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1799,7 +1869,7 @@ func (x *Assembly) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Assembly.ProtoReflect.Descriptor instead.
 func (*Assembly) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{22}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *Assembly) GetId() string {
@@ -1846,7 +1916,7 @@ type RunRequest struct {
 
 func (x *RunRequest) Reset() {
 	*x = RunRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[23]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1858,7 +1928,7 @@ func (x *RunRequest) String() string {
 func (*RunRequest) ProtoMessage() {}
 
 func (x *RunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[23]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1871,7 +1941,7 @@ func (x *RunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunRequest.ProtoReflect.Descriptor instead.
 func (*RunRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{23}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *RunRequest) GetId() string {
@@ -1934,7 +2004,7 @@ type Run struct {
 
 func (x *Run) Reset() {
 	*x = Run{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[24]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1946,7 +2016,7 @@ func (x *Run) String() string {
 func (*Run) ProtoMessage() {}
 
 func (x *Run) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[24]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1959,7 +2029,7 @@ func (x *Run) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Run.ProtoReflect.Descriptor instead.
 func (*Run) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{24}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *Run) GetId() string {
@@ -2034,7 +2104,7 @@ type RunRef struct {
 
 func (x *RunRef) Reset() {
 	*x = RunRef{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[25]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2046,7 +2116,7 @@ func (x *RunRef) String() string {
 func (*RunRef) ProtoMessage() {}
 
 func (x *RunRef) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[25]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2059,7 +2129,7 @@ func (x *RunRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunRef.ProtoReflect.Descriptor instead.
 func (*RunRef) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{25}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *RunRef) GetId() string {
@@ -2082,7 +2152,7 @@ type InjectInputRequest struct {
 
 func (x *InjectInputRequest) Reset() {
 	*x = InjectInputRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[26]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2094,7 +2164,7 @@ func (x *InjectInputRequest) String() string {
 func (*InjectInputRequest) ProtoMessage() {}
 
 func (x *InjectInputRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[26]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2107,7 +2177,7 @@ func (x *InjectInputRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InjectInputRequest.ProtoReflect.Descriptor instead.
 func (*InjectInputRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{26}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *InjectInputRequest) GetRunId() string {
@@ -2134,7 +2204,7 @@ type ClaimRequest struct {
 
 func (x *ClaimRequest) Reset() {
 	*x = ClaimRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[27]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2146,7 +2216,7 @@ func (x *ClaimRequest) String() string {
 func (*ClaimRequest) ProtoMessage() {}
 
 func (x *ClaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[27]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2159,7 +2229,7 @@ func (x *ClaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimRequest.ProtoReflect.Descriptor instead.
 func (*ClaimRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{27}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ClaimRequest) GetRunId() string {
@@ -2191,7 +2261,7 @@ type WorkItem struct {
 
 func (x *WorkItem) Reset() {
 	*x = WorkItem{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[28]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2203,7 +2273,7 @@ func (x *WorkItem) String() string {
 func (*WorkItem) ProtoMessage() {}
 
 func (x *WorkItem) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[28]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2216,7 +2286,7 @@ func (x *WorkItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkItem.ProtoReflect.Descriptor instead.
 func (*WorkItem) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{28}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *WorkItem) GetId() string {
@@ -2268,8 +2338,8 @@ func (x *WorkItem) GetInputs() []*NamedArtifact {
 	return nil
 }
 
-// Provenance is separate from Artifact identity: equal values converge to one
-// Artifact while every distinct production path remains observable.
+// Provenance is separate from Artifact identity: equal trait bags converge to
+// one Artifact while every distinct production path remains observable.
 type Derivation struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -2287,7 +2357,7 @@ type Derivation struct {
 
 func (x *Derivation) Reset() {
 	*x = Derivation{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[29]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2299,7 +2369,7 @@ func (x *Derivation) String() string {
 func (*Derivation) ProtoMessage() {}
 
 func (x *Derivation) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[29]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2312,7 +2382,7 @@ func (x *Derivation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Derivation.ProtoReflect.Descriptor instead.
 func (*Derivation) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{29}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *Derivation) GetId() string {
@@ -2387,7 +2457,7 @@ type DerivationList struct {
 
 func (x *DerivationList) Reset() {
 	*x = DerivationList{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[30]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2399,7 +2469,7 @@ func (x *DerivationList) String() string {
 func (*DerivationList) ProtoMessage() {}
 
 func (x *DerivationList) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[30]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2412,7 +2482,7 @@ func (x *DerivationList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DerivationList.ProtoReflect.Descriptor instead.
 func (*DerivationList) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{30}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *DerivationList) GetDerivations() []*Derivation {
@@ -2455,7 +2525,7 @@ type RequestContext struct {
 
 func (x *RequestContext) Reset() {
 	*x = RequestContext{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[31]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2467,7 +2537,7 @@ func (x *RequestContext) String() string {
 func (*RequestContext) ProtoMessage() {}
 
 func (x *RequestContext) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[31]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2480,7 +2550,7 @@ func (x *RequestContext) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RequestContext.ProtoReflect.Descriptor instead.
 func (*RequestContext) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{31}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RequestContext) GetCaller() string {
@@ -2524,7 +2594,7 @@ type Error struct {
 
 func (x *Error) Reset() {
 	*x = Error{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[32]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2536,7 +2606,7 @@ func (x *Error) String() string {
 func (*Error) ProtoMessage() {}
 
 func (x *Error) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[32]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2549,7 +2619,7 @@ func (x *Error) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Error.ProtoReflect.Descriptor instead.
 func (*Error) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{32}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *Error) GetCode() ErrorCode {
@@ -2596,7 +2666,7 @@ type RegisterAck struct {
 
 func (x *RegisterAck) Reset() {
 	*x = RegisterAck{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[33]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2608,7 +2678,7 @@ func (x *RegisterAck) String() string {
 func (*RegisterAck) ProtoMessage() {}
 
 func (x *RegisterAck) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[33]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2621,7 +2691,7 @@ func (x *RegisterAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterAck.ProtoReflect.Descriptor instead.
 func (*RegisterAck) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{33}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *RegisterAck) GetState() Lifecycle {
@@ -2640,7 +2710,7 @@ type PublishAck struct {
 
 func (x *PublishAck) Reset() {
 	*x = PublishAck{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[34]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2652,7 +2722,7 @@ func (x *PublishAck) String() string {
 func (*PublishAck) ProtoMessage() {}
 
 func (x *PublishAck) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[34]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2665,7 +2735,7 @@ func (x *PublishAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishAck.ProtoReflect.Descriptor instead.
 func (*PublishAck) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{34}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *PublishAck) GetSeq() uint64 {
@@ -2685,7 +2755,7 @@ type Subscription struct {
 
 func (x *Subscription) Reset() {
 	*x = Subscription{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[35]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2697,7 +2767,7 @@ func (x *Subscription) String() string {
 func (*Subscription) ProtoMessage() {}
 
 func (x *Subscription) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[35]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2710,7 +2780,7 @@ func (x *Subscription) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Subscription.ProtoReflect.Descriptor instead.
 func (*Subscription) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{35}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *Subscription) GetModule() string {
@@ -2735,7 +2805,7 @@ type SnapshotRequest struct {
 
 func (x *SnapshotRequest) Reset() {
 	*x = SnapshotRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[36]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2747,7 +2817,7 @@ func (x *SnapshotRequest) String() string {
 func (*SnapshotRequest) ProtoMessage() {}
 
 func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[36]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2760,7 +2830,7 @@ func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SnapshotRequest.ProtoReflect.Descriptor instead.
 func (*SnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{36}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{37}
 }
 
 type AppendRequest struct {
@@ -2774,7 +2844,7 @@ type AppendRequest struct {
 
 func (x *AppendRequest) Reset() {
 	*x = AppendRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[37]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2786,7 +2856,7 @@ func (x *AppendRequest) String() string {
 func (*AppendRequest) ProtoMessage() {}
 
 func (x *AppendRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[37]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2799,7 +2869,7 @@ func (x *AppendRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppendRequest.ProtoReflect.Descriptor instead.
 func (*AppendRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{37}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *AppendRequest) GetKind() string {
@@ -2835,7 +2905,7 @@ type TransitionRequest struct {
 
 func (x *TransitionRequest) Reset() {
 	*x = TransitionRequest{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[38]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2847,7 +2917,7 @@ func (x *TransitionRequest) String() string {
 func (*TransitionRequest) ProtoMessage() {}
 
 func (x *TransitionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[38]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2860,7 +2930,7 @@ func (x *TransitionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransitionRequest.ProtoReflect.Descriptor instead.
 func (*TransitionRequest) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{38}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *TransitionRequest) GetModule() string {
@@ -2886,7 +2956,7 @@ type TransitionAck struct {
 
 func (x *TransitionAck) Reset() {
 	*x = TransitionAck{}
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[39]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2898,7 +2968,7 @@ func (x *TransitionAck) String() string {
 func (*TransitionAck) ProtoMessage() {}
 
 func (x *TransitionAck) ProtoReflect() protoreflect.Message {
-	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[39]
+	mi := &file_srcport_substrate_v1_substrate_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2911,7 +2981,7 @@ func (x *TransitionAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransitionAck.ProtoReflect.Descriptor instead.
 func (*TransitionAck) Descriptor() ([]byte, []int) {
-	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{39}
+	return file_srcport_substrate_v1_substrate_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *TransitionAck) GetState() Lifecycle {
@@ -2941,54 +3011,70 @@ var file_srcport_substrate_v1_substrate_proto_rawDesc = string([]byte{
 	0x6f, 0x72, 0x74, 0x2e, 0x73, 0x75, 0x62, 0x73, 0x74, 0x72, 0x61, 0x74, 0x65, 0x2e, 0x76, 0x31,
 	0x2e, 0x46, 0x69, 0x72, 0x69, 0x6e, 0x67, 0x52, 0x06, 0x66, 0x69, 0x72, 0x69, 0x6e, 0x67, 0x4a,
 	0x04, 0x08, 0x02, 0x10, 0x03, 0x52, 0x08, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x22,
-	0x80, 0x01, 0x0a, 0x04, 0x50, 0x6f, 0x72, 0x74, 0x12, 0x12, 0x0a, 0x04, 0x6e, 0x61, 0x6d, 0x65,
+	0x8c, 0x01, 0x0a, 0x04, 0x50, 0x6f, 0x72, 0x74, 0x12, 0x12, 0x0a, 0x04, 0x6e, 0x61, 0x6d, 0x65,
 	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x12, 0x1a, 0x0a, 0x08,
-	0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08,
-	0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x12, 0x1a, 0x0a, 0x08, 0x6d, 0x75, 0x6c, 0x74,
-	0x69, 0x70, 0x6c, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x08, 0x6d, 0x75, 0x6c, 0x74,
-	0x69, 0x70, 0x6c, 0x65, 0x12, 0x1a, 0x0a, 0x08, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x61, 0x6c,
-	0x18, 0x04, 0x20, 0x01, 0x28, 0x08, 0x52, 0x08, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x61, 0x6c,
-	0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x05, 0x20, 0x01, 0x28, 0x08, 0x52, 0x03, 0x6b,
-	0x65, 0x79, 0x22, 0x98, 0x01, 0x0a, 0x0e, 0x4d, 0x6f, 0x64, 0x75, 0x6c, 0x65, 0x4d, 0x61, 0x6e,
-	0x69, 0x66, 0x65, 0x73, 0x74, 0x12, 0x12, 0x0a, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x18, 0x01, 0x20,
-	0x01, 0x28, 0x09, 0x52, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x12, 0x18, 0x0a, 0x07, 0x76, 0x65, 0x72,
-	0x73, 0x69, 0x6f, 0x6e, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x76, 0x65, 0x72, 0x73,
-	0x69, 0x6f, 0x6e, 0x12, 0x3c, 0x0a, 0x08, 0x70, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x73, 0x18,
-	0x03, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x20, 0x2e, 0x73, 0x72, 0x63, 0x70, 0x6f, 0x72, 0x74, 0x2e,
-	0x73, 0x75, 0x62, 0x73, 0x74, 0x72, 0x61, 0x74, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x43, 0x61, 0x70,
-	0x61, 0x62, 0x69, 0x6c, 0x69, 0x74, 0x79, 0x52, 0x08, 0x70, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65,
-	0x73, 0x12, 0x1a, 0x0a, 0x08, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65, 0x73, 0x18, 0x04, 0x20,
-	0x03, 0x28, 0x09, 0x52, 0x08, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65, 0x73, 0x22, 0x5e, 0x0a,
-	0x07, 0x42, 0x6c, 0x6f, 0x62, 0x52, 0x65, 0x66, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x69, 0x67, 0x65,
-	0x73, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74,
-	0x12, 0x1d, 0x0a, 0x0a, 0x62, 0x79, 0x74, 0x65, 0x5f, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x18, 0x02,
-	0x20, 0x01, 0x28, 0x04, 0x52, 0x09, 0x62, 0x79, 0x74, 0x65, 0x43, 0x6f, 0x75, 0x6e, 0x74, 0x12,
-	0x1c, 0x0a, 0x09, 0x6e, 0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x18, 0x03, 0x20, 0x01,
-	0x28, 0x09, 0x52, 0x09, 0x6e, 0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x22, 0x60, 0x0a,
-	0x09, 0x4f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x52, 0x65, 0x66, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x69,
-	0x67, 0x65, 0x73, 0x74, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x64, 0x69, 0x67, 0x65,
-	0x73, 0x74, 0x12, 0x1d, 0x0a, 0x0a, 0x62, 0x79, 0x74, 0x65, 0x5f, 0x63, 0x6f, 0x75, 0x6e, 0x74,
-	0x18, 0x02, 0x20, 0x01, 0x28, 0x04, 0x52, 0x09, 0x62, 0x79, 0x74, 0x65, 0x43, 0x6f, 0x75, 0x6e,
-	0x74, 0x12, 0x1c, 0x0a, 0x09, 0x6e, 0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x18, 0x03,
-	0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x6e, 0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x22,
-	0xa7, 0x02, 0x0a, 0x08, 0x41, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74, 0x12, 0x0e, 0x0a, 0x02,
-	0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x02, 0x69, 0x64, 0x12, 0x12, 0x0a, 0x04,
-	0x74, 0x79, 0x70, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x74, 0x79, 0x70, 0x65,
-	0x12, 0x12, 0x0a, 0x04, 0x62, 0x6f, 0x64, 0x79, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x04,
-	0x62, 0x6f, 0x64, 0x79, 0x12, 0x3c, 0x0a, 0x04, 0x6d, 0x65, 0x74, 0x61, 0x18, 0x04, 0x20, 0x03,
-	0x28, 0x0b, 0x32, 0x28, 0x2e, 0x73, 0x72, 0x63, 0x70, 0x6f, 0x72, 0x74, 0x2e, 0x73, 0x75, 0x62,
-	0x73, 0x74, 0x72, 0x61, 0x74, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x41, 0x72, 0x74, 0x69, 0x66, 0x61,
-	0x63, 0x74, 0x2e, 0x4d, 0x65, 0x74, 0x61, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x04, 0x6d, 0x65,
-	0x74, 0x61, 0x12, 0x1f, 0x0a, 0x0b, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x65, 0x64, 0x5f, 0x62,
-	0x79, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x65,
-	0x64, 0x42, 0x79, 0x12, 0x37, 0x0a, 0x06, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x18, 0x07, 0x20,
-	0x01, 0x28, 0x0b, 0x32, 0x1f, 0x2e, 0x73, 0x72, 0x63, 0x70, 0x6f, 0x72, 0x74, 0x2e, 0x73, 0x75,
-	0x62, 0x73, 0x74, 0x72, 0x61, 0x74, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x4f, 0x62, 0x6a, 0x65, 0x63,
-	0x74, 0x52, 0x65, 0x66, 0x52, 0x06, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x1a, 0x37, 0x0a, 0x09,
-	0x4d, 0x65, 0x74, 0x61, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79,
-	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a, 0x05, 0x76,
-	0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75,
-	0x65, 0x3a, 0x02, 0x38, 0x01, 0x4a, 0x04, 0x08, 0x06, 0x10, 0x07, 0x52, 0x0c, 0x64, 0x65, 0x72,
+	0x6d, 0x75, 0x6c, 0x74, 0x69, 0x70, 0x6c, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x08, 0x52, 0x08,
+	0x6d, 0x75, 0x6c, 0x74, 0x69, 0x70, 0x6c, 0x65, 0x12, 0x1a, 0x0a, 0x08, 0x6f, 0x70, 0x74, 0x69,
+	0x6f, 0x6e, 0x61, 0x6c, 0x18, 0x04, 0x20, 0x01, 0x28, 0x08, 0x52, 0x08, 0x6f, 0x70, 0x74, 0x69,
+	0x6f, 0x6e, 0x61, 0x6c, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x05, 0x20, 0x01, 0x28,
+	0x08, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x16, 0x0a, 0x06, 0x74, 0x72, 0x61, 0x69, 0x74, 0x73,
+	0x18, 0x06, 0x20, 0x03, 0x28, 0x09, 0x52, 0x06, 0x74, 0x72, 0x61, 0x69, 0x74, 0x73, 0x4a, 0x04,
+	0x08, 0x02, 0x10, 0x03, 0x52, 0x08, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x61, 0x63, 0x74, 0x22, 0x98,
+	0x01, 0x0a, 0x0e, 0x4d, 0x6f, 0x64, 0x75, 0x6c, 0x65, 0x4d, 0x61, 0x6e, 0x69, 0x66, 0x65, 0x73,
+	0x74, 0x12, 0x12, 0x0a, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52,
+	0x04, 0x6e, 0x61, 0x6d, 0x65, 0x12, 0x18, 0x0a, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e,
+	0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x12,
+	0x3c, 0x0a, 0x08, 0x70, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x73, 0x18, 0x03, 0x20, 0x03, 0x28,
+	0x0b, 0x32, 0x20, 0x2e, 0x73, 0x72, 0x63, 0x70, 0x6f, 0x72, 0x74, 0x2e, 0x73, 0x75, 0x62, 0x73,
+	0x74, 0x72, 0x61, 0x74, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x43, 0x61, 0x70, 0x61, 0x62, 0x69, 0x6c,
+	0x69, 0x74, 0x79, 0x52, 0x08, 0x70, 0x72, 0x6f, 0x76, 0x69, 0x64, 0x65, 0x73, 0x12, 0x1a, 0x0a,
+	0x08, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65, 0x73, 0x18, 0x04, 0x20, 0x03, 0x28, 0x09, 0x52,
+	0x08, 0x72, 0x65, 0x71, 0x75, 0x69, 0x72, 0x65, 0x73, 0x22, 0x5e, 0x0a, 0x07, 0x42, 0x6c, 0x6f,
+	0x62, 0x52, 0x65, 0x66, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0x18, 0x01,
+	0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0x12, 0x1d, 0x0a, 0x0a,
+	0x62, 0x79, 0x74, 0x65, 0x5f, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x18, 0x02, 0x20, 0x01, 0x28, 0x04,
+	0x52, 0x09, 0x62, 0x79, 0x74, 0x65, 0x43, 0x6f, 0x75, 0x6e, 0x74, 0x12, 0x1c, 0x0a, 0x09, 0x6e,
+	0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09,
+	0x6e, 0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x22, 0x60, 0x0a, 0x09, 0x4f, 0x62, 0x6a,
+	0x65, 0x63, 0x74, 0x52, 0x65, 0x66, 0x12, 0x16, 0x0a, 0x06, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74,
+	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0x12, 0x1d,
+	0x0a, 0x0a, 0x62, 0x79, 0x74, 0x65, 0x5f, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x18, 0x02, 0x20, 0x01,
+	0x28, 0x04, 0x52, 0x09, 0x62, 0x79, 0x74, 0x65, 0x43, 0x6f, 0x75, 0x6e, 0x74, 0x12, 0x1c, 0x0a,
+	0x09, 0x6e, 0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09,
+	0x52, 0x09, 0x6e, 0x61, 0x6d, 0x65, 0x73, 0x70, 0x61, 0x63, 0x65, 0x22, 0x54, 0x0a, 0x05, 0x54,
+	0x72, 0x61, 0x69, 0x74, 0x12, 0x12, 0x0a, 0x04, 0x62, 0x6f, 0x64, 0x79, 0x18, 0x01, 0x20, 0x01,
+	0x28, 0x0c, 0x52, 0x04, 0x62, 0x6f, 0x64, 0x79, 0x12, 0x37, 0x0a, 0x06, 0x6f, 0x62, 0x6a, 0x65,
+	0x63, 0x74, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1f, 0x2e, 0x73, 0x72, 0x63, 0x70, 0x6f,
+	0x72, 0x74, 0x2e, 0x73, 0x75, 0x62, 0x73, 0x74, 0x72, 0x61, 0x74, 0x65, 0x2e, 0x76, 0x31, 0x2e,
+	0x4f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x52, 0x65, 0x66, 0x52, 0x06, 0x6f, 0x62, 0x6a, 0x65, 0x63,
+	0x74, 0x22, 0xc5, 0x03, 0x0a, 0x08, 0x41, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74, 0x12, 0x0e,
+	0x0a, 0x02, 0x69, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x02, 0x69, 0x64, 0x12, 0x3c,
+	0x0a, 0x04, 0x6d, 0x65, 0x74, 0x61, 0x18, 0x04, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x28, 0x2e, 0x73,
+	0x72, 0x63, 0x70, 0x6f, 0x72, 0x74, 0x2e, 0x73, 0x75, 0x62, 0x73, 0x74, 0x72, 0x61, 0x74, 0x65,
+	0x2e, 0x76, 0x31, 0x2e, 0x41, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74, 0x2e, 0x4d, 0x65, 0x74,
+	0x61, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x04, 0x6d, 0x65, 0x74, 0x61, 0x12, 0x1f, 0x0a, 0x0b,
+	0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x65, 0x64, 0x5f, 0x62, 0x79, 0x18, 0x05, 0x20, 0x01, 0x28,
+	0x09, 0x52, 0x0a, 0x70, 0x72, 0x6f, 0x64, 0x75, 0x63, 0x65, 0x64, 0x42, 0x79, 0x12, 0x42, 0x0a,
+	0x06, 0x74, 0x72, 0x61, 0x69, 0x74, 0x73, 0x18, 0x08, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x2a, 0x2e,
+	0x73, 0x72, 0x63, 0x70, 0x6f, 0x72, 0x74, 0x2e, 0x73, 0x75, 0x62, 0x73, 0x74, 0x72, 0x61, 0x74,
+	0x65, 0x2e, 0x76, 0x31, 0x2e, 0x41, 0x72, 0x74, 0x69, 0x66, 0x61, 0x63, 0x74, 0x2e, 0x54, 0x72,
+	0x61, 0x69, 0x74, 0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x52, 0x06, 0x74, 0x72, 0x61, 0x69, 0x74,
+	0x73, 0x12, 0x1b, 0x0a, 0x09, 0x65, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x5f, 0x69, 0x64, 0x18, 0x09,
+	0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x65, 0x6e, 0x74, 0x69, 0x74, 0x79, 0x49, 0x64, 0x12, 0x1e,
+	0x0a, 0x0a, 0x73, 0x75, 0x70, 0x65, 0x72, 0x73, 0x65, 0x64, 0x65, 0x73, 0x18, 0x0a, 0x20, 0x01,
+	0x28, 0x09, 0x52, 0x0a, 0x73, 0x75, 0x70, 0x65, 0x72, 0x73, 0x65, 0x64, 0x65, 0x73, 0x1a, 0x37,
+	0x0a, 0x09, 0x4d, 0x65, 0x74, 0x61, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b,
+	0x65, 0x79, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x14, 0x0a,
+	0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x76, 0x61,
+	0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x1a, 0x56, 0x0a, 0x0b, 0x54, 0x72, 0x61, 0x69, 0x74,
+	0x73, 0x45, 0x6e, 0x74, 0x72, 0x79, 0x12, 0x10, 0x0a, 0x03, 0x6b, 0x65, 0x79, 0x18, 0x01, 0x20,
+	0x01, 0x28, 0x09, 0x52, 0x03, 0x6b, 0x65, 0x79, 0x12, 0x31, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75,
+	0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x1b, 0x2e, 0x73, 0x72, 0x63, 0x70, 0x6f, 0x72,
+	0x74, 0x2e, 0x73, 0x75, 0x62, 0x73, 0x74, 0x72, 0x61, 0x74, 0x65, 0x2e, 0x76, 0x31, 0x2e, 0x54,
+	0x72, 0x61, 0x69, 0x74, 0x52, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x3a, 0x02, 0x38, 0x01, 0x4a,
+	0x04, 0x08, 0x02, 0x10, 0x03, 0x4a, 0x04, 0x08, 0x03, 0x10, 0x04, 0x4a, 0x04, 0x08, 0x07, 0x10,
+	0x08, 0x4a, 0x04, 0x08, 0x06, 0x10, 0x07, 0x52, 0x04, 0x74, 0x79, 0x70, 0x65, 0x52, 0x04, 0x62,
+	0x6f, 0x64, 0x79, 0x52, 0x06, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x52, 0x0c, 0x64, 0x65, 0x72,
 	0x69, 0x76, 0x65, 0x64, 0x5f, 0x66, 0x72, 0x6f, 0x6d, 0x22, 0x1d, 0x0a, 0x0b, 0x41, 0x72, 0x74,
 	0x69, 0x66, 0x61, 0x63, 0x74, 0x52, 0x65, 0x66, 0x12, 0x0e, 0x0a, 0x02, 0x69, 0x64, 0x18, 0x01,
 	0x20, 0x01, 0x28, 0x09, 0x52, 0x02, 0x69, 0x64, 0x22, 0x42, 0x0a, 0x0e, 0x50, 0x75, 0x74, 0x42,
@@ -3443,7 +3529,7 @@ func file_srcport_substrate_v1_substrate_proto_rawDescGZIP() []byte {
 }
 
 var file_srcport_substrate_v1_substrate_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
-var file_srcport_substrate_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
+var file_srcport_substrate_v1_substrate_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
 var file_srcport_substrate_v1_substrate_proto_goTypes = []any{
 	(Lifecycle)(0),             // 0: srcport.substrate.v1.Lifecycle
 	(Firing)(0),                // 1: srcport.substrate.v1.Firing
@@ -3455,124 +3541,128 @@ var file_srcport_substrate_v1_substrate_proto_goTypes = []any{
 	(*ModuleManifest)(nil),     // 7: srcport.substrate.v1.ModuleManifest
 	(*BlobRef)(nil),            // 8: srcport.substrate.v1.BlobRef
 	(*ObjectRef)(nil),          // 9: srcport.substrate.v1.ObjectRef
-	(*Artifact)(nil),           // 10: srcport.substrate.v1.Artifact
-	(*ArtifactRef)(nil),        // 11: srcport.substrate.v1.ArtifactRef
-	(*PutBlobRequest)(nil),     // 12: srcport.substrate.v1.PutBlobRequest
-	(*GetBlobRequest)(nil),     // 13: srcport.substrate.v1.GetBlobRequest
-	(*BlobData)(nil),           // 14: srcport.substrate.v1.BlobData
-	(*HasBlobRequest)(nil),     // 15: srcport.substrate.v1.HasBlobRequest
-	(*HasBlobResponse)(nil),    // 16: srcport.substrate.v1.HasBlobResponse
-	(*Contract)(nil),           // 17: srcport.substrate.v1.Contract
-	(*Event)(nil),              // 18: srcport.substrate.v1.Event
-	(*LedgerEntry)(nil),        // 19: srcport.substrate.v1.LedgerEntry
-	(*RegistrySnapshot)(nil),   // 20: srcport.substrate.v1.RegistrySnapshot
-	(*NamedArtifact)(nil),      // 21: srcport.substrate.v1.NamedArtifact
-	(*AssemblyNode)(nil),       // 22: srcport.substrate.v1.AssemblyNode
-	(*Binding)(nil),            // 23: srcport.substrate.v1.Binding
-	(*NodeOutput)(nil),         // 24: srcport.substrate.v1.NodeOutput
-	(*Limits)(nil),             // 25: srcport.substrate.v1.Limits
-	(*ExecutionPolicy)(nil),    // 26: srcport.substrate.v1.ExecutionPolicy
-	(*Assembly)(nil),           // 27: srcport.substrate.v1.Assembly
-	(*RunRequest)(nil),         // 28: srcport.substrate.v1.RunRequest
-	(*Run)(nil),                // 29: srcport.substrate.v1.Run
-	(*RunRef)(nil),             // 30: srcport.substrate.v1.RunRef
-	(*InjectInputRequest)(nil), // 31: srcport.substrate.v1.InjectInputRequest
-	(*ClaimRequest)(nil),       // 32: srcport.substrate.v1.ClaimRequest
-	(*WorkItem)(nil),           // 33: srcport.substrate.v1.WorkItem
-	(*Derivation)(nil),         // 34: srcport.substrate.v1.Derivation
-	(*DerivationList)(nil),     // 35: srcport.substrate.v1.DerivationList
-	(*RequestContext)(nil),     // 36: srcport.substrate.v1.RequestContext
-	(*Error)(nil),              // 37: srcport.substrate.v1.Error
-	(*RegisterAck)(nil),        // 38: srcport.substrate.v1.RegisterAck
-	(*PublishAck)(nil),         // 39: srcport.substrate.v1.PublishAck
-	(*Subscription)(nil),       // 40: srcport.substrate.v1.Subscription
-	(*SnapshotRequest)(nil),    // 41: srcport.substrate.v1.SnapshotRequest
-	(*AppendRequest)(nil),      // 42: srcport.substrate.v1.AppendRequest
-	(*TransitionRequest)(nil),  // 43: srcport.substrate.v1.TransitionRequest
-	(*TransitionAck)(nil),      // 44: srcport.substrate.v1.TransitionAck
-	nil,                        // 45: srcport.substrate.v1.Artifact.MetaEntry
-	nil,                        // 46: srcport.substrate.v1.ExecutionPolicy.ByNodeEntry
+	(*Trait)(nil),              // 10: srcport.substrate.v1.Trait
+	(*Artifact)(nil),           // 11: srcport.substrate.v1.Artifact
+	(*ArtifactRef)(nil),        // 12: srcport.substrate.v1.ArtifactRef
+	(*PutBlobRequest)(nil),     // 13: srcport.substrate.v1.PutBlobRequest
+	(*GetBlobRequest)(nil),     // 14: srcport.substrate.v1.GetBlobRequest
+	(*BlobData)(nil),           // 15: srcport.substrate.v1.BlobData
+	(*HasBlobRequest)(nil),     // 16: srcport.substrate.v1.HasBlobRequest
+	(*HasBlobResponse)(nil),    // 17: srcport.substrate.v1.HasBlobResponse
+	(*Contract)(nil),           // 18: srcport.substrate.v1.Contract
+	(*Event)(nil),              // 19: srcport.substrate.v1.Event
+	(*LedgerEntry)(nil),        // 20: srcport.substrate.v1.LedgerEntry
+	(*RegistrySnapshot)(nil),   // 21: srcport.substrate.v1.RegistrySnapshot
+	(*NamedArtifact)(nil),      // 22: srcport.substrate.v1.NamedArtifact
+	(*AssemblyNode)(nil),       // 23: srcport.substrate.v1.AssemblyNode
+	(*Binding)(nil),            // 24: srcport.substrate.v1.Binding
+	(*NodeOutput)(nil),         // 25: srcport.substrate.v1.NodeOutput
+	(*Limits)(nil),             // 26: srcport.substrate.v1.Limits
+	(*ExecutionPolicy)(nil),    // 27: srcport.substrate.v1.ExecutionPolicy
+	(*Assembly)(nil),           // 28: srcport.substrate.v1.Assembly
+	(*RunRequest)(nil),         // 29: srcport.substrate.v1.RunRequest
+	(*Run)(nil),                // 30: srcport.substrate.v1.Run
+	(*RunRef)(nil),             // 31: srcport.substrate.v1.RunRef
+	(*InjectInputRequest)(nil), // 32: srcport.substrate.v1.InjectInputRequest
+	(*ClaimRequest)(nil),       // 33: srcport.substrate.v1.ClaimRequest
+	(*WorkItem)(nil),           // 34: srcport.substrate.v1.WorkItem
+	(*Derivation)(nil),         // 35: srcport.substrate.v1.Derivation
+	(*DerivationList)(nil),     // 36: srcport.substrate.v1.DerivationList
+	(*RequestContext)(nil),     // 37: srcport.substrate.v1.RequestContext
+	(*Error)(nil),              // 38: srcport.substrate.v1.Error
+	(*RegisterAck)(nil),        // 39: srcport.substrate.v1.RegisterAck
+	(*PublishAck)(nil),         // 40: srcport.substrate.v1.PublishAck
+	(*Subscription)(nil),       // 41: srcport.substrate.v1.Subscription
+	(*SnapshotRequest)(nil),    // 42: srcport.substrate.v1.SnapshotRequest
+	(*AppendRequest)(nil),      // 43: srcport.substrate.v1.AppendRequest
+	(*TransitionRequest)(nil),  // 44: srcport.substrate.v1.TransitionRequest
+	(*TransitionAck)(nil),      // 45: srcport.substrate.v1.TransitionAck
+	nil,                        // 46: srcport.substrate.v1.Artifact.MetaEntry
+	nil,                        // 47: srcport.substrate.v1.Artifact.TraitsEntry
+	nil,                        // 48: srcport.substrate.v1.ExecutionPolicy.ByNodeEntry
 }
 var file_srcport_substrate_v1_substrate_proto_depIdxs = []int32{
 	6,  // 0: srcport.substrate.v1.Capability.inputs:type_name -> srcport.substrate.v1.Port
 	6,  // 1: srcport.substrate.v1.Capability.outputs:type_name -> srcport.substrate.v1.Port
 	1,  // 2: srcport.substrate.v1.Capability.firing:type_name -> srcport.substrate.v1.Firing
 	5,  // 3: srcport.substrate.v1.ModuleManifest.provides:type_name -> srcport.substrate.v1.Capability
-	45, // 4: srcport.substrate.v1.Artifact.meta:type_name -> srcport.substrate.v1.Artifact.MetaEntry
-	9,  // 5: srcport.substrate.v1.Artifact.object:type_name -> srcport.substrate.v1.ObjectRef
-	11, // 6: srcport.substrate.v1.Event.artifacts:type_name -> srcport.substrate.v1.ArtifactRef
-	7,  // 7: srcport.substrate.v1.RegistrySnapshot.modules:type_name -> srcport.substrate.v1.ModuleManifest
-	5,  // 8: srcport.substrate.v1.RegistrySnapshot.capabilities:type_name -> srcport.substrate.v1.Capability
-	17, // 9: srcport.substrate.v1.RegistrySnapshot.contracts:type_name -> srcport.substrate.v1.Contract
-	11, // 10: srcport.substrate.v1.NamedArtifact.artifact:type_name -> srcport.substrate.v1.ArtifactRef
-	1,  // 11: srcport.substrate.v1.ExecutionPolicy.default:type_name -> srcport.substrate.v1.Firing
-	46, // 12: srcport.substrate.v1.ExecutionPolicy.by_node:type_name -> srcport.substrate.v1.ExecutionPolicy.ByNodeEntry
-	2,  // 13: srcport.substrate.v1.ExecutionPolicy.closure:type_name -> srcport.substrate.v1.Closure
-	22, // 14: srcport.substrate.v1.Assembly.nodes:type_name -> srcport.substrate.v1.AssemblyNode
-	23, // 15: srcport.substrate.v1.Assembly.bindings:type_name -> srcport.substrate.v1.Binding
-	24, // 16: srcport.substrate.v1.Assembly.terminal:type_name -> srcport.substrate.v1.NodeOutput
-	27, // 17: srcport.substrate.v1.RunRequest.assembly:type_name -> srcport.substrate.v1.Assembly
-	21, // 18: srcport.substrate.v1.RunRequest.inputs:type_name -> srcport.substrate.v1.NamedArtifact
-	25, // 19: srcport.substrate.v1.RunRequest.limits:type_name -> srcport.substrate.v1.Limits
-	26, // 20: srcport.substrate.v1.RunRequest.policy:type_name -> srcport.substrate.v1.ExecutionPolicy
-	27, // 21: srcport.substrate.v1.Run.assembly:type_name -> srcport.substrate.v1.Assembly
-	21, // 22: srcport.substrate.v1.Run.inputs:type_name -> srcport.substrate.v1.NamedArtifact
-	3,  // 23: srcport.substrate.v1.Run.state:type_name -> srcport.substrate.v1.RunState
-	11, // 24: srcport.substrate.v1.Run.answer:type_name -> srcport.substrate.v1.ArtifactRef
-	26, // 25: srcport.substrate.v1.Run.policy:type_name -> srcport.substrate.v1.ExecutionPolicy
-	21, // 26: srcport.substrate.v1.InjectInputRequest.input:type_name -> srcport.substrate.v1.NamedArtifact
-	21, // 27: srcport.substrate.v1.WorkItem.inputs:type_name -> srcport.substrate.v1.NamedArtifact
-	21, // 28: srcport.substrate.v1.Derivation.inputs:type_name -> srcport.substrate.v1.NamedArtifact
-	21, // 29: srcport.substrate.v1.Derivation.outputs:type_name -> srcport.substrate.v1.NamedArtifact
-	34, // 30: srcport.substrate.v1.DerivationList.derivations:type_name -> srcport.substrate.v1.Derivation
-	4,  // 31: srcport.substrate.v1.Error.code:type_name -> srcport.substrate.v1.ErrorCode
-	0,  // 32: srcport.substrate.v1.RegisterAck.state:type_name -> srcport.substrate.v1.Lifecycle
-	0,  // 33: srcport.substrate.v1.TransitionRequest.to:type_name -> srcport.substrate.v1.Lifecycle
-	0,  // 34: srcport.substrate.v1.TransitionAck.state:type_name -> srcport.substrate.v1.Lifecycle
-	1,  // 35: srcport.substrate.v1.ExecutionPolicy.ByNodeEntry.value:type_name -> srcport.substrate.v1.Firing
-	7,  // 36: srcport.substrate.v1.Kernel.Register:input_type -> srcport.substrate.v1.ModuleManifest
-	43, // 37: srcport.substrate.v1.Kernel.Transition:input_type -> srcport.substrate.v1.TransitionRequest
-	10, // 38: srcport.substrate.v1.Kernel.PutArtifact:input_type -> srcport.substrate.v1.Artifact
-	11, // 39: srcport.substrate.v1.Kernel.GetArtifact:input_type -> srcport.substrate.v1.ArtifactRef
-	12, // 40: srcport.substrate.v1.Kernel.PutBlob:input_type -> srcport.substrate.v1.PutBlobRequest
-	13, // 41: srcport.substrate.v1.Kernel.GetBlob:input_type -> srcport.substrate.v1.GetBlobRequest
-	15, // 42: srcport.substrate.v1.Kernel.HasBlob:input_type -> srcport.substrate.v1.HasBlobRequest
-	17, // 43: srcport.substrate.v1.Kernel.PutContract:input_type -> srcport.substrate.v1.Contract
-	18, // 44: srcport.substrate.v1.Kernel.Publish:input_type -> srcport.substrate.v1.Event
-	40, // 45: srcport.substrate.v1.Kernel.Subscribe:input_type -> srcport.substrate.v1.Subscription
-	42, // 46: srcport.substrate.v1.Kernel.Append:input_type -> srcport.substrate.v1.AppendRequest
-	41, // 47: srcport.substrate.v1.Kernel.Snapshot:input_type -> srcport.substrate.v1.SnapshotRequest
-	28, // 48: srcport.substrate.v1.Kernel.StartRun:input_type -> srcport.substrate.v1.RunRequest
-	31, // 49: srcport.substrate.v1.Kernel.InjectInput:input_type -> srcport.substrate.v1.InjectInputRequest
-	32, // 50: srcport.substrate.v1.Kernel.ClaimReady:input_type -> srcport.substrate.v1.ClaimRequest
-	34, // 51: srcport.substrate.v1.Kernel.Commit:input_type -> srcport.substrate.v1.Derivation
-	30, // 52: srcport.substrate.v1.Kernel.GetRun:input_type -> srcport.substrate.v1.RunRef
-	30, // 53: srcport.substrate.v1.Kernel.CancelRun:input_type -> srcport.substrate.v1.RunRef
-	30, // 54: srcport.substrate.v1.Kernel.ListDerivations:input_type -> srcport.substrate.v1.RunRef
-	38, // 55: srcport.substrate.v1.Kernel.Register:output_type -> srcport.substrate.v1.RegisterAck
-	44, // 56: srcport.substrate.v1.Kernel.Transition:output_type -> srcport.substrate.v1.TransitionAck
-	11, // 57: srcport.substrate.v1.Kernel.PutArtifact:output_type -> srcport.substrate.v1.ArtifactRef
-	10, // 58: srcport.substrate.v1.Kernel.GetArtifact:output_type -> srcport.substrate.v1.Artifact
-	8,  // 59: srcport.substrate.v1.Kernel.PutBlob:output_type -> srcport.substrate.v1.BlobRef
-	14, // 60: srcport.substrate.v1.Kernel.GetBlob:output_type -> srcport.substrate.v1.BlobData
-	16, // 61: srcport.substrate.v1.Kernel.HasBlob:output_type -> srcport.substrate.v1.HasBlobResponse
-	17, // 62: srcport.substrate.v1.Kernel.PutContract:output_type -> srcport.substrate.v1.Contract
-	39, // 63: srcport.substrate.v1.Kernel.Publish:output_type -> srcport.substrate.v1.PublishAck
-	18, // 64: srcport.substrate.v1.Kernel.Subscribe:output_type -> srcport.substrate.v1.Event
-	19, // 65: srcport.substrate.v1.Kernel.Append:output_type -> srcport.substrate.v1.LedgerEntry
-	20, // 66: srcport.substrate.v1.Kernel.Snapshot:output_type -> srcport.substrate.v1.RegistrySnapshot
-	29, // 67: srcport.substrate.v1.Kernel.StartRun:output_type -> srcport.substrate.v1.Run
-	29, // 68: srcport.substrate.v1.Kernel.InjectInput:output_type -> srcport.substrate.v1.Run
-	33, // 69: srcport.substrate.v1.Kernel.ClaimReady:output_type -> srcport.substrate.v1.WorkItem
-	29, // 70: srcport.substrate.v1.Kernel.Commit:output_type -> srcport.substrate.v1.Run
-	29, // 71: srcport.substrate.v1.Kernel.GetRun:output_type -> srcport.substrate.v1.Run
-	29, // 72: srcport.substrate.v1.Kernel.CancelRun:output_type -> srcport.substrate.v1.Run
-	35, // 73: srcport.substrate.v1.Kernel.ListDerivations:output_type -> srcport.substrate.v1.DerivationList
-	55, // [55:74] is the sub-list for method output_type
-	36, // [36:55] is the sub-list for method input_type
-	36, // [36:36] is the sub-list for extension type_name
-	36, // [36:36] is the sub-list for extension extendee
-	0,  // [0:36] is the sub-list for field type_name
+	9,  // 4: srcport.substrate.v1.Trait.object:type_name -> srcport.substrate.v1.ObjectRef
+	46, // 5: srcport.substrate.v1.Artifact.meta:type_name -> srcport.substrate.v1.Artifact.MetaEntry
+	47, // 6: srcport.substrate.v1.Artifact.traits:type_name -> srcport.substrate.v1.Artifact.TraitsEntry
+	12, // 7: srcport.substrate.v1.Event.artifacts:type_name -> srcport.substrate.v1.ArtifactRef
+	7,  // 8: srcport.substrate.v1.RegistrySnapshot.modules:type_name -> srcport.substrate.v1.ModuleManifest
+	5,  // 9: srcport.substrate.v1.RegistrySnapshot.capabilities:type_name -> srcport.substrate.v1.Capability
+	18, // 10: srcport.substrate.v1.RegistrySnapshot.contracts:type_name -> srcport.substrate.v1.Contract
+	12, // 11: srcport.substrate.v1.NamedArtifact.artifact:type_name -> srcport.substrate.v1.ArtifactRef
+	1,  // 12: srcport.substrate.v1.ExecutionPolicy.default:type_name -> srcport.substrate.v1.Firing
+	48, // 13: srcport.substrate.v1.ExecutionPolicy.by_node:type_name -> srcport.substrate.v1.ExecutionPolicy.ByNodeEntry
+	2,  // 14: srcport.substrate.v1.ExecutionPolicy.closure:type_name -> srcport.substrate.v1.Closure
+	23, // 15: srcport.substrate.v1.Assembly.nodes:type_name -> srcport.substrate.v1.AssemblyNode
+	24, // 16: srcport.substrate.v1.Assembly.bindings:type_name -> srcport.substrate.v1.Binding
+	25, // 17: srcport.substrate.v1.Assembly.terminal:type_name -> srcport.substrate.v1.NodeOutput
+	28, // 18: srcport.substrate.v1.RunRequest.assembly:type_name -> srcport.substrate.v1.Assembly
+	22, // 19: srcport.substrate.v1.RunRequest.inputs:type_name -> srcport.substrate.v1.NamedArtifact
+	26, // 20: srcport.substrate.v1.RunRequest.limits:type_name -> srcport.substrate.v1.Limits
+	27, // 21: srcport.substrate.v1.RunRequest.policy:type_name -> srcport.substrate.v1.ExecutionPolicy
+	28, // 22: srcport.substrate.v1.Run.assembly:type_name -> srcport.substrate.v1.Assembly
+	22, // 23: srcport.substrate.v1.Run.inputs:type_name -> srcport.substrate.v1.NamedArtifact
+	3,  // 24: srcport.substrate.v1.Run.state:type_name -> srcport.substrate.v1.RunState
+	12, // 25: srcport.substrate.v1.Run.answer:type_name -> srcport.substrate.v1.ArtifactRef
+	27, // 26: srcport.substrate.v1.Run.policy:type_name -> srcport.substrate.v1.ExecutionPolicy
+	22, // 27: srcport.substrate.v1.InjectInputRequest.input:type_name -> srcport.substrate.v1.NamedArtifact
+	22, // 28: srcport.substrate.v1.WorkItem.inputs:type_name -> srcport.substrate.v1.NamedArtifact
+	22, // 29: srcport.substrate.v1.Derivation.inputs:type_name -> srcport.substrate.v1.NamedArtifact
+	22, // 30: srcport.substrate.v1.Derivation.outputs:type_name -> srcport.substrate.v1.NamedArtifact
+	35, // 31: srcport.substrate.v1.DerivationList.derivations:type_name -> srcport.substrate.v1.Derivation
+	4,  // 32: srcport.substrate.v1.Error.code:type_name -> srcport.substrate.v1.ErrorCode
+	0,  // 33: srcport.substrate.v1.RegisterAck.state:type_name -> srcport.substrate.v1.Lifecycle
+	0,  // 34: srcport.substrate.v1.TransitionRequest.to:type_name -> srcport.substrate.v1.Lifecycle
+	0,  // 35: srcport.substrate.v1.TransitionAck.state:type_name -> srcport.substrate.v1.Lifecycle
+	10, // 36: srcport.substrate.v1.Artifact.TraitsEntry.value:type_name -> srcport.substrate.v1.Trait
+	1,  // 37: srcport.substrate.v1.ExecutionPolicy.ByNodeEntry.value:type_name -> srcport.substrate.v1.Firing
+	7,  // 38: srcport.substrate.v1.Kernel.Register:input_type -> srcport.substrate.v1.ModuleManifest
+	44, // 39: srcport.substrate.v1.Kernel.Transition:input_type -> srcport.substrate.v1.TransitionRequest
+	11, // 40: srcport.substrate.v1.Kernel.PutArtifact:input_type -> srcport.substrate.v1.Artifact
+	12, // 41: srcport.substrate.v1.Kernel.GetArtifact:input_type -> srcport.substrate.v1.ArtifactRef
+	13, // 42: srcport.substrate.v1.Kernel.PutBlob:input_type -> srcport.substrate.v1.PutBlobRequest
+	14, // 43: srcport.substrate.v1.Kernel.GetBlob:input_type -> srcport.substrate.v1.GetBlobRequest
+	16, // 44: srcport.substrate.v1.Kernel.HasBlob:input_type -> srcport.substrate.v1.HasBlobRequest
+	18, // 45: srcport.substrate.v1.Kernel.PutContract:input_type -> srcport.substrate.v1.Contract
+	19, // 46: srcport.substrate.v1.Kernel.Publish:input_type -> srcport.substrate.v1.Event
+	41, // 47: srcport.substrate.v1.Kernel.Subscribe:input_type -> srcport.substrate.v1.Subscription
+	43, // 48: srcport.substrate.v1.Kernel.Append:input_type -> srcport.substrate.v1.AppendRequest
+	42, // 49: srcport.substrate.v1.Kernel.Snapshot:input_type -> srcport.substrate.v1.SnapshotRequest
+	29, // 50: srcport.substrate.v1.Kernel.StartRun:input_type -> srcport.substrate.v1.RunRequest
+	32, // 51: srcport.substrate.v1.Kernel.InjectInput:input_type -> srcport.substrate.v1.InjectInputRequest
+	33, // 52: srcport.substrate.v1.Kernel.ClaimReady:input_type -> srcport.substrate.v1.ClaimRequest
+	35, // 53: srcport.substrate.v1.Kernel.Commit:input_type -> srcport.substrate.v1.Derivation
+	31, // 54: srcport.substrate.v1.Kernel.GetRun:input_type -> srcport.substrate.v1.RunRef
+	31, // 55: srcport.substrate.v1.Kernel.CancelRun:input_type -> srcport.substrate.v1.RunRef
+	31, // 56: srcport.substrate.v1.Kernel.ListDerivations:input_type -> srcport.substrate.v1.RunRef
+	39, // 57: srcport.substrate.v1.Kernel.Register:output_type -> srcport.substrate.v1.RegisterAck
+	45, // 58: srcport.substrate.v1.Kernel.Transition:output_type -> srcport.substrate.v1.TransitionAck
+	12, // 59: srcport.substrate.v1.Kernel.PutArtifact:output_type -> srcport.substrate.v1.ArtifactRef
+	11, // 60: srcport.substrate.v1.Kernel.GetArtifact:output_type -> srcport.substrate.v1.Artifact
+	8,  // 61: srcport.substrate.v1.Kernel.PutBlob:output_type -> srcport.substrate.v1.BlobRef
+	15, // 62: srcport.substrate.v1.Kernel.GetBlob:output_type -> srcport.substrate.v1.BlobData
+	17, // 63: srcport.substrate.v1.Kernel.HasBlob:output_type -> srcport.substrate.v1.HasBlobResponse
+	18, // 64: srcport.substrate.v1.Kernel.PutContract:output_type -> srcport.substrate.v1.Contract
+	40, // 65: srcport.substrate.v1.Kernel.Publish:output_type -> srcport.substrate.v1.PublishAck
+	19, // 66: srcport.substrate.v1.Kernel.Subscribe:output_type -> srcport.substrate.v1.Event
+	20, // 67: srcport.substrate.v1.Kernel.Append:output_type -> srcport.substrate.v1.LedgerEntry
+	21, // 68: srcport.substrate.v1.Kernel.Snapshot:output_type -> srcport.substrate.v1.RegistrySnapshot
+	30, // 69: srcport.substrate.v1.Kernel.StartRun:output_type -> srcport.substrate.v1.Run
+	30, // 70: srcport.substrate.v1.Kernel.InjectInput:output_type -> srcport.substrate.v1.Run
+	34, // 71: srcport.substrate.v1.Kernel.ClaimReady:output_type -> srcport.substrate.v1.WorkItem
+	30, // 72: srcport.substrate.v1.Kernel.Commit:output_type -> srcport.substrate.v1.Run
+	30, // 73: srcport.substrate.v1.Kernel.GetRun:output_type -> srcport.substrate.v1.Run
+	30, // 74: srcport.substrate.v1.Kernel.CancelRun:output_type -> srcport.substrate.v1.Run
+	36, // 75: srcport.substrate.v1.Kernel.ListDerivations:output_type -> srcport.substrate.v1.DerivationList
+	57, // [57:76] is the sub-list for method output_type
+	38, // [38:57] is the sub-list for method input_type
+	38, // [38:38] is the sub-list for extension type_name
+	38, // [38:38] is the sub-list for extension extendee
+	0,  // [0:38] is the sub-list for field type_name
 }
 
 func init() { file_srcport_substrate_v1_substrate_proto_init() }
@@ -3586,7 +3676,7 @@ func file_srcport_substrate_v1_substrate_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_srcport_substrate_v1_substrate_proto_rawDesc), len(file_srcport_substrate_v1_substrate_proto_rawDesc)),
 			NumEnums:      5,
-			NumMessages:   42,
+			NumMessages:   44,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

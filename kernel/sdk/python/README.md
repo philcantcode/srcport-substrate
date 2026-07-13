@@ -1,4 +1,4 @@
-# srcport-substrate — Python SDK (v1.1.0)
+# srcport-substrate — Python SDK (v2.0.0)
 
 The in-process Python realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
@@ -11,7 +11,7 @@ dependency: the `protobuf` runtime.
 > `buf generate`, committed under `src/srcport_substrate/_gen/`) and
 > re-exported from `srcport_substrate`, so the SDK can never drift from the
 > contract. They are canonical protobuf messages: construct with keyword args
-> (`Artifact(type=…, body=…)`) and use fully-qualified enum values
+> (`artifact_with_trait(contract, body)`) and use fully-qualified enum values
 > (`Lifecycle.LIFECYCLE_REGISTERED`). To add capability, widen the proto and run
 > `scripts/gen.sh`; do not fork this.
 
@@ -25,22 +25,26 @@ pip install "git+https://github.com/philcantcode/srcport-substrate.git#subdirect
 
 ```python
 from srcport_substrate import (
-    MemoryKernel, ModuleManifest, Capability, Port, Artifact, Event, Contract,
+    MemoryKernel, ModuleManifest, Capability, Port, Event, Contract,
+    artifact_with_trait,
 )
 
 kernel = MemoryKernel()
 
-# 1. A module registers, declaring the contracts it speaks.
+# 1. A module registers, declaring trait contracts on ports.
 kernel.register(ModuleManifest(
     name="recon",
     version="0.1.0",
-    provides=[Capability(name="recon.scan", outputs=[Port(name="host", contract="acme.recon.v1.Host")])],
+    provides=[Capability(
+        name="recon.scan",
+        outputs=[Port(name="host", traits=["acme.recon.v1.Host"])],
+    )],
 ))
 
-# 2. It produces an immutable, content-addressed artifact...
-host = kernel.put_artifact(Artifact(
-    type="acme.recon.v1.Host", body=b"10.0.0.1", produced_by="recon",
-))
+# 2. Produce an immutable trait-bag artifact (single trait here).
+art = artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1")
+art.produced_by = "recon"
+host = kernel.put_artifact(art)
 
 # 3. ...and publishes an event. Artifact refs are the data plane; coupling is
 #    only through contract refs.

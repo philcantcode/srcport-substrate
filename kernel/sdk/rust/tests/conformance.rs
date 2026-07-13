@@ -6,45 +6,27 @@ use std::collections::BTreeMap;
 
 use srcport_substrate::*;
 
-// 1. ADDRESSING — same (type, body) ⇒ same id; a one-byte change ⇒ a new id.
+// 1. ADDRESSING — same trait bag ⇒ same id; a one-byte change ⇒ a new id.
 #[test]
 fn addressing_is_content_derived_and_metamorphic() {
     let k = MemoryKernel::new();
 
-    let a = k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Host".into(),
-        body: b"10.0.0.1".to_vec(),
-        produced_by: "recon".into(),
-        ..Default::default()
-    }).unwrap();
+    let a = k.put_artifact({ let mut __a = artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1".to_vec()); __a.produced_by = "recon".into(); __a }).unwrap();
     // Identical content, different producer/meta — must land the SAME address.
-    let b = k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Host".into(),
-        body: b"10.0.0.1".to_vec(),
-        produced_by: "someone-else".into(),
-        ..Default::default()
-    }).unwrap();
-    assert_eq!(a.id, b.id, "same (type, body) must yield the same id");
+    let b = k.put_artifact({ let mut __a = artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1".to_vec()); __a.produced_by = "someone-else".into(); __a }).unwrap();
+    assert_eq!(a.id, b.id, "same trait bag must yield the same id");
     assert!(a.id.starts_with("sha256:"));
 
     // One byte different in the body — must yield a DIFFERENT address.
-    let c = k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Host".into(),
-        body: b"10.0.0.2".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    let c = k.put_artifact(artifact_with_trait("acme.recon.v1.Host", b"10.0.0.2".to_vec())).unwrap();
     assert_ne!(a.id, c.id, "a one-byte change must change the address");
 
     // Type participates in the address too.
-    let d = k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Port".into(),
-        body: b"10.0.0.1".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    let d = k.put_artifact(artifact_with_trait("acme.recon.v1.Port", b"10.0.0.1".to_vec())).unwrap();
     assert_ne!(a.id, d.id, "type must participate in the address");
 
     // Pure function agrees with the kernel.
-    assert_eq!(a.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"));
+    assert_eq!(a.id, artifact_id_single("acme.recon.v1.Host", b"10.0.0.1"));
 }
 
 // 2. IMMUTABILITY — reads back byte-identical; a later put never mutates it.
@@ -54,15 +36,20 @@ fn artifacts_are_immutable() {
 
     let mut meta = BTreeMap::new();
     meta.insert("first".into(), "true".into());
-    let r = k.put_artifact(Artifact {
-        r#type: "t".into(),
-        body: b"payload".to_vec(),
-        meta,
-        ..Default::default()
-    }).unwrap();
+    let r = k
+        .put_artifact({
+            let mut a = artifact_with_trait("t", b"payload".to_vec());
+            a.meta = meta;
+            a
+        })
+        .unwrap();
 
     let got = k.get_artifact(&r).unwrap();
-    assert_eq!(got.body, b"payload", "reads back byte-identical");
+    assert_eq!(
+        get_trait(&got, "t").unwrap().body,
+        b"payload",
+        "reads back byte-identical"
+    );
     assert_eq!(got.meta.get("first").map(String::as_str), Some("true"));
 
     // A later put of the same content (same id) with different meta must NOT
@@ -70,12 +57,7 @@ fn artifacts_are_immutable() {
     let mut meta2 = BTreeMap::new();
     meta2.insert("first".into(), "false".into());
     meta2.insert("sneaky".into(), "yes".into());
-    let r2 = k.put_artifact(Artifact {
-        r#type: "t".into(),
-        body: b"payload".to_vec(),
-        meta: meta2,
-        ..Default::default()
-    }).unwrap();
+    let r2 = k.put_artifact({ let mut __a = artifact_with_trait("t", b"payload".to_vec()); __a.meta = meta2; __a }).unwrap();
     assert_eq!(r2.id, r.id, "same content ⇒ same id");
 
     let after = k.get_artifact(&r).unwrap();
@@ -102,25 +84,13 @@ fn events_are_ordered_and_isolated() {
     });
 
     let h1 = k
-        .put_artifact(Artifact {
-            r#type: "acme.recon.v1.Host".into(),
-            body: b"h1".to_vec(),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_trait("acme.recon.v1.Host", b"h1".to_vec()))
         .unwrap();
     let h2 = k
-        .put_artifact(Artifact {
-            r#type: "acme.recon.v1.Host".into(),
-            body: b"h2".to_vec(),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_trait("acme.recon.v1.Host", b"h2".to_vec()))
         .unwrap();
     let p1 = k
-        .put_artifact(Artifact {
-            r#type: "acme.recon.v1.Port".into(),
-            body: b"p1".to_vec(),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_trait("acme.recon.v1.Port", b"p1".to_vec()))
         .unwrap();
     let s1 = k
         .publish(Event {
@@ -179,11 +149,7 @@ fn ledger_is_tamper_evident() {
         version: "0.1.0".into(),
         ..Default::default()
     });
-    k.put_artifact(Artifact {
-        r#type: "t".into(),
-        body: b"x".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    k.put_artifact(artifact_with_trait("t", b"x".to_vec())).unwrap();
     k.append(AppendRequest {
         kind: "domain.fact".into(),
         subject: "s".into(),
@@ -220,13 +186,7 @@ fn artifact_and_module_reconstruct_from_the_chain() {
     let mut meta = BTreeMap::new();
     meta.insert("region".into(), "eu".into());
     meta.insert("scan".into(), "full".into());
-    let r = k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Host".into(),
-        body: b"10.0.0.1".to_vec(),
-        meta: meta.clone(),
-        produced_by: "recon".into(),
-        ..Default::default()
-    }).unwrap();
+    let r = k.put_artifact({ let mut __a = artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1".to_vec()); __a.meta = meta.clone(); __a.produced_by = "recon".into(); __a }).unwrap();
 
     k.register(ModuleManifest {
         name: "recon".into(),
@@ -235,7 +195,7 @@ fn artifact_and_module_reconstruct_from_the_chain() {
             name: "recon.scan".into(),
             outputs: vec![Port {
                 name: "host".into(),
-                contract: "acme.recon.v1.Host".into(),
+                traits: vec!["acme.recon.v1.Host".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -250,12 +210,13 @@ fn artifact_and_module_reconstruct_from_the_chain() {
     let a = Artifact::decode(&a_entry.detail[..]).unwrap();
     assert_eq!(a.id, r.id);
     assert_eq!(a_entry.subject, r.id, "subject is the content address");
-    assert_eq!(a.r#type, "acme.recon.v1.Host");
+    assert!(a.traits.contains_key("acme.recon.v1.Host"));
     assert_eq!(a.meta, meta);
     assert_eq!(a.produced_by, "recon");
-    assert!(
-        a.body.is_empty(),
-        "body is cleared — the id already addresses it"
+    assert_eq!(
+        get_trait(&a, "acme.recon.v1.Host").unwrap().body,
+        b"10.0.0.1",
+        "inline trait bodies remain in the ledger (external bodies are cleared)"
     );
 
     // module.registered reconstructs the whole manifest.
@@ -268,7 +229,10 @@ fn artifact_and_module_reconstruct_from_the_chain() {
     assert_eq!(m.version, "0.1.0");
     assert_eq!(m.provides.len(), 1);
     assert_eq!(m.provides[0].name, "recon.scan");
-    assert_eq!(m.provides[0].outputs[0].contract, "acme.recon.v1.Host");
+    assert_eq!(
+        m.provides[0].outputs[0].traits,
+        vec!["acme.recon.v1.Host".to_string()]
+    );
     assert_eq!(m.requires, vec!["report.render".to_string()]);
 
     assert!(k.verify_ledger(), "the chain with fat detail verifies");
@@ -285,11 +249,9 @@ fn map_detail_encodes_canonically() {
         for (key, val) in pairs {
             meta.insert(key.to_string(), val.to_string());
         }
-        Artifact {
-            r#type: "t".into(),
-            meta,
-            ..Default::default()
-        }
+        let mut a = artifact_with_trait("t", b"");
+        a.meta = meta;
+        a
     };
     assert_eq!(
         build().encode_to_vec(),
@@ -305,27 +267,28 @@ fn map_detail_encodes_canonically() {
 #[test]
 fn address_ignores_non_identity_fields() {
     let k = MemoryKernel::new();
-    let base = k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Host".into(),
-        body: b"10.0.0.1".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    let base = k.put_artifact(artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1".to_vec())).unwrap();
 
-    let mut meta = BTreeMap::new();
+    let mut meta: BTreeMap<String, String> = BTreeMap::new();
     meta.insert("x".into(), "y".into());
-    let enriched = k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Host".into(),
-        body: b"10.0.0.1".to_vec(),
-        meta,
-        produced_by: "whoever".into(),
-        ..Default::default()
-    }).unwrap();
+    let enriched = k
+        .put_artifact({
+            let mut a = artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1".to_vec());
+            a.meta = meta;
+            a.produced_by = "whoever".into();
+            a.entity_id = "host:1".into();
+            a
+        })
+        .unwrap();
 
     assert_eq!(
         enriched.id, base.id,
-        "meta and produced_by must not participate in the address"
+        "meta, produced_by, and entity_id must not participate in the address"
     );
-    assert_eq!(enriched.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"));
+    assert_eq!(
+        enriched.id,
+        artifact_id_single("acme.recon.v1.Host", b"10.0.0.1")
+    );
 }
 
 // CROSS-SDK KNOWN ANSWER — a fixed scenario must produce this exact final ledger
@@ -335,7 +298,8 @@ fn address_ignores_non_identity_fields() {
 // all three suites in lockstep — never one SDK alone.
 #[test]
 fn ledger_hash_known_answer_cross_sdk() {
-    const WANT: &str = "5d9dea28f0fa779b7d76dd6137c9b6079561289b12ed6dff022a889b94d69cd2";
+    // Recomputed for tr-bag artifacts (v1.2). Keep in lockstep with Go/Python.
+    const WANT: &str = "3f0957aaae7a7a939dc3b5dba74145b03af065e3f04ce302ef602bc01424f350";
 
     let k = MemoryKernel::new();
     k.register(ModuleManifest {
@@ -345,23 +309,23 @@ fn ledger_hash_known_answer_cross_sdk() {
             name: "recon.scan".into(),
             outputs: vec![Port {
                 name: "host".into(),
-                contract: "acme.recon.v1.Host".into(),
+                traits: vec!["acme.recon.v1.Host".into()],
                 ..Default::default()
             }],
             ..Default::default()
         }],
         requires: vec!["report.render".into()],
     });
-    let mut meta = BTreeMap::new();
+    let mut meta: BTreeMap<String, String> = BTreeMap::new();
     meta.insert("region".into(), "eu".into());
     meta.insert("scan".into(), "full".into());
-    k.put_artifact(Artifact {
-        r#type: "acme.recon.v1.Host".into(),
-        body: b"10.0.0.1".to_vec(),
-        meta,
-        produced_by: "recon".into(),
-        ..Default::default()
-    }).unwrap();
+    k.put_artifact({
+        let mut a = artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1".to_vec());
+        a.meta = meta;
+        a.produced_by = "recon".into();
+        a
+    })
+    .unwrap();
     let chain = k.ledger();
     assert!(k.verify_ledger(), "the chain must verify");
     assert_eq!(
@@ -382,7 +346,7 @@ fn registry_reports_everything() {
             name: "recon.scan".into(),
             outputs: vec![Port {
                 name: "host".into(),
-                contract: "acme.recon.v1.Host".into(),
+                traits: vec!["acme.recon.v1.Host".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -396,7 +360,7 @@ fn registry_reports_everything() {
             name: "report.render".into(),
             outputs: vec![Port {
                 name: "report".into(),
-                contract: "acme.report.v1.Report".into(),
+                traits: vec!["acme.report.v1.Report".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -476,7 +440,7 @@ fn contracts_are_immutable_and_identifiable() {
             name: "do".into(),
             outputs: vec![Port {
                 name: "out".into(),
-                contract: "acme.NewThing".into(),
+                traits: vec!["acme.NewThing".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -537,12 +501,12 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
             name: "facts.extract".into(),
             inputs: vec![Port {
                 name: "question".into(),
-                contract: "demo.Question".into(),
+                traits: vec!["demo.Question".into()],
                 ..Default::default()
             }],
             outputs: vec![Port {
                 name: "facts".into(),
-                contract: "demo.Facts".into(),
+                traits: vec!["demo.Facts".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -557,29 +521,25 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
             inputs: vec![
                 Port {
                     name: "question".into(),
-                    contract: "demo.Question".into(),
+                    traits: vec!["demo.Question".into()],
                     ..Default::default()
                 },
                 Port {
                     name: "facts".into(),
-                    contract: "demo.Facts".into(),
+                    traits: vec!["demo.Facts".into()],
                     ..Default::default()
                 },
             ],
             outputs: vec![Port {
                 name: "answer".into(),
-                contract: "demo.Answer".into(),
+                traits: vec!["demo.Answer".into()],
                 ..Default::default()
             }],
             ..Default::default()
         }],
         ..Default::default()
     });
-    let question = k.put_artifact(Artifact {
-        r#type: "demo.Question".into(),
-        body: b"What follows?".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    let question = k.put_artifact(artifact_with_trait("demo.Question", b"What follows?".to_vec())).unwrap();
     let assembly = Assembly {
         id: "answer-pipeline@1".into(),
         nodes: vec![
@@ -650,11 +610,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
             module: "extractor".into(),
         })
         .unwrap();
-    let facts = k.put_artifact(Artifact {
-        r#type: "demo.Facts".into(),
-        body: b"typed flow".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    let facts = k.put_artifact(artifact_with_trait("demo.Facts", b"typed flow".to_vec())).unwrap();
     let progressed = k
         .commit(Derivation {
             run_id: "run-1".into(),
@@ -676,11 +632,7 @@ fn run_feeds_forward_and_closes_on_its_terminal_answer() {
         })
         .unwrap();
     assert_eq!(write.inputs.len(), 2, "fan-in supplies both typed inputs");
-    let answer = k.put_artifact(Artifact {
-        r#type: "demo.Answer".into(),
-        body: b"Modules converge.".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    let answer = k.put_artifact(artifact_with_trait("demo.Answer", b"Modules converge.".to_vec())).unwrap();
     let completed = k
         .commit(Derivation {
             run_id: "run-1".into(),
@@ -721,13 +673,13 @@ fn cyclic_assembly_is_rejected_before_it_can_expand_forever() {
             name: "loop.step".into(),
             inputs: vec![Port {
                 name: "in".into(),
-                contract: "demo.Value".into(),
+                traits: vec!["demo.Value".into()],
                 optional: true,
                 ..Default::default()
             }],
             outputs: vec![Port {
                 name: "out".into(),
-                contract: "demo.Value".into(),
+                traits: vec!["demo.Value".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -788,7 +740,7 @@ fn run_stalls_when_no_remaining_node_can_become_ready() {
             name: "source.maybe".into(),
             outputs: vec![Port {
                 name: "value".into(),
-                contract: "demo.Value".into(),
+                traits: vec!["demo.Value".into()],
                 optional: true,
                 ..Default::default()
             }],
@@ -803,12 +755,12 @@ fn run_stalls_when_no_remaining_node_can_become_ready() {
             name: "sink.answer".into(),
             inputs: vec![Port {
                 name: "value".into(),
-                contract: "demo.Value".into(),
+                traits: vec!["demo.Value".into()],
                 ..Default::default()
             }],
             outputs: vec![Port {
                 name: "answer".into(),
-                contract: "demo.Answer".into(),
+                traits: vec!["demo.Answer".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -867,9 +819,10 @@ fn run_stalls_when_no_remaining_node_can_become_ready() {
 
 #[test]
 fn convergent_run_hashes_match_every_sdk() {
+    // Trait-bag recompute (v1.2) — lockstep with Go/Python.
     const DERIVATION: &str =
-        "sha256:0e3e167112e6bb8f19d736de4592b72a2856cb494cc4dcb00fbcd5682d595cf6";
-    const LEDGER: &str = "faad7e3ce2d2e030cf37ff6001fe18f7dec0430ce14642f9ae878d66875bc28f";
+        "sha256:8f7f99a396dbf79c7f2287d2f9fca7f4167343831a9283cdfbeb2fe010c8414c";
+    const LEDGER: &str = "283106692aba4aa72f5eecfda3adc53db7ef606e2a83266fefe772a6b9c6587d";
     let k = MemoryKernel::new();
     k.register(ModuleManifest {
         name: "answerer".into(),
@@ -878,7 +831,7 @@ fn convergent_run_hashes_match_every_sdk() {
             name: "answer.write".into(),
             outputs: vec![Port {
                 name: "answer".into(),
-                contract: "demo.Answer".into(),
+                traits: vec!["demo.Answer".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -910,11 +863,7 @@ fn convergent_run_hashes_match_every_sdk() {
             module: "answerer".into(),
         })
         .unwrap();
-    let answer = k.put_artifact(Artifact {
-        r#type: "demo.Answer".into(),
-        body: b"yes".to_vec(),
-        ..Default::default()
-    }).unwrap();
+    let answer = k.put_artifact(artifact_with_trait("demo.Answer", b"yes".to_vec())).unwrap();
     k.commit(Derivation {
         run_id: "parity".into(),
         work_id: work.id,
@@ -942,13 +891,13 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
             firing: Firing::OncePerKey as i32,
             inputs: vec![Port {
                 name: "host".into(),
-                contract: "demo.Host".into(),
+                traits: vec!["demo.Host".into()],
                 key: true,
                 ..Default::default()
             }],
             outputs: vec![Port {
                 name: "report".into(),
-                contract: "demo.Report".into(),
+                traits: vec!["demo.Report".into()],
                 ..Default::default()
             }],
         }],
@@ -961,12 +910,12 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
             name: "extra.noop".into(),
             inputs: vec![Port {
                 name: "host".into(),
-                contract: "demo.Host".into(),
+                traits: vec!["demo.Host".into()],
                 ..Default::default()
             }],
             outputs: vec![Port {
                 name: "side".into(),
-                contract: "demo.Side".into(),
+                traits: vec!["demo.Side".into()],
                 ..Default::default()
             }],
             ..Default::default()
@@ -974,18 +923,10 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
         ..Default::default()
     });
     let host_a = k
-        .put_artifact(Artifact {
-            r#type: "demo.Host".into(),
-            body: b"10.0.0.1".to_vec(),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_trait("demo.Host", b"10.0.0.1".to_vec()))
         .unwrap();
     let host_b = k
-        .put_artifact(Artifact {
-            r#type: "demo.Host".into(),
-            body: b"10.0.0.2".to_vec(),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_trait("demo.Host", b"10.0.0.2".to_vec()))
         .unwrap();
     k.start_run(RunRequest {
         id: "scan".into(),
@@ -1055,11 +996,7 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
         "include_nodes dropped extra"
     );
     let report = k
-        .put_artifact(Artifact {
-            r#type: "demo.Report".into(),
-            body: b"a".to_vec(),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_trait("demo.Report", b"a".to_vec()))
         .unwrap();
     let run = k
         .commit(Derivation {
@@ -1123,23 +1060,19 @@ fn always_refires_on_reinject_of_same_artifact() {
             firing: Firing::Always as i32,
             inputs: vec![Port {
                 name: "in".into(),
-                contract: "demo.In".into(),
+                traits: vec!["demo.In".into()],
                 ..Default::default()
             }],
             outputs: vec![Port {
                 name: "out".into(),
-                contract: "demo.Out".into(),
+                traits: vec!["demo.Out".into()],
                 ..Default::default()
             }],
         }],
         ..Default::default()
     });
     let value = k
-        .put_artifact(Artifact {
-            r#type: "demo.In".into(),
-            body: b"same".to_vec(),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_trait("demo.In", b"same".to_vec()))
         .unwrap();
     k.start_run(RunRequest {
         id: "always".into(),
@@ -1184,11 +1117,7 @@ fn always_refires_on_reinject_of_same_artifact() {
             .unwrap();
         assert!(!work.id.is_empty(), "fire {i}");
         let out = k
-            .put_artifact(Artifact {
-                r#type: "demo.Out".into(),
-                body: format!("out-{i}").into_bytes(),
-                ..Default::default()
-            })
+            .put_artifact(artifact_with_trait("demo.Out", format!("out-{i}").into_bytes()))
             .unwrap();
         k.commit(Derivation {
             run_id: "always".into(),
@@ -1270,46 +1199,38 @@ fn external_artifact_refs_large_data_without_inlining() {
         namespace: "observer".into(),
         data: payload.clone(),
     });
+    let obj = ObjectRef {
+        digest: blob.digest.clone(),
+        byte_count: blob.byte_count,
+        namespace: blob.namespace.clone(),
+    };
     let r#ref = k
-        .put_artifact(Artifact {
-            r#type: "observer.v1.Capture".into(),
-            produced_by: "observer".into(),
-            object: Some(ObjectRef {
-                digest: blob.digest.clone(),
-                byte_count: blob.byte_count,
-                namespace: blob.namespace.clone(),
-            }),
-            ..Default::default()
+        .put_artifact({
+            let mut a = artifact_with_external_trait("observer.v1.Capture", obj.clone());
+            a.produced_by = "observer".into();
+            a
         })
         .unwrap();
 
-    let want = artifact_id(
+    let want = artifact_id_of(&artifact_with_external_trait(
         "observer.v1.Capture",
-        &object_ref_bytes(&ObjectRef {
-            digest: blob.digest.clone(),
-            byte_count: blob.byte_count,
-            namespace: blob.namespace.clone(),
-        }),
-    );
+        obj.clone(),
+    ));
     assert_eq!(r#ref.id, want);
     assert_ne!(r#ref.id, blob_id(&payload));
 
     let got = k.get_artifact(&r#ref).unwrap();
-    assert!(got.body.is_empty());
-    let obj = got.object.as_ref().unwrap();
-    assert_eq!(obj.digest, blob.digest);
-    assert_eq!(obj.byte_count, blob.byte_count);
+    let tr = get_trait(&got, "observer.v1.Capture").unwrap();
+    assert!(tr.body.is_empty());
+    let got_obj = tr.object.as_ref().unwrap();
+    assert_eq!(got_obj.digest, blob.digest);
+    assert_eq!(got_obj.byte_count, blob.byte_count);
 
     let ref2 = k
-        .put_artifact(Artifact {
-            r#type: "observer.v1.Capture".into(),
-            object: Some(ObjectRef {
-                digest: blob.digest.clone(),
-                byte_count: blob.byte_count,
-                namespace: blob.namespace.clone(),
-            }),
-            ..Default::default()
-        })
+        .put_artifact(artifact_with_external_trait(
+            "observer.v1.Capture",
+            obj.clone(),
+        ))
         .unwrap();
     assert_eq!(ref2.id, r#ref.id);
 
@@ -1321,8 +1242,8 @@ fn external_artifact_refs_large_data_without_inlining() {
 
     let data = k
         .get_blob(GetBlobRequest {
-            digest: obj.digest.clone(),
-            namespace: obj.namespace.clone(),
+            digest: got_obj.digest.clone(),
+            namespace: got_obj.namespace.clone(),
         })
         .unwrap();
     assert_eq!(data.data, payload);
@@ -1333,8 +1254,9 @@ fn external_artifact_refs_large_data_without_inlining() {
         .find(|e| e.kind == "artifact.put")
         .unwrap();
     let a = Artifact::decode(entry.detail.as_slice()).unwrap();
-    assert!(a.body.is_empty());
-    assert_eq!(a.object.as_ref().unwrap().digest, blob.digest);
+    let lf = get_trait(&a, "observer.v1.Capture").unwrap();
+    assert!(lf.body.is_empty());
+    assert_eq!(lf.object.as_ref().unwrap().digest, blob.digest);
 }
 
 #[test]
@@ -1346,49 +1268,45 @@ fn external_artifact_rejects_missing_or_mismatched_blob() {
         data: data.clone(),
     });
 
-    let missing = k.put_artifact(Artifact {
-        r#type: "t".into(),
-        object: Some(ObjectRef {
+    let missing = k.put_artifact(artifact_with_external_trait(
+        "t",
+        ObjectRef {
             digest: blob_id(b"nope"),
             byte_count: 4,
             namespace: "ns".into(),
-        }),
-        ..Default::default()
-    });
+        },
+    ));
     assert!(matches!(missing, Err(KernelError::NotFound(_))));
 
-    let bad_size = k.put_artifact(Artifact {
-        r#type: "t".into(),
-        object: Some(ObjectRef {
+    let bad_size = k.put_artifact(artifact_with_external_trait(
+        "t",
+        ObjectRef {
             digest: blob.digest.clone(),
             byte_count: blob.byte_count + 1,
             namespace: "ns".into(),
-        }),
-        ..Default::default()
-    });
+        },
+    ));
     assert!(matches!(bad_size, Err(KernelError::BlobIntegrity(_))));
 
-    let both = k.put_artifact(Artifact {
-        r#type: "t".into(),
-        body: b"x".to_vec(),
-        object: Some(ObjectRef {
-            digest: blob.digest.clone(),
-            byte_count: blob.byte_count,
-            namespace: "ns".into(),
-        }),
-        ..Default::default()
+    let mut both = artifact_with_trait("t", b"x".to_vec());
+    both.traits.get_mut("t").unwrap().object = Some(ObjectRef {
+        digest: blob.digest.clone(),
+        byte_count: blob.byte_count,
+        namespace: "ns".into(),
     });
-    assert!(matches!(both, Err(KernelError::Invalid(_))));
+    assert!(matches!(
+        k.put_artifact(both),
+        Err(KernelError::Invalid(_))
+    ));
 
-    let wrong_ns = k.put_artifact(Artifact {
-        r#type: "t".into(),
-        object: Some(ObjectRef {
+    let wrong_ns = k.put_artifact(artifact_with_external_trait(
+        "t",
+        ObjectRef {
             digest: blob.digest,
             byte_count: blob.byte_count,
             namespace: "other".into(),
-        }),
-        ..Default::default()
-    });
+        },
+    ));
     assert!(matches!(wrong_ns, Err(KernelError::NotFound(_))));
 }
 
@@ -1407,41 +1325,71 @@ fn value_identity_independent_of_blob_identity() {
     assert_eq!(blob_a.digest, blob_b.digest);
 
     let art_a = k
-        .put_artifact(Artifact {
-            r#type: "t".into(),
-            object: Some(ObjectRef {
+        .put_artifact(artifact_with_external_trait(
+            "t",
+            ObjectRef {
                 digest: blob_a.digest.clone(),
                 byte_count: blob_a.byte_count,
                 namespace: "a".into(),
-            }),
-            ..Default::default()
-        })
+            },
+        ))
         .unwrap();
     let art_b = k
-        .put_artifact(Artifact {
-            r#type: "t".into(),
-            object: Some(ObjectRef {
+        .put_artifact(artifact_with_external_trait(
+            "t",
+            ObjectRef {
                 digest: blob_b.digest.clone(),
                 byte_count: blob_b.byte_count,
                 namespace: "b".into(),
-            }),
-            ..Default::default()
-        })
+            },
+        ))
         .unwrap();
     assert_ne!(art_a.id, art_b.id);
 
     let art_c = k
-        .put_artifact(Artifact {
-            r#type: "other".into(),
-            object: Some(ObjectRef {
+        .put_artifact(artifact_with_external_trait(
+            "other",
+            ObjectRef {
                 digest: blob_a.digest,
                 byte_count: blob_a.byte_count,
                 namespace: "a".into(),
-            }),
-            ..Default::default()
-        })
+            },
+        ))
         .unwrap();
     assert_ne!(art_c.id, art_a.id);
+}
+
+#[test]
+fn trait_projection_and_merge() {
+    let k = MemoryKernel::new();
+    let file = k
+        .put_artifact({
+            let mut a = artifact_with_trait("vuln.v1.File", b"main.c");
+            a.entity_id = "file:main.c".into();
+            a
+        })
+        .unwrap();
+    let file_art = k.get_artifact(&file).unwrap();
+    let score_only = artifact_with_trait("vuln.v1.ScaryScore", b"0.91");
+    let merged = merge_traits(&file_art, &score_only);
+    assert!(has_traits(&merged, &["vuln.v1.File", "vuln.v1.ScaryScore"]));
+    assert_eq!(merged.entity_id, "file:main.c");
+    assert_eq!(merged.supersedes, file.id);
+
+    let put = k.put_artifact(merged).unwrap();
+    let bag = k.get_artifact(&put).unwrap();
+    let just_file = project_trait(&bag, "vuln.v1.File").unwrap();
+    assert_eq!(just_file.traits.len(), 1);
+    assert_eq!(get_trait(&just_file, "vuln.v1.File").unwrap().body, b"main.c");
+    let just_score = project_trait(&bag, "vuln.v1.ScaryScore").unwrap();
+    assert_eq!(
+        get_trait(&just_score, "vuln.v1.ScaryScore").unwrap().body,
+        b"0.91"
+    );
+    // Projection changes the bag → different id when put.
+    let pf = k.put_artifact(just_file).unwrap();
+    assert_ne!(pf.id, put.id);
+    assert_eq!(pf.id, file.id, "projecting back to File recovers original id");
 }
 
 // RequestContext: deadline rejects past absolute times; request_key de-duplicates
@@ -1456,11 +1404,7 @@ fn request_context_deadline_and_idempotency() {
     assert!(matches!(
         KernelApi::put_artifact(
             &k,
-            Artifact {
-                r#type: "t".into(),
-                body: b"x".to_vec(),
-                ..Default::default()
-            },
+            artifact_with_trait("t", b"x".to_vec()),
             &past
         ),
         Err(KernelError::FailedPrecondition(_))
@@ -1473,22 +1417,14 @@ fn request_context_deadline_and_idempotency() {
     };
     let a = KernelApi::put_artifact(
         &k,
-        Artifact {
-            r#type: "t".into(),
-            body: b"unique-body".to_vec(),
-            ..Default::default()
-        },
+        artifact_with_trait("t", b"unique-body".to_vec()),
         &key_ctx,
     )
     .unwrap();
     let before = k.ledger().len();
     let b = KernelApi::put_artifact(
         &k,
-        Artifact {
-            r#type: "t".into(),
-            body: b"unique-body".to_vec(),
-            ..Default::default()
-        },
+        artifact_with_trait("t", b"unique-body".to_vec()),
         &key_ctx,
     )
     .unwrap();

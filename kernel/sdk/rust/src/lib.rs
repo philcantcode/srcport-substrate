@@ -1,4 +1,4 @@
-//! # srcport-substrate — Rust SDK (v1.1.0, in-process)
+//! # srcport-substrate — Rust SDK (v2.0.0, in-process)
 //!
 //! One pluggable core: **seven primitives** (Module · Artifact · Contract ·
 //! Event · Ledger · Registry · Run) and **one ABI** (the [`KernelApi`] trait).
@@ -6,6 +6,11 @@
 //! mirror the `service Kernel` RPCs in `substrate.proto` one-for-one — and
 //! upholds every invariant in `SPEC.md`. The wire types are generated from the
 //! canonical proto (see `build.rs`); nothing here re-derives the contract.
+//!
+//! **Artifacts are trait bags.** A value is a map of contract ref →
+//! [`Trait`] (inline body or external [`ObjectRef`]). Ports declare required
+//! or guaranteed trait sets; matching is structural inclusion. Use
+//! [`project_traits`] / [`get_trait`] to isolate original data or one fact.
 //!
 //! **Durability lives in Modules, not the core.** [`MemoryKernel`] keeps all
 //! state in memory; it is one implementation of [`KernelApi`], not *the*
@@ -15,9 +20,9 @@
 //!
 //! The kernel knows about no domain. Targets, findings, entities, terrain and
 //! content are all Modules built *on top* of this, coupling only through
-//! contract refs. See `SPEC.md` for the two-page human-owned specification.
+//! contract refs (trait keys). See `SPEC.md` for the human-owned specification.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Mutex;
 
@@ -128,9 +133,10 @@ pub type Result<T> = std::result::Result<T, KernelError>;
 
 const SEP: u8 = 0x00;
 
-/// Advisory ceiling for `Artifact.body`. Larger payloads should `put_blob` and
-/// place a verified [`ObjectRef`]. The kernel does not hard-reject oversized
-/// inline bodies (backward compat); production modules SHOULD honour this.
+/// Advisory ceiling for a single [`Trait::body`]. Larger payloads should
+/// `put_blob` and place a verified [`ObjectRef`] on the trait. The kernel does
+/// not hard-reject oversized inline bodies; production modules SHOULD honour
+/// this.
 pub const MAX_INLINE_ARTIFACT_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Bound on a single subscriber's undelivered-event backlog. The event bus is
@@ -149,7 +155,7 @@ pub fn blob_id(data: &[u8]) -> String {
     format!("sha256:{}", hex(&h.finalize()))
 }
 
-/// Address payload for an external Artifact value:
+/// Address payload for an external trait value:
 /// `digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace`.
 pub fn object_ref_bytes(object: &ObjectRef) -> Vec<u8> {
     let mut out = Vec::with_capacity(
@@ -163,42 +169,186 @@ pub fn object_ref_bytes(object: &ObjectRef) -> Vec<u8> {
     out
 }
 
-/// Bytes folded into the Artifact address: inline body, or object_ref_bytes.
-pub fn artifact_content(artifact: &Artifact) -> Vec<u8> {
-    if let Some(obj) = artifact.object.as_ref() {
+/// Bytes folded into value identity for one trait: inline body, or
+/// [`object_ref_bytes`] when a verified external ref is set.
+pub fn trait_content(tr: &Trait) -> Vec<u8> {
+    if let Some(obj) = tr.object.as_ref() {
         if !obj.digest.is_empty() {
             return object_ref_bytes(obj);
         }
     }
-    artifact.body.clone()
+    tr.body.clone()
 }
 
-/// The Artifact address over an explicit content payload:
-/// `id = "sha256:" + hex(sha256(type + 0x00 + content))`.
-///
-/// For inline values pass body; for external values pass [`object_ref_bytes`].
-/// Prefer [`artifact_id_of`] when you have a full Artifact. `meta` and
-/// `produced_by` are deliberately NOT part of the address.
-pub fn artifact_id(r#type: &str, content: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(r#type.as_bytes());
-    h.update([SEP]);
-    h.update(content);
-    format!("sha256:{}", hex(&h.finalize()))
-}
-
-/// Typed value address for a full Artifact (inline or external).
-pub fn artifact_id_of(artifact: &Artifact) -> String {
-    artifact_id(&artifact.r#type, &artifact_content(artifact))
-}
-
-/// Whether `artifact` holds a verified external [`ObjectRef`].
-pub fn has_external_object(artifact: &Artifact) -> bool {
-    artifact
-        .object
+/// Whether this trait holds a verified external [`ObjectRef`].
+pub fn trait_has_external(tr: &Trait) -> bool {
+    tr.object
         .as_ref()
         .map(|o| !o.digest.is_empty())
         .unwrap_or(false)
+}
+
+/// Canonical encoding of a trait bag for content addressing:
+///
+/// ```text
+/// for each contract_ref in UTF-8 ascending order:
+///     contract_ref ‖ 0x00 ‖ trait_content ‖ 0x00
+/// ```
+pub fn artifact_canonical_bytes(artifact: &Artifact) -> Vec<u8> {
+    let mut keys: Vec<&String> = artifact.traits.keys().collect();
+    keys.sort(); // UTF-8 byte order
+    let mut out = Vec::new();
+    for k in keys {
+        let f = artifact.traits.get(k).expect("key from map");
+        out.extend_from_slice(k.as_bytes());
+        out.push(SEP);
+        out.extend_from_slice(&trait_content(f));
+        out.push(SEP);
+    }
+    out
+}
+
+/// Content address of a full trait-bag Artifact:
+/// `id = "sha256:" + hex(sha256(canonical_traits))`.
+///
+/// `meta`, `produced_by`, `entity_id`, and `supersedes` are deliberately NOT
+/// part of the address.
+pub fn artifact_id_of(artifact: &Artifact) -> String {
+    let mut h = Sha256::new();
+    h.update(artifact_canonical_bytes(artifact));
+    format!("sha256:{}", hex(&h.finalize()))
+}
+
+/// Content address of a **single-trait** bag (convenience for tests and simple
+/// puts): one contract ref with the given content bytes (inline).
+pub fn artifact_id_single(contract: &str, content: &[u8]) -> String {
+    artifact_id_of(&artifact_with_trait(contract, content))
+}
+
+/// Build an in-memory Artifact with one inline trait (not yet stored).
+pub fn artifact_with_trait(contract: impl Into<String>, body: impl Into<Vec<u8>>) -> Artifact {
+    let mut traits = BTreeMap::new();
+    traits.insert(
+        contract.into(),
+        Trait {
+            body: body.into(),
+            object: None,
+        },
+    );
+    Artifact {
+        traits,
+        ..Default::default()
+    }
+}
+
+/// Build an in-memory Artifact with one external-object trait (not yet stored).
+pub fn artifact_with_external_trait(contract: impl Into<String>, object: ObjectRef) -> Artifact {
+    let mut traits = BTreeMap::new();
+    traits.insert(
+        contract.into(),
+        Trait {
+            body: Vec::new(),
+            object: Some(object),
+        },
+    );
+    Artifact {
+        traits,
+        ..Default::default()
+    }
+}
+
+/// Build an in-memory Artifact from many inline traits.
+pub fn artifact_with_traits(
+    pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<Vec<u8>>)>,
+) -> Artifact {
+    let mut traits = BTreeMap::new();
+    for (c, body) in pairs {
+        traits.insert(
+            c.into(),
+            Trait {
+                body: body.into(),
+                object: None,
+            },
+        );
+    }
+    Artifact {
+        traits,
+        ..Default::default()
+    }
+}
+
+/// True when the artifact contains every listed trait contract ref.
+pub fn has_traits(artifact: &Artifact, required: &[&str]) -> bool {
+    required.iter().all(|r| artifact.traits.contains_key(*r))
+}
+
+/// True when `have` is a superset of `need` (set inclusion on contract refs).
+pub fn trait_set_covers(have: &[String], need: &[String]) -> bool {
+    need.iter().all(|n| have.iter().any(|h| h == n))
+}
+
+/// Borrow one trait by contract ref.
+pub fn get_trait<'a>(artifact: &'a Artifact, contract: &str) -> Option<&'a Trait> {
+    artifact.traits.get(contract)
+}
+
+/// Project a subset of traits into a new in-memory Artifact (new id only after
+/// `put_artifact`). Missing contracts → [`KernelError::Invalid`].
+/// Copies `entity_id` / `supersedes` / `meta` / `produced_by` from the source.
+pub fn project_traits(artifact: &Artifact, contracts: &[&str]) -> Result<Artifact> {
+    let mut traits = BTreeMap::new();
+    for c in contracts {
+        let f = artifact.traits.get(*c).ok_or_else(|| {
+            KernelError::Invalid(format!("artifact missing trait {c}"))
+        })?;
+        traits.insert((*c).to_string(), f.clone());
+    }
+    Ok(Artifact {
+        id: String::new(),
+        traits,
+        meta: artifact.meta.clone(),
+        produced_by: artifact.produced_by.clone(),
+        entity_id: artifact.entity_id.clone(),
+        supersedes: artifact.supersedes.clone(),
+    })
+}
+
+/// Project a single trait into a new single-trait Artifact.
+pub fn project_trait(artifact: &Artifact, contract: &str) -> Result<Artifact> {
+    project_traits(artifact, &[contract])
+}
+
+/// Merge two bags: union of traits; `add` wins on key collision.
+/// Sets `supersedes` to `base.id` when non-empty. Copies `entity_id` from
+/// `add` if set, else from `base`.
+pub fn merge_traits(base: &Artifact, add: &Artifact) -> Artifact {
+    let mut traits = base.traits.clone();
+    for (k, v) in &add.traits {
+        traits.insert(k.clone(), v.clone());
+    }
+    let entity_id = if !add.entity_id.is_empty() {
+        add.entity_id.clone()
+    } else {
+        base.entity_id.clone()
+    };
+    let supersedes = if !base.id.is_empty() {
+        base.id.clone()
+    } else {
+        add.supersedes.clone()
+    };
+    Artifact {
+        id: String::new(),
+        traits,
+        meta: add.meta.clone(),
+        produced_by: add.produced_by.clone(),
+        entity_id,
+        supersedes,
+    }
+}
+
+/// Whether any trait on the artifact holds an external object.
+pub fn has_external_object(artifact: &Artifact) -> bool {
+    artifact.traits.values().any(trait_has_external)
 }
 
 /// Contract content address:
@@ -420,7 +570,9 @@ impl MemoryKernel {
         for cap in &manifest.provides {
             state.capabilities.push(cap.clone());
             for port in cap.inputs.iter().chain(cap.outputs.iter()) {
-                Self::ensure_contract_placeholder(&mut state, &port.contract);
+                for trait_ref in &port.traits {
+                    Self::ensure_contract_placeholder(&mut state, trait_ref);
+                }
             }
         }
         let name = manifest.name.clone();
@@ -494,12 +646,12 @@ impl MemoryKernel {
 
     // ── 2. ARTIFACT ────────────────────────────────────────────────────────
 
-    /// `rpc PutArtifact(Artifact) -> ArtifactRef`. Content-addresses the typed
-    /// value, stores it **immutably** (first write wins), and returns its ref.
+    /// `rpc PutArtifact(Artifact) -> ArtifactRef`. Content-addresses the trait
+    /// bag, stores it **immutably** (first write wins), and returns its ref.
     ///
-    /// Inline: set `body`, leave `object` unset. External: `put_blob` first,
-    /// then set `object` with empty `body`. The blob must already exist and
-    /// match. Exactly one of body or object may carry the value.
+    /// Each trait is inline (`Trait.body`) or external (`Trait.object` after
+    /// `put_blob`). Exactly one of body or object may carry each trait's value.
+    /// At least one trait is required.
     pub fn put_artifact(&self, artifact: Artifact) -> Result<ArtifactRef> {
         self.put_artifact_ctx(artifact, &RequestContext::default())
     }
@@ -517,18 +669,31 @@ impl MemoryKernel {
         if let Some(IdempotentResult::ArtifactRef(r)) = idempotent_get(&state, "put_artifact", ctx) {
             return Ok(r);
         }
-        if has_external_object(&artifact) {
-            verify_object_ref_locked(&state, artifact.object.as_ref().unwrap())?;
+        for tr in artifact.traits.values() {
+            if trait_has_external(tr) {
+                verify_object_ref_locked(&state, tr.object.as_ref().unwrap())?;
+            }
         }
         let id = artifact_id_of(&artifact);
         artifact.id = id.clone();
         // Immutability: only the first writer of an id sets the stored bytes.
         if !state.artifacts.contains_key(&id) {
-            // Clear large inline body in the ledger; keep ObjectRef (small,
-            // part of value identity) so external artifacts reconstruct.
-            let body = std::mem::take(&mut artifact.body);
+            // Ledger detail: clear bodies only on *external* traits (ObjectRef
+            // retained). Inline trait bodies stay so empty-Trait map values
+            // encode identically across SDKs (prost omits empty map values;
+            // Go would write a zero-length message and diverge the chain).
+            let mut cleared: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+            for (k, f) in artifact.traits.iter_mut() {
+                if trait_has_external(f) {
+                    cleared.insert(k.clone(), std::mem::take(&mut f.body));
+                }
+            }
             let detail = artifact.encode_to_vec();
-            artifact.body = body;
+            for (k, body) in cleared {
+                if let Some(f) = artifact.traits.get_mut(&k) {
+                    f.body = body;
+                }
+            }
             state.artifacts.insert(id.clone(), artifact);
             Self::append_locked(&mut state, "artifact.put", &id, detail);
         }
@@ -613,10 +778,10 @@ impl MemoryKernel {
         }
     }
 
-    /// Put the blob then an external artifact referencing it (production path).
+    /// Put the blob then a single-trait external artifact (production path).
     pub fn put_artifact_with_blob(
         &self,
-        r#type: &str,
+        contract: &str,
         namespace: &str,
         data: &[u8],
         produced_by: &str,
@@ -625,14 +790,21 @@ impl MemoryKernel {
             namespace: namespace.into(),
             data: data.to_vec(),
         });
+        let mut traits = BTreeMap::new();
+        traits.insert(
+            contract.into(),
+            Trait {
+                body: Vec::new(),
+                object: Some(ObjectRef {
+                    digest: blob.digest.clone(),
+                    byte_count: blob.byte_count,
+                    namespace: blob.namespace.clone(),
+                }),
+            },
+        );
         let artifact = self.put_artifact(Artifact {
-            r#type: r#type.into(),
             produced_by: produced_by.into(),
-            object: Some(ObjectRef {
-                digest: blob.digest.clone(),
-                byte_count: blob.byte_count,
-                namespace: blob.namespace.clone(),
-            }),
+            traits,
             ..Default::default()
         })?;
         Ok((artifact, blob))
@@ -1308,26 +1480,35 @@ fn is_sha256_digest(d: &str) -> bool {
 }
 
 fn validate_artifact_content(artifact: &Artifact) -> Result<()> {
-    if artifact.r#type.is_empty() {
-        return Err(KernelError::Invalid("artifact type is required".into()));
-    }
-    let has_obj = has_external_object(artifact);
-    let has_body = !artifact.body.is_empty();
-    if has_obj && has_body {
+    if artifact.traits.is_empty() {
         return Err(KernelError::Invalid(
-            "artifact must not set both body and object".into(),
+            "artifact must have at least one trait".into(),
         ));
     }
-    if let Some(obj) = artifact.object.as_ref() {
-        if obj.digest.is_empty() && (obj.byte_count != 0 || !obj.namespace.is_empty()) {
+    for (contract, tr) in &artifact.traits {
+        if contract.is_empty() {
             return Err(KernelError::Invalid(
-                "object.digest is required when object is set".into(),
+                "trait contract ref must be non-empty".into(),
             ));
         }
-        if has_obj && !is_sha256_digest(&obj.digest) {
-            return Err(KernelError::Invalid(
-                "object.digest must be sha256:<hex>".into(),
-            ));
+        let has_obj = trait_has_external(tr);
+        let has_body = !tr.body.is_empty();
+        if has_obj && has_body {
+            return Err(KernelError::Invalid(format!(
+                "trait {contract} must not set both body and object"
+            )));
+        }
+        if let Some(obj) = tr.object.as_ref() {
+            if obj.digest.is_empty() && (obj.byte_count != 0 || !obj.namespace.is_empty()) {
+                return Err(KernelError::Invalid(format!(
+                    "trait {contract}: object.digest is required when object is set"
+                )));
+            }
+            if has_obj && !is_sha256_digest(&obj.digest) {
+                return Err(KernelError::Invalid(format!(
+                    "trait {contract}: object.digest must be sha256:<hex>"
+                )));
+            }
         }
     }
     Ok(())
@@ -1421,10 +1602,16 @@ fn validate_assembly(state: &State, assembly: &Assembly, inputs: &[NamedArtifact
         for ports in [&cap.inputs[..], &cap.outputs[..]] {
             let mut names = HashSet::new();
             for p in ports {
-                if p.name.is_empty() || p.contract.is_empty() || !names.insert(&p.name) {
+                if p.name.is_empty() || p.traits.is_empty() || !names.insert(&p.name) {
                     return Err(KernelError::Invalid(format!(
                         "{} has an empty or duplicate typed port",
                         node.id
+                    )));
+                }
+                if p.traits.iter().any(|f| f.is_empty()) {
+                    return Err(KernelError::Invalid(format!(
+                        "{}.{} has an empty trait ref",
+                        node.id, p.name
                     )));
                 }
             }
@@ -1483,12 +1670,18 @@ fn validate_assembly(state: &State, assembly: &Assembly, inputs: &[NamedArtifact
                 "binding must have exactly one source".into(),
             ));
         }
-        let source_contract = if external {
+        if external {
             let input = named_inputs
                 .get(b.input.as_str())
                 .ok_or_else(|| KernelError::Invalid(format!("run input {} is unknown", b.input)))?;
             let r = input.artifact.as_ref().unwrap();
-            state.artifacts.get(&r.id).unwrap().r#type.as_str()
+            let art = state.artifacts.get(&r.id).unwrap();
+            if !has_traits(art, &target.traits.iter().map(String::as_str).collect::<Vec<_>>()) {
+                return Err(KernelError::Invalid(format!(
+                    "trait set mismatch at {}.{}: input artifact missing required traits {:?}",
+                    b.to_node, b.to_port, target.traits
+                )));
+            }
         } else {
             let source_node = nodes.get(b.from_node.as_str()).ok_or_else(|| {
                 KernelError::Invalid(format!("binding source {} is unknown", b.from_node))
@@ -1504,13 +1697,13 @@ fn validate_assembly(state: &State, assembly: &Assembly, inputs: &[NamedArtifact
                 ))
             })?;
             edges.entry(&b.from_node).or_default().push(&b.to_node);
-            source.contract.as_str()
-        };
-        if source_contract != target.contract {
-            return Err(KernelError::Invalid(format!(
-                "contract mismatch at {}.{}: {} != {}",
-                b.to_node, b.to_port, source_contract, target.contract
-            )));
+            // Source guarantees ⊇ target requires.
+            if !trait_set_covers(&source.traits, &target.traits) {
+                return Err(KernelError::Invalid(format!(
+                    "trait set mismatch at {}.{}: source guarantees {:?} does not cover {:?}",
+                    b.to_node, b.to_port, source.traits, target.traits
+                )));
+            }
         }
     }
     for node in &assembly.nodes {
@@ -1793,10 +1986,13 @@ fn validate_outputs(state: &State, cap: &Capability, outputs: &[NamedArtifact]) 
             .artifacts
             .get(&r.id)
             .ok_or_else(|| KernelError::NotFound(r.id.clone()))?;
-        if artifact.r#type != expected.contract {
+        let need: Vec<&str> = expected.traits.iter().map(String::as_str).collect();
+        if !has_traits(artifact, &need) {
             return Err(KernelError::Invalid(format!(
-                "output {} has contract {}, want {}",
-                output.name, artifact.r#type, expected.contract
+                "output {} missing required traits {:?}; have {:?}",
+                output.name,
+                expected.traits,
+                artifact.traits.keys().collect::<Vec<_>>()
             )));
         }
     }

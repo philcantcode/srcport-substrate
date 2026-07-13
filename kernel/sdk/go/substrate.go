@@ -16,6 +16,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/philcantcode/srcport-substrate/kernel/sdk/go/internal/genpb/srcport/substrate/v1"
 )
@@ -30,6 +33,7 @@ type (
 	BlobRef          = pb.BlobRef
 	ObjectRef        = pb.ObjectRef
 	Artifact         = pb.Artifact
+	Trait            = pb.Trait
 	ArtifactRef      = pb.ArtifactRef
 	PutBlobRequest   = pb.PutBlobRequest
 	GetBlobRequest   = pb.GetBlobRequest
@@ -84,10 +88,10 @@ const (
 	ErrorCodeBlobIntegrity      = pb.ErrorCode_ERROR_CODE_BLOB_INTEGRITY
 )
 
-// MaxInlineArtifactBytes is the advisory ceiling for Artifact.body. Larger
-// payloads should PutBlob and place a verified ObjectRef on the Artifact.
-// The kernel does not hard-reject oversized inline bodies (backward compat);
-// modules and hosts SHOULD honour this boundary in production.
+// MaxInlineArtifactBytes is the advisory ceiling for a single Trait.body.
+// Larger payloads should PutBlob and place a verified ObjectRef on the trait.
+// The kernel does not hard-reject oversized inline bodies; modules and hosts
+// SHOULD honour this boundary in production.
 const MaxInlineArtifactBytes = 1 << 20 // 1 MiB
 
 // Bounded run states.
@@ -136,11 +140,9 @@ func BlobID(data []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// ObjectRefBytes is the address payload for an external Artifact value:
+// ObjectRefBytes is the address payload for an external trait value:
 //
 //	digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace
-//
-// This is what is hashed with type to form the Artifact id when object is set.
 func ObjectRefBytes(o *ObjectRef) []byte {
 	if o == nil {
 		return nil
@@ -156,41 +158,168 @@ func ObjectRefBytes(o *ObjectRef) []byte {
 	return out
 }
 
-// ArtifactContent returns the bytes folded into the Artifact address: the
-// inline body, or object_ref_bytes(object) when a verified external ref is set.
-func ArtifactContent(a *Artifact) []byte {
-	if a != nil && a.Object != nil && a.Object.Digest != "" {
-		return ObjectRefBytes(a.Object)
+// TraitContent returns bytes folded into value identity for one trait.
+func TraitContent(f *Trait) []byte {
+	if f != nil && f.Object != nil && f.Object.Digest != "" {
+		return ObjectRefBytes(f.Object)
 	}
+	if f == nil {
+		return nil
+	}
+	return f.Body
+}
+
+// TraitHasExternal reports whether the trait holds a verified ObjectRef.
+func TraitHasExternal(f *Trait) bool {
+	return f != nil && f.Object != nil && f.Object.Digest != ""
+}
+
+// ArtifactCanonicalBytes encodes a trait bag for content addressing:
+//
+//	for each contract_ref in UTF-8 ascending order:
+//	    contract_ref ‖ 0x00 ‖ trait_content ‖ 0x00
+func ArtifactCanonicalBytes(a *Artifact) []byte {
+	if a == nil || len(a.Traits) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(a.Traits))
+	for k := range a.Traits {
+		keys = append(keys, k)
+	}
+	sortStringsUTF8(keys)
+	var out []byte
+	for _, k := range keys {
+		out = append(out, k...)
+		out = append(out, sep)
+		out = append(out, TraitContent(a.Traits[k])...)
+		out = append(out, sep)
+	}
+	return out
+}
+
+// ArtifactIDOf is the content address of a full trait-bag Artifact.
+// Meta, ProducedBy, EntityId, and Supersedes are NOT part of the address.
+func ArtifactIDOf(a *Artifact) string {
+	sum := sha256.Sum256(ArtifactCanonicalBytes(a))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// ArtifactIDSingle is the content address of a single-trait bag.
+func ArtifactIDSingle(contract string, content []byte) string {
+	return ArtifactIDOf(ArtifactWithTrait(contract, content))
+}
+
+// ArtifactWithTrait builds an in-memory single-trait artifact (not stored).
+func ArtifactWithTrait(contract string, body []byte) *Artifact {
+	return &Artifact{
+		Traits: map[string]*Trait{
+			contract: {Body: append([]byte(nil), body...)},
+		},
+	}
+}
+
+// ArtifactWithExternalTrait builds a single external-object trait artifact.
+func ArtifactWithExternalTrait(contract string, obj *ObjectRef) *Artifact {
+	return &Artifact{
+		Traits: map[string]*Trait{
+			contract: {Object: obj},
+		},
+	}
+}
+
+// HasTraits reports whether the artifact contains every listed contract ref.
+func HasTraits(a *Artifact, required []string) bool {
+	if a == nil {
+		return false
+	}
+	for _, r := range required {
+		if _, ok := a.Traits[r]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// TraitSetCovers reports whether have ⊇ need.
+func TraitSetCovers(have, need []string) bool {
+	set := map[string]struct{}{}
+	for _, h := range have {
+		set[h] = struct{}{}
+	}
+	for _, n := range need {
+		if _, ok := set[n]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// GetTrait returns the trait for a contract ref, or nil.
+func GetTrait(a *Artifact, contract string) *Trait {
 	if a == nil {
 		return nil
 	}
-	return a.Body
+	return a.Traits[contract]
 }
 
-// ArtifactID computes a content address over an explicit content payload:
-//
-//	id = "sha256:" + hex(sha256(type + 0x00 + content))
-//
-// For inline values pass body; for external values pass ObjectRefBytes(object).
-// Prefer ArtifactIDOf when you have a full Artifact. Meta and ProducedBy are
-// deliberately NOT part of the address.
-func ArtifactID(typ string, content []byte) string {
-	h := sha256.New()
-	h.Write([]byte(typ))
-	h.Write([]byte{sep})
-	h.Write(content)
-	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+// ProjectTraits returns a new bag with only the named traits.
+func ProjectTraits(a *Artifact, contracts []string) (*Artifact, error) {
+	if a == nil {
+		return nil, fmt.Errorf("%w: artifact is required", ErrInvalid)
+	}
+	out := &Artifact{
+		Traits:     map[string]*Trait{},
+		Meta:       a.Meta,
+		ProducedBy: a.ProducedBy,
+		EntityId:   a.EntityId,
+		Supersedes: a.Supersedes,
+	}
+	for _, c := range contracts {
+		f, ok := a.Traits[c]
+		if !ok {
+			return nil, fmt.Errorf("%w: artifact missing trait %s", ErrInvalid, c)
+		}
+		out.Traits[c] = proto.Clone(f).(*Trait)
+	}
+	return out, nil
 }
 
-// ArtifactIDOf is the typed value address for a full Artifact (inline or external).
-func ArtifactIDOf(a *Artifact) string {
-	return ArtifactID(a.Type, ArtifactContent(a))
+// MergeTraits unions two bags; add wins on collision. Sets Supersedes to base.Id.
+func MergeTraits(base, add *Artifact) *Artifact {
+	out := &Artifact{Traits: map[string]*Trait{}}
+	if base != nil {
+		for k, v := range base.Traits {
+			out.Traits[k] = proto.Clone(v).(*Trait)
+		}
+		out.EntityId = base.EntityId
+		if base.Id != "" {
+			out.Supersedes = base.Id
+		}
+	}
+	if add != nil {
+		for k, v := range add.Traits {
+			out.Traits[k] = proto.Clone(v).(*Trait)
+		}
+		if add.EntityId != "" {
+			out.EntityId = add.EntityId
+		}
+		out.ProducedBy = add.ProducedBy
+		out.Meta = add.Meta
+	}
+	return out
 }
 
-// HasExternalObject reports whether a holds a verified external ObjectRef.
+// HasExternalObject reports whether any trait holds a verified ObjectRef.
 func HasExternalObject(a *Artifact) bool {
-	return a != nil && a.Object != nil && a.Object.Digest != ""
+	if a == nil {
+		return false
+	}
+	for _, f := range a.Traits {
+		if TraitHasExternal(f) {
+			return true
+		}
+	}
+	return false
 }
 
 // ContractDigest is the content address of a Contract's schema identity:

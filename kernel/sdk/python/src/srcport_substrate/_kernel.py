@@ -52,9 +52,12 @@ from ._types import (
     WorkItem,
     _ledger_hash,
     artifact_id_of,
+    artifact_with_external_trait,
     blob_id,
     contract_digest,
-    has_external_object,
+    trait_has_external,
+    trait_set_covers,
+    has_traits,
     is_contract_placeholder,
     verify_chain,
 )
@@ -317,7 +320,8 @@ class MemoryKernel:
             for cap in manifest.provides:
                 self._capabilities.append(copy.deepcopy(cap))
                 for port in list(cap.inputs) + list(cap.outputs):
-                    self._ensure_contract_placeholder(port.contract)
+                    for fr in port.traits:
+                        self._ensure_contract_placeholder(fr)
             self._modules.append(
                 [copy.deepcopy(manifest), Lifecycle.LIFECYCLE_REGISTERED]
             )
@@ -376,13 +380,11 @@ class MemoryKernel:
     # ── 2. Artifact ────────────────────────────────────────────────────────
 
     def put_artifact(self, artifact: Artifact, ctx: RequestContext | None = None) -> ArtifactRef:
-        """rpc PutArtifact. Content-addresses the typed value and stores it
+        """rpc PutArtifact. Content-addresses a trait bag and stores it
         immutably (first write wins).
 
-        Inline: set ``body``, leave ``object`` unset. External: ``put_blob``
-        first, then set ``object`` with empty ``body``. The blob must already
-        exist and match. Exactly one of body or object may carry the value.
-        Honour deadline and ``request_key`` idempotency.
+        Each trait is inline (body) or external (object after put_blob).
+        At least one trait is required. Honour deadline and request_key.
         """
         _check_deadline(ctx)
         self._validate_artifact_content(artifact)
@@ -390,17 +392,19 @@ class MemoryKernel:
             key = _idempotency_key("put_artifact", ctx)
             if key is not None and key in self._idempotency:
                 return copy.deepcopy(self._idempotency[key])  # type: ignore[return-value]
-            if has_external_object(artifact):
-                self._verify_object_ref_locked(artifact.object)
+            for trait in artifact.traits.values():
+                if trait_has_external(trait):
+                    self._verify_object_ref_locked(trait.object)
             aid = artifact_id_of(artifact)
             if aid not in self._artifacts:
                 stored = copy.deepcopy(artifact)
                 stored.id = aid
                 self._artifacts[aid] = stored
-                # Clear large inline body; keep ObjectRef (small, part of value
-                # identity) so external artifacts reconstruct without blob bytes.
+                # Clear bodies only on external traits (match Rust/Go).
                 for_log = copy.deepcopy(stored)
-                for_log.ClearField("body")
+                for trait in for_log.traits.values():
+                    if trait_has_external(trait):
+                        trait.ClearField("body")
                 self._append_locked("artifact.put", aid, _canonical(for_log))
             ref = ArtifactRef(id=aid)
             if key is not None and key not in self._idempotency:
@@ -457,40 +461,48 @@ class MemoryKernel:
 
     def put_artifact_with_blob(
         self,
-        type: str,
+        contract: str,
         namespace: str,
         data: bytes,
         produced_by: str = "",
         ctx: RequestContext | None = None,
     ) -> tuple[ArtifactRef, BlobRef]:
-        """Put the blob then an external artifact referencing it."""
+        """Put the blob then a single-trait external artifact."""
         blob = self.put_blob(PutBlobRequest(namespace=namespace, data=data))
-        ref = self.put_artifact(
-            Artifact(
-                type=type,
-                produced_by=produced_by,
-                object=ObjectRef(
-                    digest=blob.digest,
-                    byte_count=blob.byte_count,
-                    namespace=blob.namespace,
-                ),
-            )
+        art = artifact_with_external_trait(
+            contract,
+            ObjectRef(
+                digest=blob.digest,
+                byte_count=blob.byte_count,
+                namespace=blob.namespace,
+            ),
         )
+        art.produced_by = produced_by
+        ref = self.put_artifact(art, ctx=ctx)
         return ref, blob
 
     @staticmethod
     def _validate_artifact_content(artifact: Artifact) -> None:
-        if not artifact.type:
-            raise Invalid("artifact type is required")
-        has_obj = has_external_object(artifact)
-        has_body = bool(artifact.body)
-        if has_obj and has_body:
-            raise Invalid("artifact must not set both body and object")
-        obj = artifact.object
-        if obj.digest == "" and (obj.byte_count != 0 or obj.namespace != ""):
-            raise Invalid("object.digest is required when object is set")
-        if has_obj and not _is_sha256_digest(obj.digest):
-            raise Invalid("object.digest must be sha256:<hex>")
+        if not artifact.traits:
+            raise Invalid("artifact must have at least one trait")
+        for contract, trait in artifact.traits.items():
+            if not contract:
+                raise Invalid("trait contract ref must be non-empty")
+            has_obj = trait_has_external(trait)
+            has_body = bool(trait.body)
+            if has_obj and has_body:
+                raise Invalid(
+                    f"trait {contract} must not set both body and object"
+                )
+            obj = trait.object
+            if obj.digest == "" and (obj.byte_count != 0 or obj.namespace != ""):
+                raise Invalid(
+                    f"trait {contract}: object.digest is required when object is set"
+                )
+            if has_obj and not _is_sha256_digest(obj.digest):
+                raise Invalid(
+                    f"trait {contract}: object.digest must be sha256:<hex>"
+                )
 
     def _verify_object_ref_locked(self, obj: ObjectRef) -> None:
         slot = self._blobs.get((obj.namespace, obj.digest))
@@ -915,11 +927,15 @@ class MemoryKernel:
                 for port in ports:
                     if (
                         not port.name
-                        or not port.contract
+                        or not port.traits
                         or port.name in names
                     ):
                         raise Invalid(
                             f"{node.id} has an empty or duplicate typed port"
+                        )
+                    if any(not f for f in port.traits):
+                        raise Invalid(
+                            f"{node.id}.{port.name} has an empty trait ref"
                         )
                     names.add(port.name)
         terminal_node = nodes.get(assembly.terminal.node)
@@ -968,7 +984,11 @@ class MemoryKernel:
                 item = named_inputs.get(binding.input)
                 if item is None:
                     raise Invalid(f"unknown run input {binding.input}")
-                contract = self._artifacts[item.artifact.id].type
+                art = self._artifacts[item.artifact.id]
+                if not has_traits(art, list(target.traits)):
+                    raise Invalid(
+                        f"trait set mismatch at {binding.to_node}.{binding.to_port}"
+                    )
             else:
                 source_node = nodes.get(binding.from_node)
                 if source_node is None:
@@ -983,12 +1003,11 @@ class MemoryKernel:
                     raise Invalid(
                         f"unknown output {binding.from_node}.{binding.from_port}"
                     )
-                contract = source.contract
                 edges.setdefault(binding.from_node, []).append(binding.to_node)
-            if contract != target.contract:
-                raise Invalid(
-                    f"contract mismatch at {binding.to_node}.{binding.to_port}"
-                )
+                if not trait_set_covers(list(source.traits), list(target.traits)):
+                    raise Invalid(
+                        f"trait set mismatch at {binding.to_node}.{binding.to_port}"
+                    )
         for node in assembly.nodes:
             cap = self._capability_for(
                 node.module, node.module_version, node.capability
@@ -1046,10 +1065,10 @@ class MemoryKernel:
             artifact = self._artifacts.get(output.artifact.id)
             if artifact is None:
                 raise NotFound(output.artifact.id)
-            if artifact.type != expected.contract:
+            if not has_traits(artifact, list(expected.traits)):
                 raise Invalid(
-                    f"output {output.name} has contract {artifact.type}, "
-                    f"want {expected.contract}"
+                    f"output {output.name} missing required traits "
+                    f"{list(expected.traits)}"
                 )
 
     @staticmethod

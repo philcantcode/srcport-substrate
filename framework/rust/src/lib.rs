@@ -46,14 +46,56 @@ use srcport_substrate::{
 // ── Plugin surface ──────────────────────────────────────────────────────────
 
 /// One named output port value before the host calls `PutArtifact`.
+///
+/// Values are **trait bags**: one or more contract refs with inline bodies.
+/// Use [`PortBody::with_trait`] for the common single-trait case.
 #[derive(Debug, Clone)]
 pub struct PortBody {
     /// Capability output port name (must match the assembly / capability).
     pub port: String,
-    /// Contract ref for the artifact `type`.
-    pub contract: String,
-    /// Inline artifact body bytes.
-    pub body: Vec<u8>,
+    /// Trait bag: contract ref → inline body bytes.
+    pub traits: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Optional stable entity id (not part of value identity).
+    pub entity_id: String,
+}
+
+impl PortBody {
+    /// Single-trait output (most modules).
+    pub fn with_trait(
+        port: impl Into<String>,
+        contract: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        let mut traits = std::collections::BTreeMap::new();
+        traits.insert(contract.into(), body.into());
+        Self {
+            port: port.into(),
+            traits,
+            entity_id: String::new(),
+        }
+    }
+
+    /// Multi-trait output (enrichment / trait bags).
+    pub fn with_traits(
+        port: impl Into<String>,
+        pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<Vec<u8>>)>,
+    ) -> Self {
+        let mut traits = std::collections::BTreeMap::new();
+        for (c, b) in pairs {
+            traits.insert(c.into(), b.into());
+        }
+        Self {
+            port: port.into(),
+            traits,
+            entity_id: String::new(),
+        }
+    }
+
+    /// Attach an entity id (copied onto the artifact).
+    pub fn with_entity_id(mut self, id: impl Into<String>) -> Self {
+        self.entity_id = id.into();
+        self
+    }
 }
 
 /// Result of [`ModulePlugin::execute`].
@@ -566,11 +608,21 @@ impl<K: KernelApi> Host<K> {
             Ok(output) => {
                 let mut named_outputs = Vec::with_capacity(output.outputs.len());
                 for out in &output.outputs {
+                    let mut traits = std::collections::BTreeMap::new();
+                    for (contract, body) in &out.traits {
+                        traits.insert(
+                            contract.clone(),
+                            srcport_substrate::Trait {
+                                body: body.clone(),
+                                object: None,
+                            },
+                        );
+                    }
                     let r = self.kernel.put_artifact(
                         Artifact {
-                            r#type: out.contract.clone(),
-                            body: out.body.clone(),
+                            traits,
                             produced_by: module.into(),
+                            entity_id: out.entity_id.clone(),
                             ..Default::default()
                         },
                         &self.ctx,
@@ -693,15 +745,9 @@ impl<K: KernelApi> Host<K> {
         }
         let body = serde_json::to_vec(view)
             .map_err(|e| FrameworkError::Invalid(format!("serialize presentation: {e}")))?;
-        let r = self.kernel.put_artifact(
-            Artifact {
-                r#type: contract.into(),
-                body,
-                produced_by: module.into(),
-                ..Default::default()
-            },
-            &self.ctx,
-        )?;
+        let mut art = srcport_substrate::artifact_with_trait(contract, body);
+        art.produced_by = module.into();
+        let r = self.kernel.put_artifact(art, &self.ctx)?;
         Ok(r.id)
     }
 

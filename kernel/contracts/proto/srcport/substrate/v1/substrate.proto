@@ -6,6 +6,10 @@
 // knows nothing about any domain — no targets, trials, findings, entities,
 // terrain, or content. All of that is a Module built ON TOP of this.
 //
+// Artifacts are trait bundles: a value is a set of contract-typed traits that
+// travel together. Ports require (or guarantee) trait sets; satisfaction is
+// structural inclusion. Projection isolates one trait or a subset.
+//
 // Evolve by ADDING, never by mutating or renumbering a field. See SPEC.md.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -37,7 +41,8 @@ enum Firing {
 }
 
 // A named thing a module can do. Typed I/O is declared exclusively on ports —
-// modules couple through Port.contract refs, never through each other's code.
+// modules couple through Port.traits contract refs, never through each other's
+// code.
 message Capability {
   string name = 1;  // e.g. "recon.scan"
   reserved 2;
@@ -52,17 +57,26 @@ message Capability {
 // A named, typed side of a capability. Multiple bindings are permitted only
 // when `multiple` is true; an unbound input is permitted only when `optional`
 // is true. These rules let the kernel determine readiness without parsing data.
+//
+// Typing is a **trait set**: `traits` lists contract refs. On an input port the
+// artifact must *contain* every listed trait (superset OK). On an output port
+// the module *guarantees* those traits will be present (may include more).
+// Assembly binding: source guarantees ⊇ target requires. The kernel never
+// parses trait bodies.
 message Port {
   string name     = 1;
-  // Contract *ref* — registry key. The kernel pins ref → digest at PutContract;
-  // the string is an identity handle, not a redefinable label.
-  string contract = 2;
+  // Removed: single contract ref. Use `traits` (field 6).
+  reserved 2;
+  reserved "contract";
   bool multiple   = 3;
   bool optional   = 4;
   // When true, this port participates in FIRING_ONCE_PER_KEY identity. The
   // kernel hashes artifact ids on key ports (never domain bodies). If no input
   // port is marked key, all inputs participate.
   bool key = 5;
+  // Non-empty list of trait contract refs. Input: required. Output: guaranteed.
+  // Order is insignificant; the kernel normalizes to a set for matching.
+  repeated string traits = 6;
 }
 
 message ModuleManifest {
@@ -76,22 +90,30 @@ message ModuleManifest {
 }
 
 // ─── 2. ARTIFACT ───────────────────────────────────────────────────────────
-// A typed, content-addressed, IMMUTABLE value that flows between modules.
+// A content-addressed, IMMUTABLE **trait bundle** that flows between modules.
 //
-// Value identity and blob identity are distinct:
+// A value is a map of contract ref → Trait (inline body or external ObjectRef).
+// Traits travel together; consumers project the traits they need.
 //
-//   • Inline (small):  id = H(type ‖ 0x00 ‖ body)
-//   • External (large): id = H(type ‖ 0x00 ‖ object_ref_bytes(object))
-//       object_ref_bytes = digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace
-//   • Blob identity is pure content: digest = "sha256:" + hex(sha256(data))
+// Value identity (content address):
 //
-// Exactly one of `body` or `object` carries the value. Prefer inline for small
-// payloads; place a verified ObjectRef for large blobs so a module can commit a
-// typed value without copying PCAP / APK / evidence bytes into the artifact store.
-// The kernel never parses domain payload; `type` is the contract ref.
+//   id = H( canonical_traits )
+//   canonical_traits = for each contract_ref in UTF-8 ascending order:
+//       contract_ref ‖ 0x00 ‖ trait_content ‖ 0x00
+//   trait_content =
+//       body                                           (inline)
+//     | object_ref_bytes(object)                       (external)
+//   object_ref_bytes = digest ‖ 0x00 ‖ uint64_be(byte_count) ‖ 0x00 ‖ namespace
 //
-// Provenance is NOT on the Artifact: equal values share one address while every
-// distinct production path is recorded as a separate immutable Derivation.
+// Blob identity is pure content: digest = "sha256:" + hex(sha256(data)).
+//
+// Exactly one of Trait.body or Trait.object carries each trait's value.
+// Prefer inline for small payloads; place a verified ObjectRef for large blobs.
+// The kernel never parses domain payload; trait *keys* are contract refs.
+//
+// Provenance is NOT on the Artifact: equal trait bags share one address while
+// every distinct production path is recorded as a separate immutable Derivation.
+// entity_id / supersedes / meta / produced_by are NOT part of value identity.
 
 // Content-addressed blob. Digest is over raw bytes only (not type, not namespace).
 message BlobRef {
@@ -101,26 +123,40 @@ message BlobRef {
 }
 
 // Verified external object reference. Same fields as BlobRef; named separately
-// because it participates in typed Artifact value identity.
+// because it participates in typed Artifact value identity (via a Trait).
 message ObjectRef {
   string digest     = 1;  // blob digest; must match stored bytes
   uint64 byte_count = 2;  // expected size; verified on put and get
   string namespace  = 3;  // which blob store namespace holds the bytes
 }
 
+// One contract-typed payload inside a trait bundle.
+message Trait {
+  // Small inline value. Must be empty when `object` is set.
+  bytes body = 1;
+  // Large external value: a verified ref to a blob. When digest is non-empty,
+  // trait content hashes object_ref_bytes(object), not the blob bytes, and body
+  // must be empty. The blob must already exist in `object.namespace`.
+  ObjectRef object = 2;
+}
+
 message Artifact {
   string id                  = 1;  // content address, assigned by the kernel
-  string type                = 2;  // contract ref describing the value
-  // Small inline value. Must be empty when `object` is set.
-  bytes  body                = 3;
+  // Removed: single type + body/object. Use `traits` (field 8).
+  reserved 2, 3, 7;
+  reserved "type", "body", "object";
   map<string, string> meta   = 4;
-  string produced_by         = 5;  // module name
+  string produced_by         = 5;  // module name (not part of value id)
   reserved 6;
   reserved "derived_from";
-  // Large external value: a verified ref to a blob. When digest is non-empty,
-  // Artifact id hashes object_ref_bytes(object), not the blob bytes, and body
-  // must be empty. The blob must already exist in `object.namespace`.
-  ObjectRef object           = 7;
+  // Trait bag: key = contract ref. At least one entry required.
+  map<string, Trait> traits  = 8;
+  // Optional stable entity identity across enrichments (e.g. "file:abc").
+  // NOT part of value identity — copy forward when merging traits.
+  string entity_id           = 9;
+  // Optional prior artifact id this value supersedes (lineage hint).
+  // NOT part of value identity.
+  string supersedes          = 10;
 }
 
 message ArtifactRef { string id = 1; }
@@ -155,7 +191,8 @@ message HasBlobResponse {
 
 // ─── 3. CONTRACT ───────────────────────────────────────────────────────────
 // The declarative schema that is the SOLE coupling point. Modules couple to a
-// contract *identity*, never to each other's code.
+// contract *identity*, never to each other's code. Each **trait key** on an
+// Artifact and each entry in Port.traits names a contract ref.
 //
 // Identity & immutability:
 //   • `ref` is the stable human name and the registry key.
@@ -169,8 +206,8 @@ message HasBlobResponse {
 //   • Register may create an empty name-only placeholder for a ref named by a
 //     port; that placeholder may be filled once via PutContract.
 //
-// Port.contract, Artifact.type, and Event.type hold the ref. The kernel pins
-// that ref to one digest — the string is never redefinable.
+// Port.traits and Artifact.traits keys hold the ref. Event.type may name a ref
+// for optional event typing. The kernel pins that ref to one digest.
 
 message Contract {
   string ref         = 1;  // fully-qualified name, e.g. "acme.recon.v1.Host"
@@ -182,6 +219,7 @@ message Contract {
   string digest      = 5;  // content address; assigned by the kernel on put
   // Optional: other contract refs this one claims compatibility with. Advisory
   // only — does not rewrite or alias those refs. Sorted UTF-8 on registration.
+  // Does NOT participate in trait set matching (structural inclusion does).
   repeated string compatible_with = 6;
 }
 
@@ -214,7 +252,7 @@ message LedgerEntry {
   string subject   = 3;  // id of the thing this entry is about
   bytes  detail    = 4;  // canonical proto of one message, keyed by `kind` (see
                          // SPEC.md "Ledger detail"); large content already
-                         // addressed by `subject` (artifact body bytes, blob
+                         // addressed by `subject` (trait body bytes, blob
                          // data) is cleared; verified ObjectRef / BlobRef
                          // metadata remains.
   string prev_hash = 5;  // hash of entry seq-1 ("" for genesis)
@@ -351,8 +389,8 @@ message WorkItem {
   repeated NamedArtifact inputs = 7;
 }
 
-// Provenance is separate from Artifact identity: equal values converge to one
-// Artifact while every distinct production path remains observable.
+// Provenance is separate from Artifact identity: equal trait bags converge to
+// one Artifact while every distinct production path remains observable.
 message Derivation {
   string id                     = 1;
   string run_id                 = 2;
@@ -450,7 +488,7 @@ service Kernel {
   rpc PutArtifact (Artifact)        returns (ArtifactRef);
   rpc GetArtifact (ArtifactRef)     returns (Artifact);
   // Content-addressed blob store: large opaque bytes live here; Artifacts
-  // either inline small values or hold a verified ObjectRef into this store.
+  // hold verified ObjectRefs on individual traits.
   rpc PutBlob     (PutBlobRequest)  returns (BlobRef);
   rpc GetBlob     (GetBlobRequest)  returns (BlobData);
   rpc HasBlob     (HasBlobRequest)  returns (HasBlobResponse);

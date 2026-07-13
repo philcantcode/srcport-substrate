@@ -5,7 +5,7 @@ use srcport_framework::{
     ModulePlugin, PortBody, StepContext, StepOutput, StepResult, StoragePlan, StorageRetention,
     StoreValue, StoreWrite, TableSchema, WriteMode, STEP_LOG_TABLE,
 };
-use srcport_substrate::{
+use srcport_substrate::{artifact_with_trait, has_traits, 
     Artifact, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
     NamedArtifact, NodeOutput, Port, RunState,
 };
@@ -21,12 +21,12 @@ impl ModulePlugin for Counter {
                 name: "count.run".into(),
                 inputs: vec![Port {
                     name: "seed".into(),
-                    contract: "demo.v1.Seed".into(),
+                    traits: vec!["demo.v1.Seed".into()],
                     ..Default::default()
                 }],
                 outputs: vec![Port {
                     name: "total".into(),
-                    contract: "demo.v1.Total".into(),
+                    traits: vec!["demo.v1.Total".into()],
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -49,14 +49,10 @@ impl ModulePlugin for Counter {
         let body = step
             .inputs
             .get("seed")
-            .map(|a| a.body.clone())
+            .and_then(|a| a.traits.values().next().map(|f| f.body.clone()))
             .unwrap_or_else(|| b"1".to_vec());
         Ok(StepOutput {
-            outputs: vec![PortBody {
-                port: "total".into(),
-                contract: "demo.v1.Total".into(),
-                body,
-            }],
+            outputs: vec![PortBody::with_trait("total", "demo.v1.Total", body)],
         })
     }
 
@@ -67,7 +63,7 @@ impl ModulePlugin for Counter {
         let n: i64 = step
             .inputs
             .get("seed")
-            .and_then(|a| std::str::from_utf8(&a.body).ok())
+            .and_then(|a| std::str::from_utf8(a.traits.values().next().map(|f| f.body.as_slice()).unwrap_or(b"")).ok())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         Some(StoreWrite::append([store_row([
@@ -80,12 +76,7 @@ impl ModulePlugin for Counter {
 fn put_seed(host: &Host<MemoryKernel>, body: &[u8]) -> NamedArtifact {
     let r = host
         .kernel()
-        .put_artifact(Artifact {
-            r#type: "demo.v1.Seed".into(),
-            body: body.to_vec(),
-            produced_by: "test".into(),
-            ..Default::default()
-        })
+        .put_artifact({ let mut __a = artifact_with_trait("demo.v1.Seed", body.to_vec()); __a.produced_by = "test".into(); __a })
         .unwrap();
     NamedArtifact {
         name: "seed".into(),
@@ -261,12 +252,12 @@ fn upsert_write_mode_across_shared_runs() {
                     name: "up.run".into(),
                     inputs: vec![Port {
                         name: "in".into(),
-                        contract: "demo.v1.In".into(),
+                        traits: vec!["demo.v1.In".into()],
                         ..Default::default()
                     }],
                     outputs: vec![Port {
                         name: "out".into(),
-                        contract: "demo.v1.Out".into(),
+                        traits: vec!["demo.v1.Out".into()],
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -289,14 +280,10 @@ fn upsert_write_mode_across_shared_runs() {
             let body = step
                 .inputs
                 .get("in")
-                .map(|a| a.body.clone())
+                .and_then(|a| a.traits.values().next().map(|f| f.body.clone()))
                 .unwrap_or_default();
             Ok(StepOutput {
-                outputs: vec![PortBody {
-                    port: "out".into(),
-                    contract: "demo.v1.Out".into(),
-                    body,
-                }],
+                outputs: vec![PortBody::with_trait("out", "demo.v1.Out", body)],
             })
         }
 
@@ -307,7 +294,7 @@ fn upsert_write_mode_across_shared_runs() {
             let v = step
                 .inputs
                 .get("in")
-                .and_then(|a| String::from_utf8(a.body.clone()).ok())
+                .and_then(|a| String::from_utf8(a.traits.values().next().map(|f| f.body.clone()).unwrap_or_default()).ok())
                 .unwrap_or_default();
             Some(StoreWrite::upsert([store_row([
                 ("k", StoreValue::Text("only".into())),
@@ -342,12 +329,7 @@ fn upsert_write_mode_across_shared_runs() {
     for (id, val) in [("u1", "first"), ("u2", "second")] {
         let r = host
             .kernel()
-            .put_artifact(Artifact {
-                r#type: "demo.v1.In".into(),
-                body: val.as_bytes().to_vec(),
-                produced_by: "test".into(),
-                ..Default::default()
-            })
+            .put_artifact({ let mut __a = artifact_with_trait("demo.v1.In", val.as_bytes().to_vec()); __a.produced_by = "test".into(); __a })
             .unwrap();
         host.start_pipeline(
             id,

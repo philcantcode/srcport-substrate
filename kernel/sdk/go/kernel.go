@@ -245,7 +245,9 @@ func (k *MemoryKernel) Register(m *ModuleManifest, ctx ...*RequestContext) *Regi
 	for _, c := range m.Provides {
 		k.capabilities = append(k.capabilities, clone(c))
 		for _, p := range append(append([]*Port{}, c.Inputs...), c.Outputs...) {
-			k.ensureContractPlaceholderLocked(p.Contract)
+			for _, fr := range p.Traits {
+				k.ensureContractPlaceholderLocked(fr)
+			}
 		}
 	}
 	k.modules = append(k.modules, moduleSlot{manifest: m, lifecycle: LifecycleRegistered})
@@ -298,13 +300,11 @@ func (k *MemoryKernel) Transition(req *TransitionRequest, ctx ...*RequestContext
 
 // ─── 2. Artifact ──────────────────────────────────────────────────────────
 
-// PutArtifact content-addresses the typed value, stores it immutably (first
-// write wins), and returns its ref. Mirrors rpc PutArtifact.
+// PutArtifact content-addresses a trait bag, stores it immutably (first write
+// wins), and returns its ref. Mirrors rpc PutArtifact.
 //
-// Inline: pass body, leave object unset. External: PutBlob first, then pass
-// object (digest, byte_count, namespace) with body empty. The blob must already
-// exist and match. Exactly one of body or object may carry the value.
-// Honour RequestContext deadline and request_key idempotency.
+// Each trait is inline (body) or external (object after PutBlob). At least one
+// trait is required. Honour RequestContext deadline and request_key idempotency.
 func (k *MemoryKernel) PutArtifact(a *Artifact, ctx ...*RequestContext) (*ArtifactRef, error) {
 	c := firstCtx(ctx)
 	if err := checkDeadline(c); err != nil {
@@ -321,9 +321,11 @@ func (k *MemoryKernel) PutArtifact(a *Artifact, ctx ...*RequestContext) (*Artifa
 			return clone(cached.artifact), nil
 		}
 	}
-	if HasExternalObject(a) {
-		if err := k.verifyObjectRefLocked(a.Object); err != nil {
-			return nil, err
+	for _, f := range a.Traits {
+		if TraitHasExternal(f) {
+			if err := k.verifyObjectRefLocked(f.Object); err != nil {
+				return nil, err
+			}
 		}
 	}
 	id := ArtifactIDOf(a)
@@ -331,10 +333,15 @@ func (k *MemoryKernel) PutArtifact(a *Artifact, ctx ...*RequestContext) (*Artifa
 		stored := clone(a)
 		stored.Id = id
 		k.artifacts[id] = stored
-		// Ledger: clear large inline body; keep ObjectRef (small, part of value
-		// identity) so external artifacts reconstruct without blob bytes.
+		// Ledger: clear bodies only on external traits (ObjectRef retained).
+		// Inline bodies stay so empty-Trait map values do not diverge across
+		// SDKs (prost omits empty map values; Go would encode zero-length).
 		forLog := clone(stored)
-		forLog.Body = nil
+		for _, f := range forLog.Traits {
+			if f != nil && TraitHasExternal(f) {
+				f.Body = nil
+			}
+		}
 		k.appendLocked("artifact.put", id, marshalCanonical(forLog))
 	}
 	ref := &ArtifactRef{Id: id}
@@ -418,17 +425,15 @@ func (k *MemoryKernel) HasBlob(req *HasBlobRequest, ctx ...*RequestContext) *Has
 
 // PutArtifactWithBlob puts the blob then an external artifact referencing it.
 // Convenience for the production path: large data → blob store + ObjectRef.
-func (k *MemoryKernel) PutArtifactWithBlob(typ, namespace string, data []byte, producedBy string, ctx ...*RequestContext) (*ArtifactRef, *BlobRef, error) {
+func (k *MemoryKernel) PutArtifactWithBlob(contract, namespace string, data []byte, producedBy string, ctx ...*RequestContext) (*ArtifactRef, *BlobRef, error) {
 	blob := k.PutBlob(&PutBlobRequest{Namespace: namespace, Data: data})
-	ref, err := k.PutArtifact(&Artifact{
-		Type:       typ,
-		ProducedBy: producedBy,
-		Object: &ObjectRef{
-			Digest:    blob.Digest,
-			ByteCount: blob.ByteCount,
-			Namespace: blob.Namespace,
-		},
+	a := ArtifactWithExternalTrait(contract, &ObjectRef{
+		Digest:    blob.Digest,
+		ByteCount: blob.ByteCount,
+		Namespace: blob.Namespace,
 	})
+	a.ProducedBy = producedBy
+	ref, err := k.PutArtifact(a)
 	return ref, blob, err
 }
 
@@ -436,19 +441,26 @@ func validateArtifactContent(a *Artifact) error {
 	if a == nil {
 		return fmt.Errorf("%w: artifact is required", ErrInvalid)
 	}
-	if a.Type == "" {
-		return fmt.Errorf("%w: artifact type is required", ErrInvalid)
+	if len(a.Traits) == 0 {
+		return fmt.Errorf("%w: artifact must have at least one trait", ErrInvalid)
 	}
-	hasObj := HasExternalObject(a)
-	hasBody := len(a.Body) > 0
-	if hasObj && hasBody {
-		return fmt.Errorf("%w: artifact must not set both body and object", ErrInvalid)
-	}
-	if !hasObj && a.Object != nil && a.Object.Digest == "" && (a.Object.ByteCount != 0 || a.Object.Namespace != "") {
-		return fmt.Errorf("%w: object.digest is required when object is set", ErrInvalid)
-	}
-	if hasObj && !isSHA256Digest(a.Object.Digest) {
-		return fmt.Errorf("%w: object.digest must be sha256:<hex>", ErrInvalid)
+	for contract, f := range a.Traits {
+		if contract == "" {
+			return fmt.Errorf("%w: trait contract ref must be non-empty", ErrInvalid)
+		}
+		hasObj := TraitHasExternal(f)
+		hasBody := f != nil && len(f.Body) > 0
+		if hasObj && hasBody {
+			return fmt.Errorf("%w: trait %s must not set both body and object", ErrInvalid, contract)
+		}
+		if f != nil && f.Object != nil {
+			if f.Object.Digest == "" && (f.Object.ByteCount != 0 || f.Object.Namespace != "") {
+				return fmt.Errorf("%w: trait %s: object.digest is required when object is set", ErrInvalid, contract)
+			}
+			if hasObj && !isSHA256Digest(f.Object.Digest) {
+				return fmt.Errorf("%w: trait %s: object.digest must be sha256:<hex>", ErrInvalid, contract)
+			}
+		}
 	}
 	return nil
 }
@@ -1012,7 +1024,7 @@ func (k *MemoryKernel) validateAssembly(a *Assembly, inputs []*NamedArtifact) er
 		for _, ports := range [][]*Port{cap.Inputs, cap.Outputs} {
 			names := map[string]bool{}
 			for _, p := range ports {
-				if p.Name == "" || p.Contract == "" || names[p.Name] {
+				if p.Name == "" || len(p.Traits) == 0 || names[p.Name] {
 					return fmt.Errorf("%w: %s has an empty or duplicate typed port", ErrInvalid, n.Id)
 				}
 				names[p.Name] = true
@@ -1061,13 +1073,15 @@ func (k *MemoryKernel) validateAssembly(a *Assembly, inputs []*NamedArtifact) er
 		if upstream == external {
 			return fmt.Errorf("%w: binding must have exactly one source", ErrInvalid)
 		}
-		var contract string
 		if external {
 			value := in[b.Input]
 			if value == nil {
 				return fmt.Errorf("%w: unknown run input %s", ErrInvalid, b.Input)
 			}
-			contract = k.artifacts[value.Artifact.Id].Type
+			art := k.artifacts[value.Artifact.Id]
+			if !HasTraits(art, tp.Traits) {
+				return fmt.Errorf("%w: trait set mismatch at %s.%s", ErrInvalid, b.ToNode, b.ToPort)
+			}
 		} else {
 			sn := nodes[b.FromNode]
 			if sn == nil {
@@ -1078,11 +1092,10 @@ func (k *MemoryKernel) validateAssembly(a *Assembly, inputs []*NamedArtifact) er
 			if sp == nil {
 				return fmt.Errorf("%w: unknown output %s.%s", ErrInvalid, b.FromNode, b.FromPort)
 			}
-			contract = sp.Contract
 			edges[b.FromNode] = append(edges[b.FromNode], b.ToNode)
-		}
-		if contract != tp.Contract {
-			return fmt.Errorf("%w: contract mismatch at %s.%s", ErrInvalid, b.ToNode, b.ToPort)
+			if !TraitSetCovers(sp.Traits, tp.Traits) {
+				return fmt.Errorf("%w: trait set mismatch at %s.%s", ErrInvalid, b.ToNode, b.ToPort)
+			}
 		}
 	}
 	for _, n := range a.Nodes {
@@ -1356,8 +1369,8 @@ func (k *MemoryKernel) validateOutputs(cap *Capability, outputs []*NamedArtifact
 		if a == nil {
 			return fmt.Errorf("%w: %s", ErrNotFound, output.Artifact.Id)
 		}
-		if a.Type != expected.Contract {
-			return fmt.Errorf("%w: output %s has contract %s, want %s", ErrInvalid, output.Name, a.Type, expected.Contract)
+		if !HasTraits(a, expected.Traits) {
+			return fmt.Errorf("%w: output %s missing required traits %v", ErrInvalid, output.Name, expected.Traits)
 		}
 	}
 	return nil

@@ -378,7 +378,7 @@ for the same `(type, body)`.
 
 ## Status
 
-**`v1.1.0` — stable.** Rust, Go, and Python implement the same `KernelApi` ABI
+**`v2.0.0` — stable.** Rust, Go, and Python implement the same `KernelApi` ABI
 (with `MemoryKernel` as the in-process backend). Additive run-modes: module
 `Firing` / `Port.key`, `ExecutionPolicy`, `include_nodes`, `InjectInput`, and
 work-unit claim identity. The contract is versioned and compatibility-checked

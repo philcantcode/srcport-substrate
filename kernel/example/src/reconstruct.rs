@@ -71,7 +71,7 @@ pub struct Graph {
 impl Graph {
     /// Decode a ledger chain into a dataflow graph. Reads only the chain.
     pub fn from_ledger(chain: &[LedgerEntry]) -> Graph {
-        // artifact id → contract type, from every `artifact.put` entry.
+        // artifact id → trait contract keys (joined), from every `artifact.put`.
         let mut types: BTreeMap<String, String> = BTreeMap::new();
         // node key → decoded derivation.
         let mut derivations: Vec<Derivation> = Vec::new();
@@ -83,7 +83,11 @@ impl Graph {
             match e.kind.as_str() {
                 "artifact.put" => {
                     if let Ok(a) = Artifact::decode(&e.detail[..]) {
-                        types.insert(e.subject.clone(), a.r#type);
+                        let label = a.traits.keys().cloned().collect::<Vec<_>>().join("+");
+                        types.insert(
+                            e.subject.clone(),
+                            if label.is_empty() { "?".into() } else { label },
+                        );
                     }
                 }
                 "derivation.committed" => {

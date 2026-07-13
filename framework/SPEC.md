@@ -1,4 +1,4 @@
-# srcport-framework — Specification v0.1.0
+# srcport-framework — Specification v2.0.0
 
 Opinionated **application layer** on top of [srcport-substrate](../kernel/SPEC.md).
 This is a framework. The substrate is not.
@@ -118,13 +118,16 @@ record the failed outcome.
 returns **named port outputs**. The host puts domain artifacts and commits the
 derivation so provenance stays on the ledger.
 
-Enrichment is ordinary: produce a new typed artifact; bind it downstream.
-There is no mutable “enrichment bag” in the kernel.
+Enrichment is ordinary: produce a **new** trait-bag artifact (add traits via
+merge / multi-trait `PortBody`); bind it downstream. Projection isolates one
+trait for consumers that need only the base fact. There is no mutable bag —
+immutability still holds; “mutation over time” is succession of bags + optional
+`entity_id` / `supersedes` lineage hints.
 
 ### 5. UI profile (`srcport.ui.v1`)
 
-Optional well-known contract refs. Bodies are JSON (UTF-8) in `Artifact.body`
-when persisted.
+Optional well-known contract refs. Bodies are JSON (UTF-8) as a single trait
+on the presentation artifact when persisted.
 
 | Contract ref | Stage |
 |--------------|--------|
@@ -245,10 +248,10 @@ under PerRun it truncates the whole (already run-scoped) table.
 
 | Version | Notes |
 |---------|--------|
-| `0.1.0` | Initial charter; Rust host + `ModulePlugin`; UI profile stubs; manual assemblies only |
-| `0.1.0` (+modes) | `FrameworkPolicy` presets: converge / stream / stream_dedupe / selective; `start_pipeline`, `inject`, `DrivePlan` |
-| `0.1.0` (+lifecycle) | Step presentation lifecycle Init → Progress* → Final; `StepEvent`; UI schemas; legacy view adapters |
-| `0.1.0` (+storage) | Optional `StoragePlan` (Off / PerRun / Shared + step_log); `storage_schema` / `on_store`; `MemoryStorage` |
+| `2.0.0` | Initial charter; Rust host + `ModulePlugin`; UI profile stubs; manual assemblies only |
+| `2.0.0` (+modes) | `FrameworkPolicy` presets: converge / stream / stream_dedupe / selective; `start_pipeline`, `inject`, `DrivePlan` |
+| `2.0.0` (+lifecycle) | Step presentation lifecycle Init → Progress* → Final; `StepEvent`; UI schemas; legacy view adapters |
+| `2.0.0` (+storage) | Optional `StoragePlan` (Off / PerRun / Shared + step_log); `storage_schema` / `on_store`; `MemoryStorage` |
 
 ---
 

@@ -1,4 +1,4 @@
-# srcport-substrate — Rust SDK (v1.1.0)
+# srcport-substrate — Rust SDK (v2.0.0)
 
 The in-process Rust realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
@@ -20,33 +20,28 @@ use srcport_substrate::*;
 
 let kernel = MemoryKernel::new();
 
-// 1. A module registers, declaring the contracts it speaks.
+// 1. A module registers, declaring trait contracts on ports.
 kernel.register(ModuleManifest {
     name: "recon".into(),
     version: "0.1.0".into(),
     provides: vec![Capability {
         name: "recon.scan".into(),
-        outputs: vec![Port { name: "host".into(), contract: "acme.recon.v1.Host".into(), ..Default::default() }],
+        outputs: vec![Port {
+            name: "host".into(),
+            traits: vec!["acme.recon.v1.Host".into()],
+            ..Default::default()
+        }],
         ..Default::default()
     }],
     requires: vec![],
 });
 
-// 2. It produces an immutable, content-addressed artifact...
+// 2. Produce an immutable trait-bag artifact (single trait here).
 // Small values inline; large values put_blob then place a verified ObjectRef.
-let host = kernel.put_artifact(Artifact {
-    r#type: "acme.recon.v1.Host".into(),
-    body: b"10.0.0.1".to_vec(),
-    produced_by: "recon".into(),
-    ..Default::default()
-})?;
-// Large evidence without copying into the artifact store:
-// let blob = kernel.put_blob(PutBlobRequest { namespace: "evidence".into(), data: pcap });
-// let capture = kernel.put_artifact(Artifact {
-//     r#type: "observer.v1.Capture".into(),
-//     object: Some(ObjectRef { digest: blob.digest, byte_count: blob.byte_count, namespace: blob.namespace }),
-//     ..Default::default()
-// })?;
+let mut host_art = artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1".to_vec());
+host_art.produced_by = "recon".into();
+let host = kernel.put_artifact(host_art)?;
+// Large evidence: put_artifact_with_blob("observer.v1.Capture", "evidence", &pcap, "observer")?;
 
 // 3. ...and publishes an event. Artifact refs are the data plane; coupling is
 //    only through contract refs.

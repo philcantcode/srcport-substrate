@@ -84,18 +84,18 @@ class Capability(_message.Message):
     def __init__(self, name: _Optional[str] = ..., inputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ..., outputs: _Optional[_Iterable[_Union[Port, _Mapping]]] = ..., firing: _Optional[_Union[Firing, str]] = ...) -> None: ...
 
 class Port(_message.Message):
-    __slots__ = ("name", "contract", "multiple", "optional", "key")
+    __slots__ = ("name", "multiple", "optional", "key", "traits")
     NAME_FIELD_NUMBER: _ClassVar[int]
-    CONTRACT_FIELD_NUMBER: _ClassVar[int]
     MULTIPLE_FIELD_NUMBER: _ClassVar[int]
     OPTIONAL_FIELD_NUMBER: _ClassVar[int]
     KEY_FIELD_NUMBER: _ClassVar[int]
+    TRAITS_FIELD_NUMBER: _ClassVar[int]
     name: str
-    contract: str
     multiple: bool
     optional: bool
     key: bool
-    def __init__(self, name: _Optional[str] = ..., contract: _Optional[str] = ..., multiple: bool = ..., optional: bool = ..., key: bool = ...) -> None: ...
+    traits: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, name: _Optional[str] = ..., multiple: bool = ..., optional: bool = ..., key: bool = ..., traits: _Optional[_Iterable[str]] = ...) -> None: ...
 
 class ModuleManifest(_message.Message):
     __slots__ = ("name", "version", "provides", "requires")
@@ -129,8 +129,16 @@ class ObjectRef(_message.Message):
     namespace: str
     def __init__(self, digest: _Optional[str] = ..., byte_count: _Optional[int] = ..., namespace: _Optional[str] = ...) -> None: ...
 
+class Trait(_message.Message):
+    __slots__ = ("body", "object")
+    BODY_FIELD_NUMBER: _ClassVar[int]
+    OBJECT_FIELD_NUMBER: _ClassVar[int]
+    body: bytes
+    object: ObjectRef
+    def __init__(self, body: _Optional[bytes] = ..., object: _Optional[_Union[ObjectRef, _Mapping]] = ...) -> None: ...
+
 class Artifact(_message.Message):
-    __slots__ = ("id", "type", "body", "meta", "produced_by", "object")
+    __slots__ = ("id", "meta", "produced_by", "traits", "entity_id", "supersedes")
     class MetaEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -138,19 +146,26 @@ class Artifact(_message.Message):
         key: str
         value: str
         def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    class TraitsEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: Trait
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[_Union[Trait, _Mapping]] = ...) -> None: ...
     ID_FIELD_NUMBER: _ClassVar[int]
-    TYPE_FIELD_NUMBER: _ClassVar[int]
-    BODY_FIELD_NUMBER: _ClassVar[int]
     META_FIELD_NUMBER: _ClassVar[int]
     PRODUCED_BY_FIELD_NUMBER: _ClassVar[int]
-    OBJECT_FIELD_NUMBER: _ClassVar[int]
+    TRAITS_FIELD_NUMBER: _ClassVar[int]
+    ENTITY_ID_FIELD_NUMBER: _ClassVar[int]
+    SUPERSEDES_FIELD_NUMBER: _ClassVar[int]
     id: str
-    type: str
-    body: bytes
     meta: _containers.ScalarMap[str, str]
     produced_by: str
-    object: ObjectRef
-    def __init__(self, id: _Optional[str] = ..., type: _Optional[str] = ..., body: _Optional[bytes] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ..., object: _Optional[_Union[ObjectRef, _Mapping]] = ...) -> None: ...
+    traits: _containers.MessageMap[str, Trait]
+    entity_id: str
+    supersedes: str
+    def __init__(self, id: _Optional[str] = ..., meta: _Optional[_Mapping[str, str]] = ..., produced_by: _Optional[str] = ..., traits: _Optional[_Mapping[str, Trait]] = ..., entity_id: _Optional[str] = ..., supersedes: _Optional[str] = ...) -> None: ...
 
 class ArtifactRef(_message.Message):
     __slots__ = ("id",)

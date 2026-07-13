@@ -1,4 +1,4 @@
-# srcport-substrate — Go SDK (v1.1.0)
+# srcport-substrate — Go SDK (v2.0.0)
 
 The in-process Go realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
@@ -38,23 +38,17 @@ func main() {
 		Name:    "recon",
 		Version: "0.1.0",
 		Provides: []*substrate.Capability{
-			{Name: "recon.scan", Outputs: []*substrate.Port{{Name: "host", Contract: "acme.recon.v1.Host"}}},
+			{Name: "recon.scan", Outputs: []*substrate.Port{{Name: "host", Traits: []string{"acme.recon.v1.Host"}}}},
 		},
 	})
 
-	// 2. Small values inline; large values PutBlob then place a verified ObjectRef.
-	host, err := k.PutArtifact(&substrate.Artifact{
-		Type:       "acme.recon.v1.Host",
-		Body:       []byte("10.0.0.1"),
-		ProducedBy: "recon",
-	})
+	// 2. Trait-bag artifact (single trait). Large values: PutArtifactWithBlob.
+	a := substrate.ArtifactWithTrait("acme.recon.v1.Host", []byte("10.0.0.1"))
+	a.ProducedBy = "recon"
+	host, err := k.PutArtifact(a)
 	if err != nil {
 		panic(err)
 	}
-	// Large evidence without copying into the artifact store:
-	// blob := k.PutBlob(&substrate.PutBlobRequest{Namespace: "evidence", Data: pcap})
-	// capture, _ := k.PutArtifact(&substrate.Artifact{Type: "observer.v1.Capture",
-	//   Object: &substrate.ObjectRef{Digest: blob.Digest, ByteCount: blob.ByteCount, Namespace: blob.Namespace}})
 
 	// 3. ...and publishes an event. Artifact refs are the data plane; coupling
 	//    is only through contract refs.

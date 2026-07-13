@@ -6,6 +6,12 @@ import queue
 import unittest
 
 from srcport_substrate import (
+    artifact_with_trait,
+    artifact_with_external_trait,
+    artifact_id_single,
+    artifact_id_of,
+    get_trait,
+
     AppendRequest,
     Artifact,
     Assembly,
@@ -38,7 +44,6 @@ from srcport_substrate import (
     RunState,
     Subscription,
     TransitionRequest,
-    artifact_id,
     blob_id,
     contract_digest,
     is_contract_placeholder,
@@ -46,40 +51,57 @@ from srcport_substrate import (
     verify_chain,
 )
 
+def _art(contract, body, produced_by="", meta=None):
+    a = artifact_with_trait(contract, body)
+    if produced_by:
+        a.produced_by = produced_by
+    if meta:
+        a.meta.update(meta)
+    return a
+
+
+def _ext(contract, obj, produced_by=""):
+    a = artifact_with_external_trait(contract, obj)
+    if produced_by:
+        a.produced_by = produced_by
+    return a
+
+
+
 
 class Conformance(unittest.TestCase):
     # 1. ADDRESSING — same (type, body) ⇒ same id; a one-byte change ⇒ a new id.
     def test_addressing_is_content_derived_and_metamorphic(self):
         k = MemoryKernel()
         a = k.put_artifact(
-            Artifact(type="acme.recon.v1.Host", body=b"10.0.0.1", produced_by="recon")
+            _art("acme.recon.v1.Host", b"10.0.0.1", produced_by="recon")
         )
         b = k.put_artifact(
-            Artifact(type="acme.recon.v1.Host", body=b"10.0.0.1", produced_by="other")
+            _art("acme.recon.v1.Host", b"10.0.0.1", produced_by="other")
         )
         self.assertEqual(a.id, b.id, "same (type, body) must yield the same id")
         self.assertTrue(a.id.startswith("sha256:"))
 
-        c = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"10.0.0.2"))
+        c = k.put_artifact(artifact_with_trait("acme.recon.v1.Host", b"10.0.0.2"))
         self.assertNotEqual(a.id, c.id, "a one-byte change must change the address")
 
-        d = k.put_artifact(Artifact(type="acme.recon.v1.Port", body=b"10.0.0.1"))
+        d = k.put_artifact(artifact_with_trait("acme.recon.v1.Port", b"10.0.0.1"))
         self.assertNotEqual(a.id, d.id, "type must participate in the address")
 
-        self.assertEqual(a.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"))
+        self.assertEqual(a.id, artifact_id_single("acme.recon.v1.Host", b"10.0.0.1"))
 
     # 2. IMMUTABILITY — reads back byte-identical; a later put never mutates it.
     def test_artifacts_are_immutable(self):
         k = MemoryKernel()
-        r = k.put_artifact(Artifact(type="t", body=b"payload", meta={"first": "true"}))
+        r = k.put_artifact(_art("t", b"payload", meta={"first": "true"}))
         got = k.get_artifact(r)
-        self.assertEqual(got.body, b"payload", "reads back byte-identical")
+        self.assertEqual(get_trait(got, "t").body, b"payload", "reads back byte-identical")
         self.assertEqual(got.meta.get("first"), "true")
 
         # A later put of the same content with different meta must NOT change
         # what is stored. First write wins.
         r2 = k.put_artifact(
-            Artifact(type="t", body=b"payload", meta={"first": "false", "sneaky": "yes"})
+            _art("t", b"payload", meta={"first": "false", "sneaky": "yes"})
         )
         self.assertEqual(r2.id, r.id, "same content ⇒ same id")
         after = k.get_artifact(r)
@@ -93,9 +115,9 @@ class Conformance(unittest.TestCase):
         hosts = k.subscribe(Subscription(module="a", topics=["recon.host.found"]))
         ports = k.subscribe(Subscription(module="b", topics=["recon.port.found"]))
 
-        h1 = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"h1"))
-        h2 = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"h2"))
-        p1 = k.put_artifact(Artifact(type="acme.recon.v1.Port", body=b"p1"))
+        h1 = k.put_artifact(artifact_with_trait("acme.recon.v1.Host", b"h1"))
+        h2 = k.put_artifact(artifact_with_trait("acme.recon.v1.Host", b"h2"))
+        p1 = k.put_artifact(artifact_with_trait("acme.recon.v1.Port", b"p1"))
         s1 = k.publish(
             Event(topic="recon.host.found", type="acme.recon.v1.Host", artifacts=[h1])
         ).seq
@@ -127,7 +149,7 @@ class Conformance(unittest.TestCase):
     def test_ledger_is_tamper_evident(self):
         k = MemoryKernel()
         k.register(ModuleManifest(name="m", version="0.1.0"))
-        k.put_artifact(Artifact(type="t", body=b"x"))
+        k.put_artifact(artifact_with_trait("t", b"x"))
         k.append(AppendRequest(kind="domain.fact", subject="s", detail=b"d"))
 
         chain = k.ledger()
@@ -150,14 +172,14 @@ class Conformance(unittest.TestCase):
             ModuleManifest(
                 name="recon",
                 version="0.1.0",
-                provides=[Capability(name="recon.scan", outputs=[Port(name="out", contract="acme.recon.v1.Host")])],
+                provides=[Capability(name="recon.scan", outputs=[Port(name="out", traits=["acme.recon.v1.Host"])])],
             )
         )
         k.register(
             ModuleManifest(
                 name="report",
                 version="0.2.0",
-                provides=[Capability(name="report.render", outputs=[Port(name="out", contract="acme.report.v1.Report")])],
+                provides=[Capability(name="report.render", outputs=[Port(name="out", traits=["acme.report.v1.Report"])])],
                 requires=["recon.scan"],
             )
         )
@@ -220,7 +242,7 @@ class Conformance(unittest.TestCase):
             ModuleManifest(
                 name="mod",
                 version="1",
-                provides=[Capability(name="do", outputs=[Port(name="out", contract="acme.NewThing")])],
+                provides=[Capability(name="do", outputs=[Port(name="out", traits=["acme.NewThing"])])],
             )
         )
         filled = k.put_contract(
@@ -266,18 +288,13 @@ class Conformance(unittest.TestCase):
     def test_ledger_reconstructs_state_from_detail(self):
         k = MemoryKernel()
         r = k.put_artifact(
-            Artifact(
-                type="acme.recon.v1.Host",
-                body=b"10.0.0.1",
-                meta={"region": "eu", "scan": "full"},
-                produced_by="recon",
-            )
+            _art("acme.recon.v1.Host", b"10.0.0.1", produced_by="recon", meta={"region": "eu", "scan": "full"})
         )
         k.register(
             ModuleManifest(
                 name="recon",
                 version="0.1.0",
-                provides=[Capability(name="recon.scan", outputs=[Port(name="out", contract="acme.recon.v1.Host")])],
+                provides=[Capability(name="recon.scan", outputs=[Port(name="out", traits=["acme.recon.v1.Host"])])],
                 requires=["report.render"],
             )
         )
@@ -292,10 +309,10 @@ class Conformance(unittest.TestCase):
         a.ParseFromString(a_entry.detail)
         self.assertEqual(a.id, r.id)
         self.assertEqual(a_entry.subject, r.id, "subject is the content address")
-        self.assertEqual(a.type, "acme.recon.v1.Host")
+        self.assertIn("acme.recon.v1.Host", a.traits)
         self.assertEqual(a.produced_by, "recon")
         self.assertEqual(dict(a.meta), {"region": "eu", "scan": "full"})
-        self.assertEqual(a.body, b"", "body is cleared — the id already addresses it")
+        self.assertEqual(get_trait(a, "acme.recon.v1.Host").body, b"10.0.0.1")
 
         # module.registered reconstructs the whole manifest.
         m = ModuleManifest()
@@ -313,9 +330,7 @@ class Conformance(unittest.TestCase):
     #     ledger detail hashes reproducibly across runs and SDKs (sorted map keys).
     def test_ledger_detail_encodes_canonically(self):
         def build():
-            return Artifact(
-                type="t", meta={"z": "1", "a": "2", "m": "3", "b": "4"}
-            ).SerializeToString(deterministic=True)
+            return _art("t", b"", meta={"z": "1", "a": "2", "m": "3", "b": "4"}).SerializeToString(deterministic=True)
 
         for _ in range(64):
             self.assertEqual(
@@ -327,20 +342,15 @@ class Conformance(unittest.TestCase):
     # id must not move, or the address would be keyed on provenance, not content.
     def test_address_ignores_non_identity_fields(self):
         k = MemoryKernel()
-        base = k.put_artifact(Artifact(type="acme.recon.v1.Host", body=b"10.0.0.1"))
+        base = k.put_artifact(artifact_with_trait("acme.recon.v1.Host", b"10.0.0.1"))
         enriched = k.put_artifact(
-            Artifact(
-                type="acme.recon.v1.Host",
-                body=b"10.0.0.1",
-                meta={"x": "y"},
-                produced_by="whoever",
-            )
+            _art("acme.recon.v1.Host", b"10.0.0.1", produced_by="whoever", meta={"x": "y"})
         )
         self.assertEqual(
             enriched.id, base.id,
             "meta and produced_by must not participate in the address",
         )
-        self.assertEqual(enriched.id, artifact_id("acme.recon.v1.Host", b"10.0.0.1"))
+        self.assertEqual(enriched.id, artifact_id_single("acme.recon.v1.Host", b"10.0.0.1"))
 
     # CROSS-SDK KNOWN ANSWER — a fixed scenario must produce this exact final
     # ledger hash in every SDK. Go, Rust, and Python all assert the SAME constant,
@@ -348,24 +358,19 @@ class Conformance(unittest.TestCase):
     # three chains are pinned to cross-verify. If it ever changes, it changes in
     # all three suites in lockstep — never one SDK alone.
     def test_ledger_hash_known_answer_cross_sdk(self):
-        want = "5d9dea28f0fa779b7d76dd6137c9b6079561289b12ed6dff022a889b94d69cd2"
+        want = "3f0957aaae7a7a939dc3b5dba74145b03af065e3f04ce302ef602bc01424f350"
 
         k = MemoryKernel()
         k.register(
             ModuleManifest(
                 name="recon",
                 version="0.1.0",
-                provides=[Capability(name="recon.scan", outputs=[Port(name="host", contract="acme.recon.v1.Host")])],
+                provides=[Capability(name="recon.scan", outputs=[Port(name="host", traits=["acme.recon.v1.Host"])])],
                 requires=["report.render"],
             )
         )
         k.put_artifact(
-            Artifact(
-                type="acme.recon.v1.Host",
-                body=b"10.0.0.1",
-                meta={"region": "eu", "scan": "full"},
-                produced_by="recon",
-            )
+            _art("acme.recon.v1.Host", b"10.0.0.1", produced_by="recon", meta={"region": "eu", "scan": "full"})
         )
         chain = k.ledger()
         self.assertTrue(k.verify_ledger(), "the chain must verify")
@@ -380,8 +385,8 @@ class Conformance(unittest.TestCase):
                 provides=[
                     Capability(
                         name="facts.extract",
-                        inputs=[Port(name="question", contract="demo.Question")],
-                        outputs=[Port(name="facts", contract="demo.Facts")],
+                        inputs=[Port(name="question", traits=["demo.Question"])],
+                        outputs=[Port(name="facts", traits=["demo.Facts"])],
                     )
                 ],
             )
@@ -394,16 +399,16 @@ class Conformance(unittest.TestCase):
                     Capability(
                         name="answer.write",
                         inputs=[
-                            Port(name="question", contract="demo.Question"),
-                            Port(name="facts", contract="demo.Facts"),
+                            Port(name="question", traits=["demo.Question"]),
+                            Port(name="facts", traits=["demo.Facts"]),
                         ],
-                        outputs=[Port(name="answer", contract="demo.Answer")],
+                        outputs=[Port(name="answer", traits=["demo.Answer"])],
                     )
                 ],
             )
         )
         question = k.put_artifact(
-            Artifact(type="demo.Question", body=b"What follows?")
+            artifact_with_trait("demo.Question", b"What follows?")
         )
         assembly = Assembly(
             id="answer-pipeline@1",
@@ -447,7 +452,7 @@ class Conformance(unittest.TestCase):
         extract = k.claim_ready(
             ClaimRequest(run_id="run-1", module="extractor")
         )
-        facts = k.put_artifact(Artifact(type="demo.Facts", body=b"typed flow"))
+        facts = k.put_artifact(artifact_with_trait("demo.Facts", b"typed flow"))
         k.commit(
             Derivation(
                 run_id="run-1",
@@ -459,7 +464,7 @@ class Conformance(unittest.TestCase):
         write = k.claim_ready(ClaimRequest(run_id="run-1", module="writer"))
         self.assertEqual(len(write.inputs), 2, "fan-in supplies both inputs")
         answer = k.put_artifact(
-            Artifact(type="demo.Answer", body=b"Modules converge.")
+            artifact_with_trait("demo.Answer", b"Modules converge.")
         )
         completed = k.commit(
             Derivation(
@@ -488,10 +493,10 @@ class Conformance(unittest.TestCase):
                         name="loop.step",
                         inputs=[
                             Port(
-                                name="in", contract="demo.Value", optional=True
+                                name="in", traits=["demo.Value"], optional=True
                             )
                         ],
-                        outputs=[Port(name="out", contract="demo.Value")],
+                        outputs=[Port(name="out", traits=["demo.Value"])],
                     )
                 ],
             )
@@ -527,8 +532,8 @@ class Conformance(unittest.TestCase):
 
     def test_run_stalls_when_no_node_can_become_ready(self):
         k = MemoryKernel()
-        k.register(ModuleManifest(name="source", version="1", provides=[Capability(name="source.maybe", outputs=[Port(name="value", contract="demo.Value", optional=True)])]))
-        k.register(ModuleManifest(name="sink", version="1", provides=[Capability(name="sink.answer", inputs=[Port(name="value", contract="demo.Value")], outputs=[Port(name="answer", contract="demo.Answer")])]))
+        k.register(ModuleManifest(name="source", version="1", provides=[Capability(name="source.maybe", outputs=[Port(name="value", traits=["demo.Value"], optional=True)])]))
+        k.register(ModuleManifest(name="sink", version="1", provides=[Capability(name="sink.answer", inputs=[Port(name="value", traits=["demo.Value"])], outputs=[Port(name="answer", traits=["demo.Answer"])])]))
         assembly = Assembly(id="stall@1", nodes=[AssemblyNode(id="source", module="source", module_version="1", capability="source.maybe"), AssemblyNode(id="sink", module="sink", module_version="1", capability="sink.answer")], bindings=[Binding(to_node="sink", to_port="value", from_node="source", from_port="value")], terminal=NodeOutput(node="sink", port="answer"))
         k.start_run(RunRequest(id="stall", assembly=assembly))
         work = k.claim_ready(ClaimRequest(run_id="stall", module="source"))
@@ -537,13 +542,13 @@ class Conformance(unittest.TestCase):
 
     def test_convergent_run_hashes_match_every_sdk(self):
         k = MemoryKernel()
-        k.register(ModuleManifest(name="answerer", version="1.0.0", provides=[Capability(name="answer.write", outputs=[Port(name="answer", contract="demo.Answer")])]))
+        k.register(ModuleManifest(name="answerer", version="1.0.0", provides=[Capability(name="answer.write", outputs=[Port(name="answer", traits=["demo.Answer"])])]))
         k.start_run(RunRequest(id="parity", assembly=Assembly(id="single@1", nodes=[AssemblyNode(id="answer", module="answerer", module_version="1.0.0", capability="answer.write")], terminal=NodeOutput(node="answer", port="answer"))))
         work = k.claim_ready(ClaimRequest(run_id="parity", module="answerer"))
-        answer = k.put_artifact(Artifact(type="demo.Answer", body=b"yes"))
+        answer = k.put_artifact(artifact_with_trait("demo.Answer", b"yes"))
         k.commit(Derivation(run_id="parity", work_id=work.id, node_id=work.node_id, outputs=[NamedArtifact(name="answer", artifact=answer)]))
-        self.assertEqual(k.derivations()[0].id, "sha256:0e3e167112e6bb8f19d736de4592b72a2856cb494cc4dcb00fbcd5682d595cf6")
-        self.assertEqual(k.ledger()[-1].hash, "faad7e3ce2d2e030cf37ff6001fe18f7dec0430ce14642f9ae878d66875bc28f")
+        self.assertEqual(k.derivations()[0].id, "sha256:8f7f99a396dbf79c7f2287d2f9fca7f4167343831a9283cdfbeb2fe010c8414c")
+        self.assertEqual(k.ledger()[-1].hash, "283106692aba4aa72f5eecfda3adc53db7ef606e2a83266fefe772a6b9c6587d")
 
     # 12. PRODUCTION ARTIFACT BOUNDARY — inline small; external verified ObjectRef.
     def test_blob_store_is_content_addressed_and_immutable(self):
@@ -580,43 +585,34 @@ class Conformance(unittest.TestCase):
 
         blob = k.put_blob(PutBlobRequest(namespace="observer", data=payload))
         ref = k.put_artifact(
-            Artifact(
-                type="observer.v1.Capture",
-                produced_by="observer",
-                object=ObjectRef(
+            _ext("observer.v1.Capture", ObjectRef(
                     digest=blob.digest,
                     byte_count=blob.byte_count,
                     namespace=blob.namespace,
-                ),
-            )
+                ), produced_by="observer")
         )
-        want = artifact_id(
+        want_art = artifact_with_external_trait(
             "observer.v1.Capture",
-            object_ref_bytes(
-                ObjectRef(
-                    digest=blob.digest,
-                    byte_count=blob.byte_count,
-                    namespace=blob.namespace,
-                )
+            ObjectRef(
+                digest=blob.digest,
+                byte_count=blob.byte_count,
+                namespace=blob.namespace,
             ),
         )
-        self.assertEqual(ref.id, want)
+        self.assertEqual(ref.id, artifact_id_of(want_art))
         self.assertNotEqual(ref.id, blob_id(payload))
 
         got = k.get_artifact(ref)
-        self.assertEqual(got.body, b"")
-        self.assertEqual(got.object.digest, blob.digest)
-        self.assertEqual(got.object.byte_count, blob.byte_count)
+        self.assertEqual(list(got.traits.values())[0].body, b"")
+        self.assertEqual(list(got.traits.values())[0].object.digest, blob.digest)
+        self.assertEqual(list(got.traits.values())[0].object.byte_count, blob.byte_count)
 
         ref2 = k.put_artifact(
-            Artifact(
-                type="observer.v1.Capture",
-                object=ObjectRef(
+            artifact_with_external_trait("observer.v1.Capture", ObjectRef(
                     digest=blob.digest,
                     byte_count=blob.byte_count,
                     namespace=blob.namespace,
-                ),
-            )
+                ))
         )
         self.assertEqual(ref2.id, ref.id)
 
@@ -627,15 +623,15 @@ class Conformance(unittest.TestCase):
         self.assertEqual(blob3.digest, blob.digest)
 
         data = k.get_blob(
-            GetBlobRequest(digest=got.object.digest, namespace=got.object.namespace)
+            GetBlobRequest(digest=list(got.traits.values())[0].object.digest, namespace=list(got.traits.values())[0].object.namespace)
         )
         self.assertEqual(data.data, payload)
 
         entry = next(e for e in k.ledger() if e.kind == "artifact.put")
         a = Artifact()
         a.ParseFromString(entry.detail)
-        self.assertEqual(a.body, b"")
-        self.assertEqual(a.object.digest, blob.digest)
+        self.assertEqual(list(a.traits.values())[0].body, b"")
+        self.assertEqual(list(a.traits.values())[0].object.digest, blob.digest)
 
     def test_external_artifact_rejects_missing_or_mismatched_blob(self):
         k = MemoryKernel()
@@ -644,46 +640,35 @@ class Conformance(unittest.TestCase):
 
         with self.assertRaises(NotFound):
             k.put_artifact(
-                Artifact(
-                    type="t",
-                    object=ObjectRef(
+                artifact_with_external_trait("t", ObjectRef(
                         digest=blob_id(b"nope"), byte_count=4, namespace="ns"
-                    ),
-                )
+                    ))
             )
         with self.assertRaises(BlobIntegrity):
             k.put_artifact(
-                Artifact(
-                    type="t",
-                    object=ObjectRef(
+                artifact_with_external_trait("t", ObjectRef(
                         digest=blob.digest,
                         byte_count=blob.byte_count + 1,
                         namespace="ns",
-                    ),
-                )
+                    ))
             )
         with self.assertRaises(Invalid):
-            k.put_artifact(
-                Artifact(
-                    type="t",
-                    body=b"x",
-                    object=ObjectRef(
-                        digest=blob.digest,
-                        byte_count=blob.byte_count,
-                        namespace="ns",
-                    ),
+            both = artifact_with_trait("t", b"x")
+            both.traits["t"].object.CopyFrom(
+                ObjectRef(
+                    digest=blob.digest,
+                    byte_count=blob.byte_count,
+                    namespace="ns",
                 )
             )
+            k.put_artifact(both)
         with self.assertRaises(NotFound):
             k.put_artifact(
-                Artifact(
-                    type="t",
-                    object=ObjectRef(
+                artifact_with_external_trait("t", ObjectRef(
                         digest=blob.digest,
                         byte_count=blob.byte_count,
                         namespace="other",
-                    ),
-                )
+                    ))
             )
 
     def test_value_identity_independent_of_blob_identity(self):
@@ -694,36 +679,27 @@ class Conformance(unittest.TestCase):
         self.assertEqual(blob_a.digest, blob_b.digest)
 
         art_a = k.put_artifact(
-            Artifact(
-                type="t",
-                object=ObjectRef(
+            artifact_with_external_trait("t", ObjectRef(
                     digest=blob_a.digest,
                     byte_count=blob_a.byte_count,
                     namespace="a",
-                ),
-            )
+                ))
         )
         art_b = k.put_artifact(
-            Artifact(
-                type="t",
-                object=ObjectRef(
+            artifact_with_external_trait("t", ObjectRef(
                     digest=blob_b.digest,
                     byte_count=blob_b.byte_count,
                     namespace="b",
-                ),
-            )
+                ))
         )
         self.assertNotEqual(art_a.id, art_b.id)
 
         art_c = k.put_artifact(
-            Artifact(
-                type="other",
-                object=ObjectRef(
+            artifact_with_external_trait("other", ObjectRef(
                     digest=blob_a.digest,
                     byte_count=blob_a.byte_count,
                     namespace="a",
-                ),
-            )
+                ))
         )
         self.assertNotEqual(art_c.id, art_a.id)
 
@@ -731,11 +707,11 @@ class Conformance(unittest.TestCase):
         k = MemoryKernel()
         past = RequestContext(deadline_unix_ms=1)
         with self.assertRaises(FailedPrecondition):
-            k.put_artifact(Artifact(type="t", body=b"x"), ctx=past)
+            k.put_artifact(artifact_with_trait("t", b"x"), ctx=past)
         ctx = RequestContext(caller="worker", request_key="put-once")
-        a = k.put_artifact(Artifact(type="t", body=b"unique-body"), ctx=ctx)
+        a = k.put_artifact(artifact_with_trait("t", b"unique-body"), ctx=ctx)
         before = len(k.ledger())
-        b = k.put_artifact(Artifact(type="t", body=b"unique-body"), ctx=ctx)
+        b = k.put_artifact(artifact_with_trait("t", b"unique-body"), ctx=ctx)
         self.assertEqual(a.id, b.id)
         self.assertEqual(len(k.ledger()), before, "idempotent replay must not append")
 
