@@ -29,12 +29,22 @@ Your product / UI shell
 
 - **[`SPEC.md`](SPEC.md)** — charter, boundary, concepts, versioning
 - **[`profiles/ui/`](profiles/ui/)** — well-known UI contract refs
-- **[`rust/`](rust/)** — first implementation (host + `ModulePlugin`)
+- **[`sdk/rust/`](sdk/rust/)** — Rust host + `ModulePlugin`
+- **[`sdk/go/`](sdk/go/)** — Go host + `ModulePlugin`
+- **[`sdk/python/`](sdk/python/)** — Python host + `ModulePlugin`
 
-## Quick start (Rust)
+## Quick start
 
 ```bash
-cargo test --manifest-path framework/rust/Cargo.toml
+# Rust
+cargo test --manifest-path framework/sdk/rust/Cargo.toml
+
+# Go
+cd framework/sdk/go && go test ./...
+
+# Python (install kernel SDK first)
+pip install ./kernel/sdk/python ./framework/sdk/python
+python -m unittest discover -s framework/sdk/python/tests -v
 ```
 
 ```rust
@@ -87,7 +97,7 @@ use srcport_framework::{
 | `StoragePlan::shared()` | Durable module tables across runs |
 | `StoragePlan::step_log_only()` | Framework step audit only |
 
-See `framework/rust/tests/` (`host_drive`, `modes`, `lifecycle`, `storage`).
+See `framework/sdk/rust/tests/` (`host_drive`, `modes`, `lifecycle`, `storage`).
 
 ## Layout
 
@@ -96,13 +106,16 @@ framework/
 ├─ SPEC.md
 ├─ README.md
 ├─ profiles/ui/          # contract docs + JSON schemas
-└─ rust/                 # srcport-framework crate
+└─ sdk/
+   ├─ rust/              # srcport-framework crate
+   ├─ go/                # Go package
+   └─ python/            # srcport_framework package
 ```
 
 ## Status
 
-**`v2.1.0`** — cut/seed (`start_after` / `from_node` / `resume_after`) and
-optional cross-run memoisation (`memoized`, `module_digest`, `MemoryMemo`).
-Builds on v2.0 host, step lifecycle, and `StoragePlan`.
+**`v2.2.0`** — host + `ModulePlugin` in **Rust, Go, and Python** under
+`framework/sdk/{rust,go,python}` (layout move from `framework/rust/`). Builds on
+v2.1 cut/seed and memo, plus v2.0 step lifecycle and `StoragePlan`.
 
-Minimum substrate: **v2.0.0**.
+Minimum substrate: **v2.0.0** (kernel **v2.1.0** recommended for store policy).

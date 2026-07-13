@@ -1,4 +1,4 @@
-# srcport-substrate — Rust SDK (v2.0.0)
+# srcport-substrate — Rust SDK (v2.1.0)
 
 The in-process Rust realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).

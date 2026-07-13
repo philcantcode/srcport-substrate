@@ -62,8 +62,8 @@ jobs:
       # Framework sits on the public ABI only; kernel must not import it.
       - name: Framework tests and clippy
         run: |
-          cargo test --manifest-path framework/rust/Cargo.toml
-          cargo clippy --manifest-path framework/rust/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path framework/sdk/rust/Cargo.toml
+          cargo clippy --manifest-path framework/sdk/rust/Cargo.toml --all-targets -- -D warnings
 
   go:
     runs-on: ubuntu-latest
@@ -72,12 +72,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
-      - name: Vet
+      - name: Kernel SDK vet
         run: go vet ./...
         working-directory: kernel/sdk/go
-      - name: Test
+      - name: Kernel SDK test
         run: go test ./...
         working-directory: kernel/sdk/go
+      - name: Framework SDK test
+        run: go test ./...
+        working-directory: framework/sdk/go
 
   python:
     runs-on: ubuntu-latest
@@ -86,7 +89,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install the SDK
-        run: pip install ./kernel/sdk/python
-      - name: Conformance suite
+      - name: Install kernel + framework SDKs
+        run: |
+          pip install ./kernel/sdk/python
+          pip install ./framework/sdk/python
+      - name: Kernel conformance suite
         run: python -m unittest discover -s kernel/sdk/python/tests -v
+      - name: Framework tests
+        run: python -m unittest discover -s framework/sdk/python/tests -v

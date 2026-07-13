@@ -1,4 +1,4 @@
-"""srcport-substrate — Python SDK (v2.0.0, in-process).
+"""srcport-substrate — Python SDK (v2.1.0, in-process).
 
 One pluggable core: seven primitives (Module · Artifact · Contract · Event ·
 Ledger · Registry · Run) and one Kernel ABI, conformant to SPEC.md.

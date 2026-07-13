@@ -8,12 +8,13 @@ depend on the kernel; the kernel never depends on the framework.
 | Product | Path | Role |
 |---------|------|------|
 | **Kernel** | [`kernel/`](kernel/) | Domain-neutral microkernel: contract, SDKs, conformance |
-| **Framework** | [`framework/`](framework/) | Opinionated host, module plugins, UI profiles (`v0.x`) |
+| **Framework** | [`framework/`](framework/) | Opinionated host, module plugins, UI profiles; SDKs in `framework/sdk/{rust,go,python}` |
 
 ```text
 srcport-substrate/
-├─ kernel/          ← substrate SPEC · proto · SDKs · example
-├─ framework/       ← host · plugins · UI profiles
+├─ kernel/          ← substrate SPEC · proto · SDKs
+├─ framework/       ← host · plugins · UI profiles · sdk/{rust,go,python}
+├─ docs/            ← short concept guides
 ├─ README.md        ← you are here
 └─ LICENSE*
 ```
@@ -45,8 +46,8 @@ flowchart TB
 | Wire format | [`kernel/contracts/proto/.../substrate.proto`](kernel/contracts/proto/srcport/substrate/v1/substrate.proto) |
 | Framework charter | [`framework/SPEC.md`](framework/SPEC.md) |
 | Framework usage | [`framework/README.md`](framework/README.md) |
-| Run the kernel demo | `cd kernel/example && cargo run` |
-| Test the framework | `cargo test --manifest-path framework/rust/Cargo.toml` |
+| Agent / contributor guide | [`AGENTS.md`](AGENTS.md) |
+| Test the framework | `cargo test --manifest-path framework/sdk/rust/Cargo.toml` |
 
 ## Kernel (summary)
 
@@ -70,7 +71,10 @@ commit. Plugins implement domain work; UI is opt-in via `srcport.ui.v1` JSON
 artifacts. Does **not** change `substrate.proto`.
 
 ```bash
-cargo test --manifest-path framework/rust/Cargo.toml
+cargo test --manifest-path framework/sdk/rust/Cargo.toml
+cd framework/sdk/go && go test ./...
+pip install ./kernel/sdk/python ./framework/sdk/python
+python -m unittest discover -s framework/sdk/python/tests -v
 ```
 
 ## Rule

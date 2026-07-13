@@ -1,9 +1,7 @@
 # Rust build output. Each crate builds standalone under kernel/ or framework/.
 /kernel/sdk/*/target/
-/kernel/example/target/
-/kernel/example/Cargo.lock
-/kernel/example/flow.html
-/framework/rust/target/
+/framework/sdk/*/target/
+/framework/sdk/python/**/.venv/
 
 # Python build/test noise
 __pycache__/

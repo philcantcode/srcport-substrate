@@ -46,7 +46,10 @@ srcport-substrate/           # monorepo root
    ├─ README.md
    ├─ profiles/              # well-known contracts (not substrate.proto)
    │  └─ ui/
-   └─ rust/                  # first host + plugin SDK
+   └─ sdk/
+      ├─ rust/               # host + plugin SDK
+      ├─ go/
+      └─ python/
 ```
 
 Kernel [`SPEC.md`](../kernel/SPEC.md) and [`contracts/`](../kernel/contracts/)
@@ -299,6 +302,7 @@ under PerRun it truncates the whole (already run-scoped) table.
 | `2.0.0` (+lifecycle) | Step presentation lifecycle Init → Progress* → Final; `StepEvent`; UI schemas; legacy view adapters |
 | `2.0.0` (+storage) | Optional `StoragePlan` (Off / PerRun / Shared + step_log); `storage_schema` / `on_store`; `MemoryStorage` |
 | **`2.1.0`** | **Cut/seed** (`start_after` / `from_node` / `resume_after`, `__seed/…` inputs, `StepStage::Skipped`) and **memo** (`MemoPlan` / `MemoryMemo`, `module_digest`, `memoized()`, `StepStage::Cached`, cascade invalidation). Substrate unchanged at v2.0.0. |
+| **`2.2.0`** | **Multi-language SDKs** under `framework/sdk/{rust,go,python}` (path move from `framework/rust/`). Go and Python host + `ModulePlugin` parity with Rust (policy, cut/seed, memo, storage, presentation). CI covers all three. |
 
 ---
 
@@ -308,7 +312,6 @@ under PerRun it truncates the whole (already run-scoped) table.
 - Multi-language plugin ABIs (WASM, gRPC workers) — later if needed
 - Built-in auth, multi-tenant isolation, or a full widget toolkit
 - Production SQL drivers (trait + memory backend only; adapters later)
-- Replacing `kernel/example/` (kernel-only demo stays; framework has its own tests)
 
 ---
 

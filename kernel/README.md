@@ -86,17 +86,15 @@ the thing that finally becomes boring, trusted, and legible.
 
 ## See it run
 
-[`example/`](example/) (from this directory) builds a tiny three-module domain on the Rust SDK, drives
-a **real** convergent Run, then reconstructs the whole dataflow **solely by
-decoding the append-only ledger** — proving, not merely illustrating, that
-artifact refs are the data plane and the chain records exactly what happened.
+Each language SDK ships the shared conformance suite against `MemoryKernel` —
+claim/commit, immutability, ledger chain, and cross-SDK known-answer addresses.
+From the monorepo root:
 
+```bash
+cargo test --manifest-path kernel/sdk/rust/Cargo.toml
+cd kernel/sdk/go && go test ./...
+pip install ./kernel/sdk/python && python -m unittest discover -s kernel/sdk/python/tests -v
 ```
-cd example && cargo run
-```
-
-It prints a live trace and writes a self-contained `flow.html` — every box and
-arrow rebuilt from the tamper-evident chain, never from live kernel state.
 
 ---
 
@@ -350,8 +348,7 @@ kernel/                                     # this directory
 ├─ scripts/gen.sh                           # regenerate Go/Python types
 ├─ contracts/proto/srcport/substrate/v1/
 │  └─ substrate.proto                       # THE substrate contract
-├─ sdk/{rust,go,python}/                    # conforming implementations
-└─ example/                                 # kernel-only domain demo
+└─ sdk/{rust,go,python}/                    # conforming implementations
 ```
 
 Monorepo root also has [`../framework/`](../framework/) (depends on this kernel only).
@@ -383,10 +380,11 @@ for the same `(type, body)`.
 
 ## Status
 
-**`v2.0.0` — stable.** Rust, Go, and Python implement the same `KernelApi` ABI
-(with `MemoryKernel` as the in-process backend). Additive run-modes: module
-`Firing` / `Port.key`, `ExecutionPolicy`, `include_nodes`, `InjectInput`, and
-work-unit claim identity. The contract is versioned and compatibility-checked
+**`v2.1.0` — stable.** Rust, Go, and Python implement the same `KernelApi` ABI
+(with `MemoryKernel` as the in-process backend). Additive since v2.0: run-modes
+(`Firing` / `Port.key`, `ExecutionPolicy`, `include_nodes`, `InjectInput`) and
+**`ArtifactStorePolicy`** (inline/blob limits, ingest mode, durability on the
+registry snapshot). The contract is versioned and compatibility-checked
 (`buf breaking`); pin an exact tag and upgrade deliberately.
 
 ---

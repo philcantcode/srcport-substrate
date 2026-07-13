@@ -3,8 +3,8 @@
 Host loop and `ModulePlugin` trait for products built on `srcport-substrate`.
 
 ```bash
-cargo test --manifest-path framework/rust/Cargo.toml
-cargo clippy --manifest-path framework/rust/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path framework/sdk/rust/Cargo.toml
+cargo clippy --manifest-path framework/sdk/rust/Cargo.toml --all-targets -- -D warnings
 ```
 
 ## Surface
@@ -21,5 +21,5 @@ cargo clippy --manifest-path framework/rust/Cargo.toml --all-targets -- -D warni
 | [`StoragePlan`](src/storage.rs) / [`MemoryStorage`](src/storage.rs) | Optional tabular side-channel (PerRun / Shared / step_log) |
 
 Depends only on the public `srcport-substrate` ABI (path dependency on
-`kernel/sdk/rust`). See [`../../kernel/SPEC.md`](../../kernel/SPEC.md) and
-[`../SPEC.md`](../SPEC.md).
+`kernel/sdk/rust`). See [`../../../kernel/SPEC.md`](../../../kernel/SPEC.md) and
+[`../../SPEC.md`](../../SPEC.md).

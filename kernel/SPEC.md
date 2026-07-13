@@ -1,4 +1,4 @@
-# srcport-substrate — Specification v2.0.0
+# srcport-substrate — Specification v2.1.0
 
 One canonical contract for every future project. Domain-neutral. Small enough
 to hold in your head. This document and [`substrate.proto`](contracts/proto/srcport/substrate/v1/substrate.proto)

@@ -1,4 +1,4 @@
-# srcport-substrate — Python SDK (v2.0.0)
+# srcport-substrate — Python SDK (v2.1.0)
 
 The in-process Python realisation of the `Kernel` ABI defined in
 [`../../contracts/proto/srcport/substrate/v1/substrate.proto`](../../contracts/proto/srcport/substrate/v1/substrate.proto).
