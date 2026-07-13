@@ -16,7 +16,7 @@ It conforms to [`SPEC.md`](../../SPEC.md) — the seven primitives and the one A
 ## Install
 
 ```sh
-go get github.com/philcantcode/srcport-substrate/sdk/go
+go get github.com/philcantcode/srcport-substrate/kernel/sdk/go
 ```
 
 ## Using it
@@ -27,7 +27,7 @@ package main
 import (
 	"fmt"
 
-	substrate "github.com/philcantcode/srcport-substrate/sdk/go"
+	substrate "github.com/philcantcode/srcport-substrate/kernel/sdk/go"
 )
 
 func main() {
@@ -111,6 +111,6 @@ go vet ./...
 ## Regenerating
 
 The types in `internal/genpb/` are generated from the contract. After changing
-`substrate.proto`, run `scripts/gen.sh` from the repo root (needs
+`substrate.proto`, run `scripts/gen.sh` from `kernel/` (or `bash kernel/scripts/gen.sh` from the monorepo root) (needs
 [`buf`](https://buf.build); no `protoc` binary required). CI fails if the
 committed codegen is stale.

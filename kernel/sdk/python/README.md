@@ -18,7 +18,7 @@ dependency: the `protobuf` runtime.
 ## Install
 
 ```sh
-pip install "git+https://github.com/philcantcode/srcport-substrate.git#subdirectory=sdk/python"
+pip install "git+https://github.com/philcantcode/srcport-substrate.git#subdirectory=kernel/sdk/python"
 ```
 
 ## Using it

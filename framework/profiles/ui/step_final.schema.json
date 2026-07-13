@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://srcport.dev/schemas/ui/v1/StepFinal.json",
+  "title": "srcport.ui.v1.StepFinal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "status", "stage"],
+  "properties": {
+    "stage": { "const": "final" },
+    "title": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "running", "blocked", "ok", "empty", "failed"]
+    },
+    "detail": { "type": "string" },
+    "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+    "run_id": { "type": "string" },
+    "work_id": { "type": "string" },
+    "node_id": { "type": "string" },
+    "module": { "type": "string" },
+    "capability": { "type": "string" },
+    "phase": { "type": "string" },
+    "highlight_ports": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "output_ports": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

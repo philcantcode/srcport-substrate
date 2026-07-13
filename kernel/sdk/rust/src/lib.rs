@@ -1627,7 +1627,7 @@ fn materialize_assembly(assembly: &Assembly, include: &[String]) -> Result<Assem
         .iter()
         .filter(|b| {
             want.contains(b.to_node.as_str())
-                && (b.input.is_empty() == false || want.contains(b.from_node.as_str()))
+                && (!b.input.is_empty() || want.contains(b.from_node.as_str()))
         })
         .cloned()
         .collect();

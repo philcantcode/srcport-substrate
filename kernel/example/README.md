@@ -1,4 +1,4 @@
-# `example/` — a real Run, visualised from the ledger alone
+# `kernel/example/` — a real Run, visualised from the ledger alone
 
 A runnable example on the [Rust SDK](../sdk/rust). It builds a tiny domain on
 the kernel, drives a **real** convergent Run, and then reconstructs the entire
@@ -6,7 +6,7 @@ dataflow **solely by decoding the append-only ledger** — proving the spec's
 central claim rather than illustrating it.
 
 ```
-cd example && cargo run          # standalone crate — depends on ../sdk/rust by path
+cd kernel/example && cargo run          # standalone crate — depends on ../sdk/rust by path
 ```
 
 It prints a live terminal trace and writes a self-contained

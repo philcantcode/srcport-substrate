@@ -7,6 +7,7 @@
 # Managed mode keeps substrate.proto language-neutral: no go_package or other
 # per-language options leak into the human-owned contract.
 #
+# Run from kernel/ (see scripts/gen.sh):
 #   scripts/gen.sh        # regenerate
 #   buf lint              # keep the contract clean
 #   buf breaking --against '.git#branch=main'
@@ -15,7 +16,7 @@ managed:
   enabled: true
   override:
     - file_option: go_package_prefix
-      value: github.com/philcantcode/srcport-substrate/sdk/go/internal/genpb
+      value: github.com/philcantcode/srcport-substrate/kernel/sdk/go/internal/genpb
 plugins:
   # Go — canonical protoc-gen-go (google.golang.org/protobuf runtime).
   - remote: buf.build/protocolbuffers/go:v1.36.5

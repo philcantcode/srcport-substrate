@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Regenerate all SDK types from contracts/proto/**/*.proto.
+# Regenerate all kernel SDK types from contracts/proto/**/*.proto.
 #
+# Run from anywhere; this script cds to kernel/ (parent of scripts/).
 # The Rust SDK generates at build time (build.rs); this script covers Go and
 # Python, whose gencode is committed. CI runs this and fails if the working tree
 # changes — that check, not good intentions, is what keeps the SDKs in lockstep
@@ -10,8 +11,8 @@
 # protoc / protoc-gen-* is needed — only network access to buf.build.
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$repo_root"
+kernel_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$kernel_root"
 
 echo "buf lint..."
 buf lint

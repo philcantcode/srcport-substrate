@@ -1,4 +1,4 @@
-module github.com/philcantcode/srcport-substrate/sdk/go
+module github.com/philcantcode/srcport-substrate/kernel/sdk/go
 
 go 1.23
 

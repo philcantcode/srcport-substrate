@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://srcport.dev/schemas/ui/v1/ResultView.json",
+  "title": "srcport.ui.v1.ResultView (legacy)",
+  "description": "Legacy. Prefer srcport.ui.v1.StepFinal.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["title", "status"],
+  "properties": {
+    "title": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "empty", "failed"]
+    },
+    "summary": { "type": "string" },
+    "run_id": { "type": "string" },
+    "work_id": { "type": "string" },
+    "node_id": { "type": "string" },
+    "module": { "type": "string" },
+    "output_ports": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

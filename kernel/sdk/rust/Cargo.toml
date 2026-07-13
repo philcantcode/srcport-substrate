@@ -8,7 +8,7 @@ description = "In-process Rust SDK for the srcport-substrate microkernel: seven 
 repository = "https://github.com/philcantcode/srcport-substrate"
 
 # The generated protobuf types ARE the contract. `build.rs` compiles
-# ../../contracts/proto/.../substrate.proto with protox (pure Rust — no protoc
+# kernel/contracts/proto/.../substrate.proto with protox (pure Rust — no protoc
 # binary required) so this crate can never drift from substrate.proto.
 [dependencies]
 prost = "0.13"

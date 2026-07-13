@@ -951,7 +951,6 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
                 contract: "demo.Report".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }],
         ..Default::default()
     });
@@ -1024,7 +1023,6 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
                 node: "scan".into(),
                 port: "report".into(),
             }),
-            ..Default::default()
         }),
         include_nodes: vec!["scan".into()],
         inputs: vec![NamedArtifact {
@@ -1036,7 +1034,6 @@ fn once_per_key_suppresses_duplicate_keys_and_include_nodes_filters() {
             ..Default::default()
         }),
         limits: Some(Limits { max_steps: 10 }),
-        ..Default::default()
     })
     .unwrap();
 
@@ -1134,7 +1131,6 @@ fn always_refires_on_reinject_of_same_artifact() {
                 contract: "demo.Out".into(),
                 ..Default::default()
             }],
-            ..Default::default()
         }],
         ..Default::default()
     });
@@ -1165,7 +1161,6 @@ fn always_refires_on_reinject_of_same_artifact() {
                 node: "echo".into(),
                 port: "out".into(),
             }),
-            ..Default::default()
         }),
         inputs: vec![NamedArtifact {
             name: "in".into(),

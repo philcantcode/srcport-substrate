@@ -2,8 +2,12 @@
 
 One canonical contract for every future project. Domain-neutral. Small enough
 to hold in your head. This document and [`substrate.proto`](contracts/proto/srcport/substrate/v1/substrate.proto)
-are the **only** things a human owns and reads; SDKs and backends conform to
-them, and coding agents fill the leaves behind them.
+are the **only** things a human owns and reads for the **kernel**; SDKs and
+backends conform to them, and coding agents fill the leaves behind them.
+
+An optional **application framework** (host, plugins, UI profiles) lives in
+[`../framework/`](../framework/) and has its own charter. It depends on this
+contract; this contract never depends on it.
 
 > **The one rule.** One canonical contract, many conforming implementations.
 > A production consumer will often need its own durable backend. The thing that

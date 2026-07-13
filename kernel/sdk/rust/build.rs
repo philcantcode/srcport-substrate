@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Repo layout: sdk/rust/build.rs  ->  ../../contracts/proto
+    // Repo layout: kernel/sdk/rust/build.rs  ->  ../../contracts/proto
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join("../../contracts/proto");
     let proto_file = proto_root.join("srcport/substrate/v1/substrate.proto");

@@ -1,10 +1,9 @@
-# Rust build output. Each SDK crate under sdk/* builds standalone.
-/sdk/*/target/
-
-# The example crate builds standalone too, and regenerates its own visual.
-/example/target/
-/example/Cargo.lock
-/example/flow.html
+# Rust build output. Each crate builds standalone under kernel/ or framework/.
+/kernel/sdk/*/target/
+/kernel/example/target/
+/kernel/example/Cargo.lock
+/kernel/example/flow.html
+/framework/rust/target/
 
 # Python build/test noise
 __pycache__/

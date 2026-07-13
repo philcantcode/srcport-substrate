@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://srcport.dev/schemas/ui/v1/ProcessingView.json",
+  "title": "srcport.ui.v1.ProcessingView (legacy)",
+  "description": "Legacy. Prefer srcport.ui.v1.StepInit / StepProgress.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["title", "status"],
+  "properties": {
+    "title": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "running", "blocked", "failed"]
+    },
+    "detail": { "type": "string" },
+    "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+    "run_id": { "type": "string" },
+    "work_id": { "type": "string" },
+    "node_id": { "type": "string" },
+    "module": { "type": "string" }
+  }
+}

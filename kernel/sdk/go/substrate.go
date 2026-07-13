@@ -17,7 +17,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 
-	pb "github.com/philcantcode/srcport-substrate/sdk/go/internal/genpb/srcport/substrate/v1"
+	pb "github.com/philcantcode/srcport-substrate/kernel/sdk/go/internal/genpb/srcport/substrate/v1"
 )
 
 // ─── the seven primitives + ABI acks, aliased to the generated types ────────
