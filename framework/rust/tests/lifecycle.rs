@@ -4,9 +4,9 @@ use srcport_framework::{
     FrameworkError, FrameworkPolicy, Host, ModulePlugin, PortBody, Presentation, PresentationStatus,
     StepContext, StepOutput, StepResult, StepStage, UiPersist, CONTRACT_STEP_PROGRESS,
 };
-use srcport_substrate::{artifact_with_trait, has_traits, 
-    Artifact, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
-    NamedArtifact, NodeOutput, Port, RunState,
+use srcport_substrate::{
+    artifact_with_trait, has_traits, Assembly, AssemblyNode, Binding, Capability, MemoryKernel,
+    ModuleManifest, NamedArtifact, NodeOutput, Port, RunState,
 };
 
 struct Scanner;

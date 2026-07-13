@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use srcport_substrate::{Assembly, Closure, ExecutionPolicy, Firing, Limits, RunRequest};
 
+use crate::memo::MemoPlan;
 use crate::storage::StoragePlan;
 
 /// Product-facing run mode. Maps to kernel [`Closure`] (and default firing for some presets).
@@ -18,8 +19,9 @@ pub enum RunMode {
     Stream,
     /// Like [`Stream`], but work-unit identity is `ONCE_PER_KEY` by default.
     DedupeStream,
-    /// Subset of assembly nodes (`include_nodes`); converges like [`Converge`] unless overridden.
-    /// Pair with [`NodePlan::Only`].
+    /// Subset of assembly nodes; converges like [`Converge`] unless overridden.
+    /// Pair with [`NodePlan::Only`], [`NodePlan::After`], or [`NodePlan::From`].
+    /// The host materialises a cut (rewrites crossing edges to seed inputs).
     Selective,
     /// Caller picks closure; firing/nodes/drive still apply.
     Manual {
@@ -45,14 +47,26 @@ pub enum FiringPlan {
     },
 }
 
-/// Which assembly nodes participate (`RunRequest.include_nodes`).
+/// Which assembly nodes participate in a run.
+///
+/// Non-[`All`] plans are **cut** by the host before `StartRun`: dropped nodes
+/// are removed and edges that cross the cut become synthetic `__seed/…` run
+/// inputs (see [`crate::materialize_cut`]). The kernel still sees a normal
+/// acyclic assembly — there is no hard-coded step index.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NodePlan {
     /// Full assembly.
     #[default]
     All,
-    /// Only these assembly node ids (terminal must remain — kernel validates).
+    /// Only these assembly node ids (terminal must remain).
+    /// Crossing edges from omitted producers become required seed inputs.
     Only(Vec<String>),
+    /// Start **after** this node: drop it and its transitive predecessors;
+    /// keep parallel branches and everything else. Seed outputs of the cut.
+    After(String),
+    /// Start **from** this node: keep it and nodes reachable from it (must
+    /// include the terminal). Seed every crossing edge into the kept set.
+    From(String),
 }
 
 /// How [`crate::Host::drive`] schedules claims.
@@ -83,7 +97,7 @@ pub enum DriveAfter {
 /// Opinionated framework policy for one pipeline run.
 ///
 /// Compiles to kernel `ExecutionPolicy`, `include_nodes`, and `Limits`. Host-only
-/// fields (`drive`, `claim_modules`, `storage`) never enter the kernel.
+/// fields (`drive`, `claim_modules`, `storage`, `memo`) never enter the kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameworkPolicy {
     /// Named product mode.
@@ -101,6 +115,8 @@ pub struct FrameworkPolicy {
     pub claim_modules: Option<Vec<String>>,
     /// Optional tabular storage phase (module tables + optional step log).
     pub storage: StoragePlan,
+    /// Optional cross-run work memoisation (requires [`crate::Host::with_memo`]).
+    pub memo: MemoPlan,
 }
 
 impl Default for FrameworkPolicy {
@@ -110,69 +126,106 @@ impl Default for FrameworkPolicy {
 }
 
 impl FrameworkPolicy {
-    /// Classic feed-forward run → first terminal completes the run.
-    pub fn converge() -> Self {
+    fn base(
+        mode: RunMode,
+        firing: FiringPlan,
+        nodes: NodePlan,
+        drive: DrivePlan,
+    ) -> Self {
         Self {
-            mode: RunMode::Converge,
-            firing: FiringPlan::CapabilityDefaults,
-            nodes: NodePlan::All,
+            mode,
+            firing,
+            nodes,
             max_steps: None,
-            drive: DrivePlan::UntilIdle,
+            drive,
             claim_modules: None,
             storage: StoragePlan::off(),
+            memo: MemoPlan::off(),
         }
+    }
+
+    /// Classic feed-forward run → first terminal completes the run.
+    pub fn converge() -> Self {
+        Self::base(
+            RunMode::Converge,
+            FiringPlan::CapabilityDefaults,
+            NodePlan::All,
+            DrivePlan::UntilIdle,
+        )
+    }
+
+    /// Converge with work memoisation enabled (requires [`crate::Host::with_memo`]).
+    ///
+    /// Nodes that declare a non-empty [`crate::ModulePlugin::module_digest`] and
+    /// whose input artifact ids match a prior successful run skip `execute`.
+    pub fn memoized() -> Self {
+        Self::converge().with_memo(MemoPlan::on())
     }
 
     /// Open run that re-fires on new/reinjected inputs (`ALWAYS` default).
     pub fn stream() -> Self {
-        Self {
-            mode: RunMode::Stream,
-            firing: FiringPlan::All(Firing::Always),
-            nodes: NodePlan::All,
-            max_steps: None,
-            drive: DrivePlan::UntilIdleThenWait,
-            claim_modules: None,
-            storage: StoragePlan::off(),
-        }
+        Self::base(
+            RunMode::Stream,
+            FiringPlan::All(Firing::Always),
+            NodePlan::All,
+            DrivePlan::UntilIdleThenWait,
+        )
     }
 
     /// Open run with `ONCE_PER_KEY` default (modules should mark `Port.key` where needed).
     pub fn stream_dedupe() -> Self {
-        Self {
-            mode: RunMode::DedupeStream,
-            firing: FiringPlan::All(Firing::OncePerKey),
-            nodes: NodePlan::All,
-            max_steps: None,
-            drive: DrivePlan::UntilIdleThenWait,
-            claim_modules: None,
-            storage: StoragePlan::off(),
-        }
+        Self::base(
+            RunMode::DedupeStream,
+            FiringPlan::All(Firing::OncePerKey),
+            NodePlan::All,
+            DrivePlan::UntilIdleThenWait,
+        )
     }
 
     /// Only the given assembly node ids participate; converges on terminal.
+    ///
+    /// Crossing edges from omitted nodes become `__seed/…` inputs that must be
+    /// supplied on `start_pipeline` (or via [`crate::seeds_from_run`]).
     pub fn selective(node_ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Self {
-            mode: RunMode::Selective,
-            firing: FiringPlan::CapabilityDefaults,
-            nodes: NodePlan::Only(node_ids.into_iter().map(Into::into).collect()),
-            max_steps: None,
-            drive: DrivePlan::UntilIdle,
-            claim_modules: None,
-            storage: StoragePlan::off(),
-        }
+        Self::base(
+            RunMode::Selective,
+            FiringPlan::CapabilityDefaults,
+            NodePlan::Only(node_ids.into_iter().map(Into::into).collect()),
+            DrivePlan::UntilIdle,
+        )
+    }
+
+    /// Skip `node` and its transitive predecessors; run the rest (seed cut edges).
+    ///
+    /// Example: after `extract` has run (or you have fixture facts), continue
+    /// with `retrieve` + `write` without re-executing extract.
+    pub fn start_after(node: impl Into<String>) -> Self {
+        Self::base(
+            RunMode::Selective,
+            FiringPlan::CapabilityDefaults,
+            NodePlan::After(node.into()),
+            DrivePlan::UntilIdle,
+        )
+    }
+
+    /// Run only `node` and nodes reachable from it (must reach terminal); seed the rest.
+    pub fn from_node(node: impl Into<String>) -> Self {
+        Self::base(
+            RunMode::Selective,
+            FiringPlan::CapabilityDefaults,
+            NodePlan::From(node.into()),
+            DrivePlan::UntilIdle,
+        )
     }
 
     /// Escape hatch: pick closure explicitly.
     pub fn manual(closure: Closure) -> Self {
-        Self {
-            mode: RunMode::Manual { closure },
-            firing: FiringPlan::CapabilityDefaults,
-            nodes: NodePlan::All,
-            max_steps: None,
-            drive: DrivePlan::UntilIdle,
-            claim_modules: None,
-            storage: StoragePlan::off(),
-        }
+        Self::base(
+            RunMode::Manual { closure },
+            FiringPlan::CapabilityDefaults,
+            NodePlan::All,
+            DrivePlan::UntilIdle,
+        )
     }
 
     /// Override firing plan.
@@ -213,6 +266,14 @@ impl FrameworkPolicy {
     /// Requires a [`crate::StorageBackend`] on the host (`Host::with_storage`).
     pub fn with_storage(mut self, storage: StoragePlan) -> Self {
         self.storage = storage;
+        self
+    }
+
+    /// Optional cross-run memoisation ([`MemoPlan`]).
+    ///
+    /// Requires a [`crate::MemoStore`] on the host (`Host::with_memo`).
+    pub fn with_memo(mut self, memo: MemoPlan) -> Self {
+        self.memo = memo;
         self
     }
 
@@ -268,11 +329,21 @@ impl FrameworkPolicy {
     }
 
     /// `include_nodes` for the run request (empty = all).
+    ///
+    /// When the host has already materialised a cut assembly, it forces
+    /// [`NodePlan::All`] on the kernel request so nodes are not filtered twice.
+    /// This method remains useful for callers that pass a full assembly and an
+    /// explicit [`NodePlan::Only`] list without host cut materialisation.
     pub fn include_nodes(&self) -> Vec<String> {
         match &self.nodes {
-            NodePlan::All => Vec::new(),
+            NodePlan::All | NodePlan::After(_) | NodePlan::From(_) => Vec::new(),
             NodePlan::Only(ids) => ids.clone(),
         }
+    }
+
+    /// True when the host must materialise a cut (drop nodes + seed rebind).
+    pub fn needs_cut(&self) -> bool {
+        !matches!(self.nodes, NodePlan::All)
     }
 
     /// Resolve `max_steps` for the kernel.

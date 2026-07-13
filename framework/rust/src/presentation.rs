@@ -14,6 +14,10 @@ pub const CONTRACT_STEP_INIT: &str = "srcport.ui.v1.StepInit";
 pub const CONTRACT_STEP_PROGRESS: &str = "srcport.ui.v1.StepProgress";
 /// Contract ref: step finished (success or failure presentation).
 pub const CONTRACT_STEP_FINAL: &str = "srcport.ui.v1.StepFinal";
+/// Contract ref: host-side skipped / seeded node (cut materialisation).
+pub const CONTRACT_STEP_SKIPPED: &str = "srcport.ui.v1.StepSkipped";
+/// Contract ref: memo cache hit (execute skipped; outputs reused).
+pub const CONTRACT_STEP_CACHED: &str = "srcport.ui.v1.StepCached";
 
 /// Legacy contract (prefer [`CONTRACT_STEP_INIT`] / [`CONTRACT_STEP_PROGRESS`]).
 pub const CONTRACT_PROCESSING_VIEW: &str = "srcport.ui.v1.ProcessingView";
@@ -30,6 +34,14 @@ pub enum StepStage {
     Progress,
     /// After outputs or on step error.
     Final,
+    /// Host cut: node will not execute; satisfied by seeds or purely dropped.
+    ///
+    /// Not part of the claim → execute → commit path. Emitted at
+    /// `start_pipeline` when a [`crate::NodePlan`] drops nodes.
+    Skipped,
+    /// Memo hit: claimed unit committed with prior output artifact refs;
+    /// domain `execute` was not called.
+    Cached,
 }
 
 impl StepStage {
@@ -39,6 +51,8 @@ impl StepStage {
             StepStage::Init => CONTRACT_STEP_INIT,
             StepStage::Progress => CONTRACT_STEP_PROGRESS,
             StepStage::Final => CONTRACT_STEP_FINAL,
+            StepStage::Skipped => CONTRACT_STEP_SKIPPED,
+            StepStage::Cached => CONTRACT_STEP_CACHED,
         }
     }
 }
@@ -179,6 +193,30 @@ impl Presentation {
             title: title.into(),
             status: PresentationStatus::Failed,
             detail: Some(detail.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Host-side: node skipped by a cut (optional seed detail).
+    pub fn skipped(title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            stage: StepStage::Skipped,
+            title: title.into(),
+            status: PresentationStatus::Empty,
+            detail: Some(detail.into()),
+            progress: Some(1.0),
+            ..Default::default()
+        }
+    }
+
+    /// Memo cache hit: outputs reused without domain execute.
+    pub fn cached(title: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            stage: StepStage::Cached,
+            title: title.into(),
+            status: PresentationStatus::Ok,
+            detail: Some(detail.into()),
+            progress: Some(1.0),
             ..Default::default()
         }
     }

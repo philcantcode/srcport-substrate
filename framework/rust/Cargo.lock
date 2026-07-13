@@ -508,10 +508,11 @@ dependencies = [
 
 [[package]]
 name = "srcport-framework"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "srcport-substrate",
 ]
 

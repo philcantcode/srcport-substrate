@@ -55,6 +55,15 @@ use srcport_framework::{
 // host.start_pipeline(id, assembly, inputs, FrameworkPolicy::stream())?;
 // host.inject(id, named_input, DriveAfter::UntilIdle)?;
 
+// start after a step (seed frontier outputs; skip node + predecessors):
+// host.start_pipeline(id, assembly, inputs_with_seeds, FrameworkPolicy::start_after("extract"))?;
+// host.resume_after("run-2", "run-1", "extract", FrameworkPolicy::start_after("extract"))?;
+
+// memoised re-runs (skip execute when module_digest + inputs match):
+// let mut host = Host::new(kernel).with_memo(MemoryMemo::new());
+// // ModulePlugin::module_digest() → Some("build-sha…")
+// host.start_pipeline(id, assembly, inputs, FrameworkPolicy::memoized())?;
+
 // storage (optional):
 // let mut host = Host::new(kernel).with_storage(MemoryStorage::new());
 // FrameworkPolicy::converge().with_storage(StoragePlan::per_run())
@@ -65,7 +74,10 @@ use srcport_framework::{
 | `FrameworkPolicy::converge()` | One answer, then done |
 | `FrameworkPolicy::stream()` | Keep run open; re-fire on inject |
 | `FrameworkPolicy::stream_dedupe()` | Stream but once per key |
-| `FrameworkPolicy::selective(nodes)` | Only some assembly nodes |
+| `FrameworkPolicy::selective(nodes)` | Only some assembly nodes (seed cut edges) |
+| `FrameworkPolicy::start_after(node)` | Skip that node + predecessors; seed outputs |
+| `FrameworkPolicy::from_node(node)` | Run only that node + successors; seed the rest |
+| `FrameworkPolicy::memoized()` | Converge + cross-run work cache |
 
 | Storage | Use when |
 |---------|----------|
@@ -89,7 +101,8 @@ framework/
 
 ## Status
 
-**`v2.0.0`** — manual assemblies, Rust host, step presentation lifecycle,
-optional `StoragePlan` + `MemoryStorage`. Auto-composer not yet implemented.
+**`v2.1.0`** — cut/seed (`start_after` / `from_node` / `resume_after`) and
+optional cross-run memoisation (`memoized`, `module_digest`, `MemoryMemo`).
+Builds on v2.0 host, step lifecycle, and `StoragePlan`.
 
 Minimum substrate: **v2.0.0**.

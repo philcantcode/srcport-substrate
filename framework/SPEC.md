@@ -98,11 +98,19 @@ Per **work unit** (not kernel module `REGISTERED→…`):
 ClaimReady → on_init (Init) → execute { emit_progress* } → on_final (Final) → Put/Commit → on_store
 ```
 
+Host cut (before any claim), when nodes are dropped by a node plan:
+
+```text
+start_pipeline → materialize_cut → StepStage::Skipped (per dropped node) → StartRun
+```
+
 | Stage | How | Contract |
 |-------|-----|----------|
 | **Init** | `on_init` | `srcport.ui.v1.StepInit` |
 | **Progress** | `StepContext::emit_progress` (0..N) | `srcport.ui.v1.StepProgress` |
 | **Final** | `on_final` (success or failure) | `srcport.ui.v1.StepFinal` |
+| **Skipped** | host cut at `start_pipeline` | `srcport.ui.v1.StepSkipped` |
+| **Cached** | memo hit after claim (no `execute`) | `srcport.ui.v1.StepCached` |
 | **Store** | `on_store` (after commit; best-effort on fail) | tabular rows on `StorageBackend` |
 
 Host collects [`StepEvent`]s (`stage` + `Presentation` + optional artifact id).
@@ -160,11 +168,47 @@ the escape hatch** (`RunMode::Manual`, `Host::start_run`).
 | **`converge()`** | One-shot → terminal | `FIRST_TERMINAL`, capability firing | `drive` until idle / complete |
 | **`stream()`** | Loop on new data | `OPEN`, force `ALWAYS` per node | drain then wait; `inject` + re-drive |
 | **`stream_dedupe()`** | Stream once per key | `OPEN`, force `ONCE_PER_KEY` | same as stream |
-| **`selective(nodes)`** | Only some steps | `include_nodes`, converge | drive subset assembly |
+| **`selective(nodes)`** | Only some steps | materialised cut assembly | seed required; drive subset |
+| **`start_after(node)`** | Skip node + predecessors | materialised cut assembly | seed cut edges; run the rest |
+| **`from_node(node)`** | Only node + successors | materialised cut assembly | seed cut edges; must reach terminal |
+| **`memoized()`** | Converge + work cache | same as converge | skip `execute` on memo hit |
 | **`manual(closure)`** | Escape hatch | caller closure | defaults; override with builders |
 
 Builders: `with_firing`, `with_nodes`, `with_drive`, `with_max_steps`,
-`with_claim_modules` (soft host claim allow-list), `with_storage(StoragePlan)`.
+`with_claim_modules` (soft host claim allow-list), `with_storage(StoragePlan)`,
+`with_memo(MemoPlan)`.
+
+**Cut + seed (skip / start-after).** There is no hard-coded step index. A non-
+`NodePlan::All` plan is materialised by the host before `StartRun`:
+
+1. Resolve kept vs dropped nodes (`Only` / `After` / `From`).
+2. Drop excluded nodes from the assembly.
+3. Rewrite crossing edges (dropped producer → kept consumer) to synthetic run
+   inputs named `__seed/{from_node}/{from_port}`.
+4. Fail closed if any required seed is missing from `inputs`.
+5. Emit `StepStage::Skipped` presentation events for dropped nodes (side
+   channel only — not domain readiness).
+6. Pass the materialised assembly to the kernel with `include_nodes` empty
+   (already cut).
+
+Helpers: `seed_input_name`, `seeds_from_run` (latest derivation outputs from a
+prior run), `Host::resume_after` (start_after + auto-seed from prior run).
+
+**Memo (skip re-work).** Optional cross-run cache. Key:
+
+```text
+H(module ‖ module_version ‖ module_digest ‖ capability ‖ sorted (port → artifact_id))
+```
+
+On claim, if `MemoPlan` is enabled and the key hits and all output artifacts
+still exist: emit `StepStage::Cached`, `Commit` the prior output refs (no
+`execute`), and continue. On miss: normal execute, then `MemoStore.put`.
+
+- Plugins declare `module_digest()` — empty/None ⇒ uncacheable
+- Invalidation is automatic: digest or input artifact id change ⇒ miss; new
+  output ids cascade to downstream nodes
+- Host needs `Host::with_memo(MemoryMemo::new())` (or another `MemoStore`)
+- Requires same kernel artifact store across runs (ids must still resolve)
 
 **Firing note.** The kernel resolves `by_node` → capability.firing →
 policy.default → `ONCE`. `FiringPlan::All` therefore pins **every assembly
@@ -173,10 +217,12 @@ node** in `by_node` so stream modes override module-declared `ONCE`.
 Host entrypoints:
 
 - `start_pipeline(id, assembly, inputs, policy)`
+- `resume_after(new_id, prior_id, after_node, policy)`
 - `drive` / `drive_with(DrivePlan)`
 - `inject(run_id, input, DriveAfter::{No, UntilIdle, OnePass})`
 - `cancel(run_id)`
 - `Host::with_storage(backend)` — required when `StoragePlan` is enabled
+- `Host::with_memo(store)` — required when `MemoPlan` is enabled
 
 ### 8. Storage phase (`StoragePlan`) — optional
 
@@ -238,11 +284,11 @@ under PerRun it truncates the whole (already run-scoped) table.
 
 ## Versioning
 
-- Framework line: **`v0.x`** until the host loop and UI profile stabilize.
-- Breaking changes allowed in `0.x` with a changelog note in this file.
-- Always declare the minimum substrate version (today: **substrate v1.1.0**).
-- When freezing `v1.0.0` of the framework: pin UI contract refs and the plugin
-  trait surface; still evolve substrate only by its own rules.
+- Framework line: **`v2.x`** on substrate **v2.0.0+**. Additive features within
+  a minor; break only on framework major.
+- Always declare the minimum substrate version (today: **substrate v2.0.0**).
+- Substrate evolves only by its own rules (`kernel/SPEC.md`); this framework
+  never forces a substrate bump for host-only features.
 
 ### Changelog
 
@@ -252,6 +298,7 @@ under PerRun it truncates the whole (already run-scoped) table.
 | `2.0.0` (+modes) | `FrameworkPolicy` presets: converge / stream / stream_dedupe / selective; `start_pipeline`, `inject`, `DrivePlan` |
 | `2.0.0` (+lifecycle) | Step presentation lifecycle Init → Progress* → Final; `StepEvent`; UI schemas; legacy view adapters |
 | `2.0.0` (+storage) | Optional `StoragePlan` (Off / PerRun / Shared + step_log); `storage_schema` / `on_store`; `MemoryStorage` |
+| **`2.1.0`** | **Cut/seed** (`start_after` / `from_node` / `resume_after`, `__seed/…` inputs, `StepStage::Skipped`) and **memo** (`MemoPlan` / `MemoryMemo`, `module_digest`, `memoized()`, `StepStage::Cached`, cascade invalidation). Substrate unchanged at v2.0.0. |
 
 ---
 

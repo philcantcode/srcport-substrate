@@ -5,9 +5,9 @@ use srcport_framework::{
     ProcessingStatus, ProcessingView, ResultStatus, ResultView, StepContext, StepEvent, StepOutput,
     StepResult, StepStage, UiPersist, CONTRACT_STEP_FINAL, CONTRACT_STEP_INIT,
 };
-use srcport_substrate::{artifact_with_trait, has_traits, 
-    Artifact, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
-    NamedArtifact, NodeOutput, Port, RunState, WorkItem,
+use srcport_substrate::{
+    artifact_with_trait, has_traits, Assembly, AssemblyNode, Binding, Capability, MemoryKernel,
+    ModuleManifest, NamedArtifact, NodeOutput, Port, RunState, WorkItem,
 };
 
 // ── plugins ─────────────────────────────────────────────────────────────────

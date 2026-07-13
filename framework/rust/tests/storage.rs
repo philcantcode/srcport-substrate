@@ -5,8 +5,8 @@ use srcport_framework::{
     ModulePlugin, PortBody, StepContext, StepOutput, StepResult, StoragePlan, StorageRetention,
     StoreValue, StoreWrite, TableSchema, WriteMode, STEP_LOG_TABLE,
 };
-use srcport_substrate::{artifact_with_trait, has_traits, 
-    Artifact, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
+use srcport_substrate::{
+    artifact_with_trait, Assembly, AssemblyNode, Binding, Capability, MemoryKernel, ModuleManifest,
     NamedArtifact, NodeOutput, Port, RunState,
 };
 

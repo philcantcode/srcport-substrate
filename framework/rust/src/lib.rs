@@ -1,4 +1,4 @@
-//! # srcport-framework — Rust host + module plugins (v0.1.0)
+//! # srcport-framework — Rust host + module plugins
 //!
 //! Opinionated application layer on [`srcport_substrate`]. The kernel never
 //! loads plugins or calls presentation / storage hooks — only a [`Host`] does.
@@ -10,23 +10,38 @@
 //!                  └──────── KernelApi ─────┴── presentation ──┘    storage side-channel
 //! ```
 //!
-//! **Modes** ([`FrameworkPolicy`]): converge / stream / stream_dedupe / selective.  
-//! **Step lifecycle**: Init → Progress\* → Final ([`Presentation`], [`StepEvent`]).  
-//! **Storage** (optional): [`StoragePlan`] + module [`TableSchema`] / [`StoreWrite`].
+//! **Modes** ([`FrameworkPolicy`]): converge / stream / stream_dedupe / selective /
+//! start_after / from_node (cut + seed) / memoized.  
+//! **Step lifecycle**: Init → Progress\* → Final ([`Presentation`], [`StepEvent`]);  
+//! optional **Skipped** (cut) and **Cached** (memo hit) events.  
+//! **Storage** (optional): [`StoragePlan`] + module [`TableSchema`] / [`StoreWrite`].  
+//! **Memo** (optional): [`MemoPlan`] + [`MemoStore`] — skip `execute` when module
+//! digest and input artifact ids match a prior run.
 
 #![deny(missing_docs)]
 
+mod cut;
+mod memo;
 mod policy;
 mod presentation;
 mod storage;
 
+pub use cut::{
+    is_seed_input_name, materialize_cut, merge_inputs, resolve_kept_nodes, seed_input_name,
+    seeds_from_run, validate_seeds_present, AssemblyCut, SeedSpec, SkippedNode, SEED_INPUT_PREFIX,
+};
+pub use memo::{
+    build_record, input_fingerprint_map, memo_key, record_to_named_outputs, MemoNodes, MemoPlan,
+    MemoRecord, MemoStore, MemoryMemo,
+};
 pub use policy::{
     DriveAfter, DrivePlan, FiringPlan, FrameworkPolicy, NodePlan, RunMode,
 };
 pub use presentation::{
     Presentation, PresentationStatus, ProcessingStatus, ProcessingView, ResultStatus, ResultView,
     StepEvent, StepResult, StepStage, UiEvent, CONTRACT_PROCESSING_VIEW, CONTRACT_RESULT_VIEW,
-    CONTRACT_STEP_FINAL, CONTRACT_STEP_INIT, CONTRACT_STEP_PROGRESS,
+    CONTRACT_STEP_CACHED, CONTRACT_STEP_FINAL, CONTRACT_STEP_INIT, CONTRACT_STEP_PROGRESS,
+    CONTRACT_STEP_SKIPPED,
 };
 pub use storage::{
     store_row, ColumnDef, ColumnType, MemoryStorage, QualifiedTable, StorageBackend, StorageMode,
@@ -186,6 +201,18 @@ pub trait ModulePlugin: Send {
     /// Manifest passed to `Register`.
     fn manifest(&self) -> ModuleManifest;
 
+    /// Content identity of this implementation for [`MemoPlan`] caching.
+    ///
+    /// Return a stable digest of code / config that affects outputs. Empty /
+    /// `None` means the node is **uncacheable** (always executes). Read on each
+    /// claim when memo is enabled so digests can be updated deliberately.
+    ///
+    /// Examples: build-time hash of the crate, wasm digest, or an explicit
+    /// version pin the author bumps when behaviour changes.
+    fn module_digest(&self) -> Option<String> {
+        None
+    }
+
     /// Perform domain work for a claimed unit.
     ///
     /// Call [`StepContext::emit_progress`] zero or more times for Progress stages.
@@ -194,6 +221,7 @@ pub trait ModulePlugin: Send {
     /// Optional **Init** presentation after claim, before `execute`.
     ///
     /// Default: maps legacy [`ModulePlugin::processing_ui`] if implemented.
+    /// Not called on memo cache hits.
     fn on_init(&self, step: &StepContext) -> Option<Presentation> {
         self.processing_ui(&step.work).map(Presentation::from)
     }
@@ -256,7 +284,7 @@ pub struct Host<K: KernelApi> {
     ctx: RequestContext,
     ui_persist: UiPersist,
     step_events: Vec<StepEvent>,
-    /// Policy frozen at [`Host::start_pipeline`] (drive / claim filters / storage).
+    /// Policy frozen at [`Host::start_pipeline`] (drive / claim filters / storage / memo).
     run_policies: HashMap<String, FrameworkPolicy>,
     /// Optional tabular backend (required when any run uses storage).
     storage: Option<Box<dyn StorageBackend>>,
@@ -264,6 +292,12 @@ pub struct Host<K: KernelApi> {
     storage_schemas: HashMap<String, TableSchema>,
     /// Physical tables created for a run (for PerRun cleanup).
     run_tables: HashMap<String, Vec<String>>,
+    /// Optional cross-run memo store (required when any run enables [`MemoPlan`]).
+    memo: Option<Box<dyn MemoStore>>,
+    /// How many times domain `execute` ran (tests / metrics).
+    execute_count: u64,
+    /// How many memo cache hits were applied (tests / metrics).
+    memo_hit_count: u64,
 }
 
 impl<K: KernelApi> Host<K> {
@@ -282,6 +316,9 @@ impl<K: KernelApi> Host<K> {
             storage: None,
             storage_schemas: HashMap::new(),
             run_tables: HashMap::new(),
+            memo: None,
+            execute_count: 0,
+            memo_hit_count: 0,
         }
     }
 
@@ -303,9 +340,35 @@ impl<K: KernelApi> Host<K> {
         self
     }
 
+    /// Attach a memo store for [`MemoPlan`]-enabled runs.
+    pub fn with_memo(mut self, store: impl MemoStore + 'static) -> Self {
+        self.memo = Some(Box::new(store));
+        self
+    }
+
     /// Borrow the underlying kernel.
     pub fn kernel(&self) -> &K {
         &self.kernel
+    }
+
+    /// Borrow the memo store, if configured.
+    pub fn memo_store(&self) -> Option<&(dyn MemoStore + 'static)> {
+        self.memo.as_deref()
+    }
+
+    /// Mutable memo store (e.g. tests clearing entries).
+    pub fn memo_store_mut(&mut self) -> Option<&mut (dyn MemoStore + 'static)> {
+        self.memo.as_deref_mut()
+    }
+
+    /// Total domain `execute` invocations since host creation.
+    pub fn execute_count(&self) -> u64 {
+        self.execute_count
+    }
+
+    /// Total memo cache hits applied since host creation.
+    pub fn memo_hit_count(&self) -> u64 {
+        self.memo_hit_count
     }
 
     /// Borrow the storage backend, if configured.
@@ -379,6 +442,11 @@ impl<K: KernelApi> Host<K> {
 
     /// Start a pipeline with an opinionated [`FrameworkPolicy`].
     ///
+    /// When `policy.nodes` is not [`NodePlan::All`], the host **materialises a
+    /// cut**: drops excluded nodes, rewrites crossing edges to `__seed/…`
+    /// inputs, and fails closed if any required seed is missing from `inputs`.
+    /// Skipped nodes emit [`StepStage::Skipped`] events (presentation only).
+    ///
     /// When `policy.storage` is enabled, ensures module tables (and optional
     /// step log) on the host storage backend.
     pub fn start_pipeline(
@@ -388,11 +456,9 @@ impl<K: KernelApi> Host<K> {
         inputs: Vec<NamedArtifact>,
         policy: FrameworkPolicy,
     ) -> Result<Run, FrameworkError> {
-        if matches!(policy.mode, RunMode::Selective)
-            && !matches!(policy.nodes, NodePlan::Only(ref ids) if !ids.is_empty())
-        {
+        if matches!(policy.mode, RunMode::Selective) && matches!(policy.nodes, NodePlan::All) {
             return Err(FrameworkError::Invalid(
-                "RunMode::Selective requires NodePlan::Only with at least one node id".into(),
+                "RunMode::Selective requires NodePlan::Only, After, or From".into(),
             ));
         }
         let run_id = run_id.into();
@@ -411,10 +477,23 @@ impl<K: KernelApi> Host<K> {
                     .into(),
             ));
         }
+        if policy.memo.enabled && self.memo.is_none() {
+            return Err(FrameworkError::Invalid(
+                "MemoPlan enabled but host has no MemoStore (use Host::with_memo)".into(),
+            ));
+        }
 
-        let req = policy.apply_to_run_request(RunRequest {
+        let cut = materialize_cut(&assembly, &policy.nodes)?;
+        validate_seeds_present(&cut, &inputs)?;
+        self.emit_skip_events(&run_id, &cut)?;
+
+        // Assembly is already materialised; do not apply include_nodes again.
+        let mut kernel_policy = policy.clone();
+        kernel_policy.nodes = NodePlan::All;
+
+        let req = kernel_policy.apply_to_run_request(RunRequest {
             id: run_id.clone(),
-            assembly: Some(assembly),
+            assembly: Some(cut.assembly),
             inputs,
             ..Default::default()
         });
@@ -422,6 +501,94 @@ impl<K: KernelApi> Host<K> {
         self.ensure_run_storage(&run_id, &policy)?;
         self.run_policies.insert(run_id, policy);
         Ok(run)
+    }
+
+    /// Resume a prior run **after** a completed node: seed that node (and its
+    /// transitive predecessors) from the prior run's latest derivations, then
+    /// start a new pipeline with [`FrameworkPolicy::start_after`].
+    ///
+    /// The new run uses the prior run's frozen assembly and original non-seed
+    /// inputs, plus seeds collected from derivations. `policy` defaults should
+    /// usually be [`FrameworkPolicy::start_after`]; storage/firing builders may
+    /// be layered on top (the node plan is forced to `After(after_node)`).
+    pub fn resume_after(
+        &mut self,
+        new_run_id: impl Into<String>,
+        prior_run_id: &str,
+        after_node: impl Into<String>,
+        mut policy: FrameworkPolicy,
+    ) -> Result<Run, FrameworkError> {
+        let after_node = after_node.into();
+        let prior = self.get_run(prior_run_id)?;
+        let assembly = prior
+            .assembly
+            .clone()
+            .ok_or_else(|| FrameworkError::Invalid("prior run has no assembly".into()))?;
+
+        // Cut against the *full* prior assembly (not an already-cut subset).
+        policy.nodes = NodePlan::After(after_node.clone());
+        let cut = materialize_cut(&assembly, &policy.nodes)?;
+
+        let mut cut_nodes: Vec<String> = cut.skipped.iter().map(|s| s.node_id.clone()).collect();
+        // Include the frontier node itself (it is in skipped for After).
+        if !cut_nodes.iter().any(|n| n == &after_node) {
+            cut_nodes.push(after_node.clone());
+        }
+        let seeds = seeds_from_run(&self.kernel, prior_run_id, &cut_nodes, &self.ctx)?;
+
+        // Carry original run inputs (non-seed); seeds overlay.
+        let base_inputs: Vec<NamedArtifact> = prior
+            .inputs
+            .into_iter()
+            .filter(|i| !is_seed_input_name(&i.name))
+            .collect();
+        let inputs = merge_inputs(base_inputs, seeds);
+
+        self.start_pipeline(new_run_id, assembly, inputs, policy)
+    }
+
+    fn emit_skip_events(
+        &mut self,
+        run_id: &str,
+        cut: &AssemblyCut,
+    ) -> Result<(), FrameworkError> {
+        if cut.skipped.is_empty() {
+            return Ok(());
+        }
+        let seed_by_node: HashMap<&str, Vec<&SeedSpec>> = {
+            let mut m: HashMap<&str, Vec<&SeedSpec>> = HashMap::new();
+            for s in &cut.required_seeds {
+                m.entry(s.from_node.as_str()).or_default().push(s);
+            }
+            m
+        };
+        for skipped in &cut.skipped {
+            let seeds = seed_by_node.get(skipped.node_id.as_str()).map(|v| v.as_slice());
+            let detail = match seeds {
+                Some(list) if !list.is_empty() => {
+                    let ports: Vec<_> = list.iter().map(|s| s.from_port.as_str()).collect();
+                    format!(
+                        "skipped (seeded ports: {}); cut from run",
+                        ports.join(", ")
+                    )
+                }
+                _ => "skipped (no outputs required by kept nodes)".into(),
+            };
+            let mut p = Presentation::skipped(format!("Skip {}", skipped.node_id), detail);
+            p.run_id = run_id.into();
+            p.node_id = skipped.node_id.clone();
+            p.module = skipped.module.clone();
+            p.capability = skipped.capability.clone();
+            p.meta.insert("cut".into(), "true".into());
+            if let Some(list) = seeds {
+                for s in list {
+                    p.meta
+                        .insert(format!("seed:{}", s.from_port), s.input_name.clone());
+                }
+            }
+            self.emit_presentation(&skipped.module, p)?;
+        }
+        Ok(())
     }
 
     /// Freeze an assembly over inputs without a framework policy.
@@ -557,10 +724,14 @@ impl<K: KernelApi> Host<K> {
         self.get_run(run_id)
     }
 
-    /// Claim → Init → execute (Progress\*) → Final → put/commit for `module`.
+    /// Claim → (memo hit | Init → execute → Final) → put/commit for `module`.
     ///
-    /// Returns whether a work unit ran. On domain execute failure, emits Final
-    /// (if any) and returns [`FrameworkError::StepFailed`] without committing.
+    /// When [`MemoPlan`] is enabled and a matching entry exists, domain
+    /// `execute` is skipped and prior output artifact refs are committed.
+    ///
+    /// Returns whether a work unit ran (including memo hits). On domain execute
+    /// failure, emits Final (if any) and returns [`FrameworkError::StepFailed`]
+    /// without committing.
     pub fn try_step(&mut self, run_id: &str, module: &str) -> Result<bool, FrameworkError> {
         let work = self.kernel.claim_ready(
             ClaimRequest {
@@ -575,6 +746,21 @@ impl<K: KernelApi> Host<K> {
         }
 
         let mut step = self.load_step(run_id, &work)?;
+
+        // ── Memo lookup (optional) ────────────────────────────────────────
+        if let Some((key, named_outputs, source_run)) =
+            self.try_memo_hit(run_id, module, &work)?
+        {
+            return self.commit_memo_hit(
+                run_id,
+                module,
+                &work,
+                &step,
+                &key,
+                named_outputs,
+                &source_run,
+            );
+        }
 
         // ── Init ──────────────────────────────────────────────────────────
         let init = {
@@ -598,6 +784,7 @@ impl<K: KernelApi> Host<K> {
                 .ok_or_else(|| FrameworkError::NoPlugin(module.into()))?;
             plugin.execute(&mut step)
         };
+        self.execute_count = self.execute_count.saturating_add(1);
 
         let progress = step.take_progress();
         for p in progress {
@@ -659,11 +846,13 @@ impl<K: KernelApi> Host<K> {
                         run_id: run_id.into(),
                         work_id: work.id.clone(),
                         node_id: work.node_id.clone(),
-                        outputs: named_outputs,
+                        outputs: named_outputs.clone(),
                         ..Default::default()
                     },
                     &self.ctx,
                 )?;
+
+                self.store_memo_after_success(run_id, module, &work, &named_outputs)?;
 
                 // ── Storage (after successful commit) ─────────────────────
                 self.apply_step_storage(run_id, module, &step, &step_result)?;
@@ -699,6 +888,150 @@ impl<K: KernelApi> Host<K> {
                 Err(FrameworkError::StepFailed(msg))
             }
         }
+    }
+
+    /// Attempt a memo hit. Returns `(key, outputs, source_run_id)` when valid.
+    fn try_memo_hit(
+        &self,
+        run_id: &str,
+        module: &str,
+        work: &WorkItem,
+    ) -> Result<Option<(String, Vec<NamedArtifact>, String)>, FrameworkError> {
+        let Some(policy) = self.run_policies.get(run_id) else {
+            return Ok(None);
+        };
+        if !policy.memo.enabled {
+            return Ok(None);
+        }
+        if !policy.memo.nodes.allows(&work.node_id) {
+            return Ok(None);
+        }
+        let digest = self
+            .plugins
+            .get(module)
+            .and_then(|p| p.module_digest())
+            .filter(|d| !d.is_empty());
+        let Some(digest) = digest else {
+            // Uncacheable without a digest (always miss, never error).
+            let _ = policy.memo.require_digest;
+            return Ok(None);
+        };
+        let Some(store) = self.memo.as_ref() else {
+            return Ok(None);
+        };
+
+        let inputs = input_fingerprint_map(work);
+        let key = memo_key(
+            module,
+            &work.module_version,
+            &digest,
+            &work.capability,
+            &inputs,
+        );
+        let Some(record) = store.get(&key)? else {
+            return Ok(None);
+        };
+
+        // Verify every output artifact still exists in the kernel.
+        let named = record_to_named_outputs(&record);
+        for na in &named {
+            let Some(r) = na.artifact.as_ref() else {
+                return Ok(None);
+            };
+            if self.kernel.get_artifact(r, &self.ctx).is_err() {
+                return Ok(None);
+            }
+        }
+        if named.is_empty() && !record.outputs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((key, named, record.source_run_id.clone())))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_memo_hit(
+        &mut self,
+        run_id: &str,
+        module: &str,
+        work: &WorkItem,
+        step: &StepContext,
+        key: &str,
+        named_outputs: Vec<NamedArtifact>,
+        source_run: &str,
+    ) -> Result<bool, FrameworkError> {
+        let mut p = Presentation::cached(
+            format!("Cached {}", work.node_id),
+            format!("memo hit; outputs from run {source_run}"),
+        );
+        p.fill_identity(run_id, work);
+        p.output_ports = named_outputs.iter().map(|o| o.name.clone()).collect();
+        p.meta.insert("memo".into(), "hit".into());
+        p.meta.insert("memo_key".into(), key.into());
+        p.meta
+            .insert("memo_source_run".into(), source_run.into());
+        self.emit_presentation(module, p)?;
+
+        self.kernel.commit(
+            Derivation {
+                run_id: run_id.into(),
+                work_id: work.id.clone(),
+                node_id: work.node_id.clone(),
+                outputs: named_outputs.clone(),
+                ..Default::default()
+            },
+            &self.ctx,
+        )?;
+
+        self.memo_hit_count = self.memo_hit_count.saturating_add(1);
+
+        let step_result = StepResult {
+            ok: true,
+            outputs: named_outputs,
+            error: None,
+        };
+        // Step log / optional storage still records the (reused) step.
+        self.apply_step_storage(run_id, module, step, &step_result)?;
+        Ok(true)
+    }
+
+    fn store_memo_after_success(
+        &mut self,
+        run_id: &str,
+        module: &str,
+        work: &WorkItem,
+        named_outputs: &[NamedArtifact],
+    ) -> Result<(), FrameworkError> {
+        let Some(policy) = self.run_policies.get(run_id) else {
+            return Ok(());
+        };
+        if !policy.memo.enabled {
+            return Ok(());
+        }
+        if !policy.memo.nodes.allows(&work.node_id) {
+            return Ok(());
+        }
+        let digest = match self
+            .plugins
+            .get(module)
+            .and_then(|p| p.module_digest())
+            .filter(|d| !d.is_empty())
+        {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let Some(store) = self.memo.as_mut() else {
+            return Ok(());
+        };
+        let inputs = input_fingerprint_map(work);
+        let key = memo_key(
+            module,
+            &work.module_version,
+            &digest,
+            &work.capability,
+            &inputs,
+        );
+        let record = build_record(key, work, &digest, named_outputs, run_id);
+        store.put(record)
     }
 
     fn load_step(&self, run_id: &str, work: &WorkItem) -> Result<StepContext, FrameworkError> {
