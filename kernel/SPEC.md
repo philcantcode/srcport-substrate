@@ -366,6 +366,7 @@ Within a major version, evolution is by **addition**, never by mutation:
 - **`v2.0.0`** — product/SDK major: **trait bags** as the sole artifact model (formerly drafted as v1.2). Breaking vs v1.x single-type artifacts. Proto package path remains `srcport.substrate.v1` (reserved fields); SDK crates and tags are **2.0.0**.
 - **`v2.1.0`** — additive: **`ArtifactStorePolicy`** (frozen store law: max inline/blob sizes, `COPY_VERIFY` ingest, durability class), exposed on `RegistrySnapshot.store_policy`; hard enforcement via `RESOURCE_EXHAUSTED`.
 - **`v2.2.0`** — additive **leased concurrency**: batch `ClaimReady` → `ClaimResponse`, `Heartbeat`, `FailWork`, `Limits.{max_in_flight,default_lease_ms,max_attempts}`, work-unit lease lifecycle (READY/CLAIMED/DONE).
+- **`v2.3.0`** — monorepo/SDK **package alignment** with framework 2.3.0 (same leased-claim ABI as v2.2.0; crate versions report `2.3.0` so products pin one monorepo tag without kernel/framework version skew in `cargo` output).
 - **`v1.2.0`** (draft line, superseded by v2.0.0) — **trait bags** replace single-type artifacts. `Artifact` is
   a map of contract ref → `Trait`; `Port.traits` declares required/guaranteed
   sets; matching is set inclusion; projection helpers isolate traits. No
